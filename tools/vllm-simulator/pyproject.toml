@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm_simulator"
+dynamic = ["version"]
+description = "A simulation benchmark tool for vLLM"
+dependencies = [
+    "numpy",
+    "scikit-learn",
+    "aiconfigurator"
+]
