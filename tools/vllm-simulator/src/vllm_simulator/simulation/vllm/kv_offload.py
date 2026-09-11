@@ -26,8 +26,12 @@ class C_VLLMSimpleCPUOffloadWorkerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        def override_init(self, vllm_config, kv_cache_config, cpu_capacity_bytes):
-            """Skip pinned memory allocation and CUDA stream creation."""
+        def override_init(self, *args, **kwargs):
+            """Skip pinned memory allocation and CUDA stream creation.
+
+            Signature passthrough: the fork added kv_offload_backend/disk_*
+            kwargs; accept and ignore them all.
+            """
             self._captured_metadata = None
             self._completed_store_events: dict[int, int] = {}
             logger.info(
@@ -42,13 +46,24 @@ class C_VLLMSimpleCPUOffloadWorkerHook(BaseHook):
         def override_bind_connector_metadata(self, metadata):
             """Capture metadata so we can report events as completed."""
             self._captured_metadata = metadata
+            # Native attribute name on the fork; native methods read it.
+            self._connector_metadata = metadata
 
         def override_clear_connector_metadata(self):
             """Clear captured metadata."""
             self._captured_metadata = None
+            self._connector_metadata = None
 
         def override_handle_preemptions(self, kv_connector_metadata):
             """No-op: no in-flight transfers to flush."""
+            pass
+
+        def override_start_load_kv(self, *args, **kwargs):
+            """No-op: loads auto-complete via override_get_finished."""
+            pass
+
+        def override_wait_for_save(self, *args, **kwargs):
+            """No-op: stores auto-complete via override_get_finished."""
             pass
 
         def override_get_finished(self, finished_req_ids):
@@ -89,6 +104,8 @@ class C_VLLMSimpleCPUOffloadWorkerHook(BaseHook):
         target.bind_connector_metadata = override_bind_connector_metadata
         target.clear_connector_metadata = override_clear_connector_metadata
         target.handle_preemptions = override_handle_preemptions
+        target.start_load_kv = override_start_load_kv
+        target.wait_for_save = override_wait_for_save
         target.get_finished = override_get_finished
         target.build_connector_worker_meta = override_build_connector_worker_meta
 
