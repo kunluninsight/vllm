@@ -196,6 +196,20 @@ class ConfigManager:
                     "sample_tokens_breakpoint_tokens", 0
                 ),
             )
+        elif predictor_config.get("name") == "replay":
+            from vllm_simulator.time_predictor.replay import ReplayTimePredictor
+
+            return ReplayTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                database_path=predictor_config.get("database_path"),
+                miss_fallback_seconds=predictor_config.get(
+                    "miss_fallback_seconds", 0.0
+                ),
+                miss_strategy=predictor_config.get("miss_strategy", "zero"),
+                miss_knn_k=predictor_config.get("miss_knn_k", 3),
+            )
         else:
             raise ValueError(
                 f"Unknown predictor name: {predictor_config.get('name')}. "
