@@ -324,7 +324,7 @@ def sparse_attn_indexer(
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
-    if not isinstance(attn_metadata, dict):
+    if not isinstance(attn_metadata, dict) or envs.VLLM_META_MODE:
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
@@ -774,7 +774,7 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not has_deep_gemm() and not envs.VLLM_META_MODE:
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."

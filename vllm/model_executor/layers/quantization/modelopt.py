@@ -1216,7 +1216,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         expose_input_quant_key(layer, self.kernel)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if (
+        if not envs.VLLM_META_MODE and (
             torch.unique(layer.input_scale).numel() != 1
             or torch.unique(layer.weight_scale_2).numel() != 1
         ):
@@ -1246,7 +1246,11 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
 
         # Convert layer to NVFP4 linear kernel format
-        self.kernel.process_weights_after_loading(layer)
+        if not envs.VLLM_META_MODE:
+            # Meta CI: the kernel repack (marlin/cutlass swizzle) is GPU-only +
+            # data-dependent (.item()); skip it (apply below is short-circuited,
+            # so repacked weights are not needed).
+            self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -1254,6 +1258,12 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if envs.VLLM_META_MODE:
+            # Meta CI: the NVFP4 GEMM leaf is GPU/layout-specific; return a
+            # shape-correct meta output instead of launching the backend GEMM.
+            return x.new_empty(
+                (*x.shape[:-1], layer.output_size_per_partition), dtype=x.dtype
+            )
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 
@@ -1374,7 +1384,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         if hasattr(layer, "input_scale"):
             del layer.input_scale
 
-        if torch.unique(layer.weight_scale_2).numel() != 1:
+        if not envs.VLLM_META_MODE and torch.unique(layer.weight_scale_2).numel() != 1:
             logger.warning_once(
                 "In W4A16_NVFP4 linear, the global weight scale "
                 "(weight_scale_2) differs across fused parallel layers "
@@ -1391,7 +1401,9 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         )
         del layer.weight_scale_2
 
-        self.kernel.process_weights_after_loading(layer)
+        if not envs.VLLM_META_MODE:
+            # Meta CI: skip the GPU-only kernel repack (see W4A4 note).
+            self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -1399,6 +1411,11 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if envs.VLLM_META_MODE:
+            # Meta CI: shape-correct output instead of the NVFP4 GEMM leaf.
+            return x.new_empty(
+                (*x.shape[:-1], layer.output_size_per_partition), dtype=x.dtype
+            )
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 
@@ -1559,6 +1576,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+
+        if envs.VLLM_META_MODE:
+            # Meta CI: the NVFP4 MoE weight conversion + kernel build are GPU-only
+            # + data-dependent; expert compute runs through the faked moe_forward
+            # op, so none of it is needed on meta.
+            return
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(

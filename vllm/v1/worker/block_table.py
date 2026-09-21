@@ -514,11 +514,79 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
             grid=(2,),
         )
 
+    def _native(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        max_num_tokens: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        block_table: torch.Tensor,
+        block_table_stride: int,
+        block_size: int,
+        slot_mapping: torch.Tensor,
+        kv_cache_block_size: int,
+        blocks_per_kv_block: int,
+        total_cp_world_size: int,
+        total_cp_rank: int,
+        cp_kv_cache_interleave_size: int,
+    ) -> None:
+        """Pure-torch equivalent of the Triton slot-mapping kernel (CPU/meta).
+
+        Vectorized mirror of the kernel above, including decode context-parallel
+        (DCP) sharding, so it stays correct for ``total_cp_world_size > 1``:
+        out-of-shard tokens map to ``PAD_SLOT_ID`` and each rank only owns the
+        interleaved virtual-block offsets assigned to it. For the common
+        ``total_cp_world_size == 1`` case this collapses to
+        ``slot = block_table[req, pos // block_size] * block_size
+                 + pos % block_size``.
+        """
+        device = slot_mapping.device
+        # token -> request index
+        qsl = query_start_loc[: num_reqs + 1].to(torch.long)
+        req_ids = torch.zeros(num_tokens, dtype=torch.long, device=device)
+        for r in range(num_reqs):
+            req_ids[qsl[r] : qsl[r + 1]] = r
+        pos = positions[:num_tokens].to(torch.long)
+
+        virtual_block_size = kv_cache_block_size * total_cp_world_size
+        virtual_block_indices = pos // virtual_block_size
+        virtual_block_offsets = pos % virtual_block_size
+        is_local = (
+            virtual_block_offsets // cp_kv_cache_interleave_size
+        ) % total_cp_world_size == total_cp_rank
+        local_block_offsets = (
+            virtual_block_offsets
+            // (total_cp_world_size * cp_kv_cache_interleave_size)
+        ) * cp_kv_cache_interleave_size + (
+            virtual_block_offsets % cp_kv_cache_interleave_size
+        )
+        block_indices = (
+            virtual_block_indices * blocks_per_kv_block
+            + local_block_offsets // block_size
+        )
+        # Only the local shard's rows are read; index the rest at 0 then PAD.
+        safe_indices = torch.where(is_local, block_indices, torch.zeros_like(block_indices))
+        block_numbers = block_table[req_ids, safe_indices].to(torch.long)
+        slot = block_numbers * block_size + (local_block_offsets % block_size)
+        slot = torch.where(is_local, slot, torch.full_like(slot, PAD_SLOT_ID))
+        slot_mapping[:num_tokens] = slot.to(slot_mapping.dtype)
+        # Pad the CUDA-graph tail (kernel's last program does this).
+        if max_num_tokens > num_tokens:
+            slot_mapping[num_tokens:max_num_tokens] = PAD_SLOT_ID
+
+
     def __call__(
         self,
         num_reqs: int,
         *args: Any,
     ) -> None:
+        import vllm.envs as envs
+
+        if envs.VLLM_META_MODE:
+            # No Triton driver on CPU/meta; use the pure-torch fallback.
+            self._native(num_reqs, *args)
+            return
         self.kernel[(num_reqs + 1,)](
             *args,
             PAD_ID=PAD_SLOT_ID,

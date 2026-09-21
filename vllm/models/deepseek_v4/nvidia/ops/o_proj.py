@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
@@ -45,6 +46,16 @@ def deep_gemm_fp8_o_proj(
     Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
     """
+    if envs.VLLM_META_MODE:
+        # Meta CI: the inverse-RoPE + fp8-quant kernel and the DeepGEMM einsum
+        # are GPU-only. Skip them and run the real output projection (``wo_b``, a
+        # native Linear) on a shape-correct meta latent, matching production.
+        z = torch.empty(
+            (o.shape[0], n_groups, o_lora_rank),
+            device=o.device,
+            dtype=torch.bfloat16,
+        )
+        return wo_b(z.flatten(1))
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
         positions,
