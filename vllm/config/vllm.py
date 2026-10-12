@@ -1079,16 +1079,16 @@ class VllmConfig:
         if envs.VLLM_META_MODE:
             if self.model_config is not None:
                 self.model_config.enforce_eager = True
-            self.load_config.load_format = "dummy"
-            self.load_config.device = "meta"
-            # CustomOps (RMSNorm/RoPE/SiluAndMul/...) -> forward_native (pure
-            # torch, meta-friendly) instead of the _C kernels.
-            self.compilation_config.custom_ops = ["none"]
+            self.load_config.load_format = "meta"
+            # V1 async scheduling depends on value-carrying sampled-token
+            # broadcasts between pipeline stages. Meta tensors only carry shape,
+            # so use the production synchronous PP path instead.
+            if self.parallel_config.pipeline_parallel_size > 1:
+                self.scheduler_config.async_scheduling = False
             # Speculative decoding builds a draft head + acceptance-sampling loop
             # with value-dependent (.item()) boundaries that don't lower onto
             # meta; drop the speculator (meta CI validates the base model).
-            if self.speculative_config is not None:
-                self.speculative_config = None
+            self.speculative_config = None
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
@@ -1202,11 +1202,12 @@ class VllmConfig:
                 self.model_config, self.load_config
             )
 
-        # "dummy" reads no weights at all, and the sharded formats read a vLLM
-        # state dict, which stores tied word embeddings under the lm_head only.
-        # Neither can tell us what the original checkpoint contained.
+        # "dummy"/"meta" read no weights at all, and the sharded formats read a
+        # vLLM state dict, which stores tied word embeddings under the lm_head
+        # only. Neither can tell us what the original checkpoint contained.
         if self.model_config is not None and self.load_config.load_format not in (
             "dummy",
+            "meta",
             "sharded_state",
             "runai_streamer_sharded",
         ):

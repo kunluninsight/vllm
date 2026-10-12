@@ -1216,7 +1216,12 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         expose_input_quant_key(layer, self.kernel)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not envs.VLLM_META_MODE and (
+        if layer.weight.is_meta:
+            # Scale checks and kernel repacking need real values; meta weights
+            # keep their logical layout and apply() propagates the output shape.
+            return
+
+        if (
             torch.unique(layer.input_scale).numel() != 1
             or torch.unique(layer.weight_scale_2).numel() != 1
         ):
@@ -1246,11 +1251,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
 
         # Convert layer to NVFP4 linear kernel format
-        if not envs.VLLM_META_MODE:
-            # Meta CI: the kernel repack (marlin/cutlass swizzle) is GPU-only +
-            # data-dependent (.item()); skip it (apply below is short-circuited,
-            # so repacked weights are not needed).
-            self.kernel.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -1258,9 +1259,9 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if envs.VLLM_META_MODE:
-            # Meta CI: the NVFP4 GEMM leaf is GPU/layout-specific; return a
-            # shape-correct meta output instead of launching the backend GEMM.
+        if x.is_meta:
+            # The NVFP4 backend GEMM requires real storage; propagate its output
+            # shape for meta tensors.
             return x.new_empty(
                 (*x.shape[:-1], layer.output_size_per_partition), dtype=x.dtype
             )
@@ -1375,6 +1376,11 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if layer.weight.is_meta:
+            # Scale checks and kernel repacking need real values; meta weights
+            # keep their logical layout and apply() propagates the output shape.
+            return
+
         if not hasattr(layer, "has_bias"):
             layer.has_bias = getattr(layer, "bias", None) is not None
 
@@ -1384,7 +1390,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         if hasattr(layer, "input_scale"):
             del layer.input_scale
 
-        if not envs.VLLM_META_MODE and torch.unique(layer.weight_scale_2).numel() != 1:
+        if torch.unique(layer.weight_scale_2).numel() != 1:
             logger.warning_once(
                 "In W4A16_NVFP4 linear, the global weight scale "
                 "(weight_scale_2) differs across fused parallel layers "
@@ -1401,9 +1407,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         )
         del layer.weight_scale_2
 
-        if not envs.VLLM_META_MODE:
-            # Meta CI: skip the GPU-only kernel repack (see W4A4 note).
-            self.kernel.process_weights_after_loading(layer)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -1411,8 +1415,9 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if envs.VLLM_META_MODE:
-            # Meta CI: shape-correct output instead of the NVFP4 GEMM leaf.
+        if x.is_meta:
+            # The NVFP4 backend GEMM requires real storage; propagate its output
+            # shape for meta tensors.
             return x.new_empty(
                 (*x.shape[:-1], layer.output_size_per_partition), dtype=x.dtype
             )
@@ -1577,10 +1582,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
 
-        if envs.VLLM_META_MODE:
-            # Meta CI: the NVFP4 MoE weight conversion + kernel build are GPU-only
-            # + data-dependent; expert compute runs through the faked moe_forward
-            # op, so none of it is needed on meta.
+        if layer.w13_weight.is_meta:
+            # Weight conversion and backend setup require real values; expert
+            # compute is represented by the meta-capable moe_forward op.
             return
 
         # Use a single gscale for w13.
