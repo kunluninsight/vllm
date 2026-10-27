@@ -1,20 +1,25 @@
-from sglang_simulator.simulation.sglang.utils import resolve_model_info
-from sglang_simulator.simulation.types import (
+import pytest
+
+from hisim.simulation.hijack.vllm.utils import resolve_model_info
+from hisim.simulation.types import (
     SchedulerConfig,
 )
-from sglang_simulator.spec.accelerator import AcceleratorInfo
-from sglang_simulator.spec.model import ModelInfo
-from sglang_simulator.time_predictor import (
-    AIConfiguratorTimePredictor,
+from hisim.spec.accelerator import AcceleratorInfo
+from hisim.spec.model import ModelInfo
+from hisim.time_predictor import (
+    LinearTimePredictor,
     ScheduleBatch,
     ScheduleRequest,
 )
 
-from sglang.srt.configs.model_config import ModelConfig
-
 
 def test_time_predictor():
-    model: ModelInfo = resolve_model_info(ModelConfig(model_path="Qwen/Qwen3-8B"))
+    pytest.importorskip("aiconfigurator")
+    vllm = pytest.importorskip("vllm")
+    from vllm.config import ModelConfig
+    from hisim.time_predictor import AIConfiguratorTimePredictor
+
+    model: ModelInfo = resolve_model_info(ModelConfig(model="Qwen/Qwen3-8B"))
     hw = AcceleratorInfo(
         name="a100_sxm",
         vendor="NVIDIA",
@@ -23,7 +28,7 @@ def test_time_predictor():
         inter_node_bandwidth_gb=25,
         intra_node_bandwidth_gb=300,
     )
-    config = SchedulerConfig(backend_name="sglang", backend_version="0.5.9")
+    config = SchedulerConfig(backend_name="vllm", backend_version=vllm.__version__)
     for clz in [
         AIConfiguratorTimePredictor,
     ]:

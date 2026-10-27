@@ -1,8 +1,10 @@
-import sglang_simulator.hook as sgl_simulator_hook
+import pytest
+
+import hisim.hook as hisim_hook
 
 
 # define hook
-class C_DemoHook(sgl_simulator_hook.BaseHook):
+class C_DemoHook(hisim_hook.BaseHook):
     # if running with pytest, the module name is "test_hook_demo"
     HOOK_MODULE_NAME = __name__
     HOOK_CLASS_NAME = "Demo"
@@ -21,7 +23,7 @@ class C_DemoHook(sgl_simulator_hook.BaseHook):
         return target_class
 
 
-sgl_simulator_hook.install_class_hooks(C_DemoHook)
+hisim_hook.install_class_hooks(C_DemoHook)
 
 
 # the target class should be defined after installing hook
@@ -35,8 +37,4 @@ def test_hook_demo():
     msg = "Message"
     res = demo.run(msg)
     # the message will be returned form hook
-    assert res == f"{msg} from Hook"
-
-
-if __name__ == "__main__":
-    test_hook_demo()
+    assert res == (f"{msg} from Hook")

@@ -3,12 +3,12 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang_simulator"
+name = "hisim"
 dynamic = ["version"]
-description = "A simulation benchmark tool for sglang"
+description = "A high-fidelity LLM inference simulator"
 dependencies = [
     "numpy",
     "scikit-learn",
     "xgboost",
-    "aiconfigurator @ git+https://github.com/ai-dynamo/aiconfigurator.git"
+    "aiconfigurator"
 ]

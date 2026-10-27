@@ -1,168 +1,181 @@
-# sglang_simulator
-## Background
-As large language models (LLMs) are rapidly deployed at scale for inference services, inference performance directly impacts user experience, service cost, and resource efficiency. Key metrics such as Time to First Token (TTFT), Time Per Output Token (TPOT), and system throughput are highly dependent on the complex interplay among model architecture, hardware platforms (e.g., A100/H100), inference engines (e.g., SGLang, vLLM, TensorRT-LLM), and runtime configurations (e.g., quantization, batching, and parallelism strategies).
+# hisim
+HiSim adds inference simulation to an existing DashLLM → vLLM → v6d serving
+stack. Keep your DashLLM entrypoint, request client, and configured cache
+services; enable HiSim through the environment. No serving-source changes or
+simulator-specific launcher are required.
 
-Traditional end-to-end stress testing on real GPU clusters is expensive and time-consuming, making it impractical to efficiently explore the vast space of configuration combinations. To address this, we propose **sglang_simulator**, a high-fidelity CPU-based simulation system. sglang_simulator enables fast, low-cost, and high-fidelity prediction of key performance metrics across different models, target hardware, inference engines, and configurations by replaying real-world inference workload traces collected from production or representative scenarios, thereby accelerating the design and optimization of inference systems.
+In `BLOCKING` mode, model execution is replaced with predicted latency on the
+wall clock. The serving and scheduling paths still handle real requests, so
+existing clients can measure TTFT, TPOT, and throughput. Generated tokens are
+simulated; this is not a model-quality test.
 
----
-## Introduction
-sglang_simulator is a simulation tool that provides a command-line interface compatible with SGLang. It launches a mock inference service that accepts user requests—either via real-world trace replay or synthetic load generation—using standard benchmarking scripts. sglang_simulator outputs performance metrics identical to those produced by `sglang bench_serving`. See **Quick Start** for usage examples.
+## Transparent integration
+Use your existing, compatible DashLLM serving image with its vLLM, PyTorch,
+and v6d dependencies. Install HiSim into the Python environment used by the
+serving workers and any Python-based v6d processes:
 
----
-## Installation
 ```bash
-cd tools/sglang_simulator
-pip install .
+# From the HiSim project root, before enabling simulation.
+python -m pip install .
 ```
 
----
-## Quick Start
-### Step 1: Mock Simulation
-This example runs inference simulation using real-world trace data. You may also use synthetic random workloads (see below).
+Save the configuration below as `hisim.json`, then add these settings to your
+normal serving environment:
 
-#### Launch the Simulation Server
-Run the following command from the project root directory (the folder containing this `README.md`):
 ```bash
-python3 -m sglang_simulator.simulation.sglang.launch_server \
-  --model-path "Qwen/Qwen3-32B-FP8" \
-  --sim-config-path test/assets/config.json
+export HISIM_ENABLE=1
+export HISIM_OUTPUT_MODE=BLOCKING
+export HISIM_CONFIG_PATH="$(pwd)/hisim.json"
+
+# Keep your existing DashLLM serving arguments and deployment configuration.
+dashllm_cmd serving
 ```
 
-> **Notes**:
-> - Use `--sim-config-path` to specify the simulation configuration file, which is equivalent to the system environment variable `SGLANG_SIMULATOR_CONFIG_PATH`.
-> - In pure CPU simulation environments, you may need to install the CPU-compatible version of vLLM (a dependency of SGLang CPU mode) and set the following environment variables:
->   ```bash
->   export SGLANG_USE_CPU_ENGINE=1
->   export FLASHINFER_DISABLE_VERSION_CHECK=1
->   ```
-> - The provided [config file](test/assets/config.json) is for testing. Adjust hardware bandwidth and other parameters to match your actual deployment scenario for higher fidelity.
+Installation provides `hisim.pth`, which installs hooks at Python startup when
+`HISIM_ENABLE=1`. Export the settings **before starting the service**, and make
+sure workers and v6d children inherit them and can read the configuration path.
+Changing the environment in an already-running interpreter does not rerun the
+startup hook. Adding `src` to `PYTHONPATH` alone does not install the `.pth` file.
 
-#### Run the Simulation Benchmark
-- **Synthetic random workload**:
-  ```bash
-  python3 -m sglang_simulator.simulation.bench_serving \
-      --warmup-requests 0 \
-      --model "Qwen/Qwen3-32B-FP8" \
-      --dataset-name random \
-      --request-rate 4 \
-      --random-input-len 1024 \
-      --random-output-len 1024 \
-      --num-prompts 10
-  ```
+Set `HISIM_ENABLE=0` and restart the service to stop automatic hook installation.
+Restore any simulation-specific engine settings when returning to real serving.
 
-You have now completed an inference simulation using framework interception.
+## Simulator configuration
+`HISIM_CONFIG_PATH` points to a JSON file describing the simulated hardware,
+predictor, and target parallelism. It is separate from DashLLM's
+`DS_LLM_ENGINE_CONFIG`, which configures the serving engine.
 
-#### Example Output
-```bash
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 not set
-Successful requests:                     10
-Benchmark duration (s):                  1.15
-Total input tokens:                      1997
-Total input text tokens:                 -1
-Total generated tokens:                  2798
-Total generated tokens (retokenized):    -1
-Request throughput (req/s):              1.58
-Input token throughput (tok/s):          316.20
-Output token throughput (tok/s):         443.04
-Peak output token throughput (tok/s):    -1.00
-Peak concurrent requests:                -1
-Total token throughput (tok/s):          759.24
-Concurrency:                             -1.00
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   3431.84
-Median E2E Latency (ms):                 3809.48
-P90 E2E Latency (ms):                    5309.93
-P99 E2E Latency (ms):                    6214.97
----------------Time to First Token----------------
-Mean TTFT (ms):                          128.59
-Median TTFT (ms):                        128.59
-P99 TTFT (ms):                           128.59
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          12.14
-Median TPOT (ms):                        12.44
-P99 TPOT (ms):                           12.89
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           11.85
-Median ITL (ms):                         11.95
-P95 ITL (ms):                            12.05
-P99 ITL (ms):                            12.07
-Max ITL (ms):                            12.08
-==================================================
-```
+A single-node configuration using `linear`:
 
-> Fields marked with `-1` indicate unsupported metrics in simulation mode.
-
----
-## Usage
-### Mock Simulation (Inference Simulation)
-sglang_simulator uses **dynamic interception** to hijack the execution flow of the inference framework, bypassing actual LLM computation.
-
-- For supported launch options, run:
-  ```bash
-  python -m sglang_simulator.simulation.sglang.launch_server --help
-  ```
-
----
-### Configuration File Format (`SGLANG_SIMULATOR_CONFIG_PATH`)
-The config file is a JSON file with three main sections:
-
-- **`platform`**: Hardware and bandwidth settings
-  - `accelerator`: GPU model (e.g., `"h100_sxm"`)
-  - `disk_*_bandwidth_gb`: L3 (disk) read/write bandwidth (GB/s)
-  - `memory_*_bandwidth_gb`: L2 (memory) read/write bandwidth (GB/s)
-
-- **`predictor`**: Time prediction module
-  - `name`: predictor type (`"aiconfigurator"`)
-  - See the **TimePredictor** section below for details
-
-- **`scheduler`**: Parallelism and backend metadata
-  > ⚠️ **Note**: Multi-GPU parallelism (TP/EP) should not be configured at the framework level during server launch. Instead, specify `tp_size` and `ep_size` here; the predictor will simulate parallel execution overhead accordingly.
-  - When `predictor.name = "aiconfigurator"`, `backend_version` must be provided.
-
-**Example Config**:
 ```json
 {
-    "platform": {
-        "accelerator": {
-            "name": "a100_sxm",
-            "hbm_capacity_gb": 80
-        },
-        "disk_read_bandwidth_gb": 8,
-        "disk_write_bandwidth_gb": 8,
-        "memory_read_bandwidth_gb": 64,
-        "memory_write_bandwidth_gb": 64,
-        "num_device_per_node": 8
+  "platform": {
+    "accelerator": {
+      "name": "h100_sxm",
+      "hbm_capacity_gb": 80
     },
-    "predictor": {
-        "name": "aiconfigurator"
-    },
-    "scheduler": {
-        "tp_size": 1,
-        "ep_size": 1,
-        "dp_size": 1,
-        "backend_version": "0.5.9"
-    }
+    "memory_read_bandwidth_gb": 64,
+    "memory_write_bandwidth_gb": 64,
+    "disk_read_bandwidth_gb": 8,
+    "disk_write_bandwidth_gb": 8,
+    "num_device_per_node": 1
+  },
+  "predictor": {
+    "name": "linear",
+    "base_ms": 2.0,
+    "per_token_ms": 0.01
+  },
+  "scheduler": {
+    "tp_size": 1,
+    "ep_size": 1,
+    "dp_size": 1
+  }
 }
 ```
 
----
-## TimePredictor
-### AIConfigurator
-- Project: <https://github.com/ai-dynamo/aiconfigurator>
-- Parameters:
-  - `database_path`: (optional) path to custom operator profiling data
-  - `platform.accelerator.name`: device/system name; it should be one of those defined internally in AIConfigurator
-  - `prefill_scale_factor` / `decode_scale_factor`: optional calibration factors to adjust predicted latency
+These are example values, not calibrated performance estimates.
 
-**Example**:
+### Hardware and parallelism
+- `platform.accelerator.name` selects a hardware preset; see
+  [available presets](src/hisim/spec/accelerator/info.py). Custom devices require
+  their capacity and bandwidth fields; see
+  [configuration parsing](src/hisim/simulation/manager/config.py).
+- `memory_*_bandwidth_gb` and `disk_*_bandwidth_gb` describe memory and disk
+  bandwidth in GB/s; `num_device_per_node` describes the simulated node.
+- `scheduler.tp_size`, `ep_size`, and `dp_size` describe target parallelism for
+  simulation. HiSim forces vLLM engine parallelism to one and uses a single
+  executor; target parallelism does not launch corresponding GPU workers.
+- `scheduler.physical_block_size` can override the modeled KV block size when
+  matching a production cache layout. Leave it unset for framework-derived
+  sizing, especially for hybrid attention/Mamba models.
+
+### Latency predictor
+`linear` is useful for integration checks and controlled load experiments:
+
+```text
+step_latency_ms = base_ms + per_token_ms × scheduled_tokens
+```
+
+Scheduled tokens are the sum of request `extend_length` values in the batch,
+including prefill and decode tokens. Past KV length does not contribute. Both
+coefficients default to zero and must be non-negative; empty batches have zero
+latency. Set `per_token_ms=0` for constant latency per nonempty step. Linear
+coefficients are explicit inputs, not inferred from the hardware configuration.
+
+For calibrated prediction, replace the `predictor` section:
+- `aiconfigurator`: requires compatible AIConfigurator profiling data and
+  hardware/backend metadata. Options include `database_path`, `database_mode`
+  (default `SILICON`), `prefill_scale_factor`, and `decode_scale_factor`. Set
+  `scheduler.backend_name` and `backend_version` to the profiled backend.
+- `ml`: requires `database_path` pointing to a compatible trained model bundle;
+  `latency_scale` defaults to `1.0`.
+
+See [predictor selection and options](src/hisim/simulation/manager/config.py).
+Restart serving processes after editing the JSON; configuration is cached in
+each process.
+
+## DashLLM engine settings
+Keep your usual model, transport, service-discovery, and v6d configuration.
+Merge the following settings into your existing `DS_LLM_ENGINE_CONFIG` for a
+simple simulation run; do not replace its connector settings:
+
 ```json
 {
-  "name": "aiconfigurator",
-  "database_path": "path/to/aiconfigurator/data",
-  "prefill_scale_factor": 1.02040816,
-  "decode_scale_factor": 1.01010101
+  "load_format": "dummy",
+  "enforce_eager": true,
+  "async_scheduling": false
 }
 ```
+
+Model configuration and tokenizer files must remain available. Inference hooks
+skip real model execution, but framework model inspection and initialization
+still run. Disable model preloading/staging through your serving image's
+settings when it would otherwise copy real weights.
+
+For cache tests, keep prefix caching and your v6d connector enabled. Input
+length, context limits, and cache capacity must allow complete **physical** KV
+blocks; short prompts may complete without storing anything in v6d. HiSim does
+not provision Redis, trackers, sockets, or cache topology for your deployment.
+
+On CPU-only hosts, ensure child workers have the intended device visibility
+before bootstrap. Some DashServing launchers overwrite `CUDA_VISIBLE_DEVICES`;
+HiSim's startup default does not override an existing value. Framework controls
+remain distinct from simulator settings.
+
+## Environment settings
+Simulator settings are defined in [src/hisim/env.py](src/hisim/env.py).
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `HISIM_ENABLE` | Install hooks automatically at Python startup | Disabled |
+| `HISIM_OUTPUT_MODE` | Use `BLOCKING` for live serving | `OFFLINE`; set explicitly |
+| `HISIM_CONFIG_PATH` | Simulator JSON path, readable by every worker | Required |
+| `HISIM_OUTPUT_DIR` | Directory for simulator outputs | `/tmp/hisim/output/`; the standalone worker wrapper uses `/tmp/hisim/<name>` |
+| `HISIM_LOG_LEVEL` | Simulator logging level | `INFO` |
+| `HISIM_RECORD_STATS` | Collect per-request/iteration simulator stats in `BLOCKING` mode | `0` |
+| `HISIM_MAX_TOKENS` | Override request output length and ignore EOS for controlled tests | Unset: keep request limits |
+| `HISIM_BW_PROFILE` | JSON calibration profile for v6d transfer-latency modeling | Unset: model disabled |
+
+Leave `HISIM_MAX_TOKENS` unset when testing the client's requested output lengths.
+Enable `HISIM_RECORD_STATS=1` only when internal statistics are needed; collection
+adds overhead beyond the normal client-side measurements.
+
+For cache-latency calibration, `HISIM_STORE_POLL_MS` and
+`HISIM_STORE_RANK_SYNC_MS` override store-completion profile values.
+`HISIM_SEG1_FLOOR_MS` and `HISIM_SEG1_PER_BLK_MS` set cross-node latency parameters;
+overriding either replaces the profile pair, with the unspecified value set to
+zero. See the [bandwidth model](src/hisim/simulation/hijack/v6d/bandwidth.py) for
+the profile schema and applicability.
+
+## End-to-end check
+The [single-node smoke test](test/test_dashllm_single_node.py) uses the equivalent
+DashLLM Python serving entrypoint, `BLOCKING` mode, and `linear` prediction:
+
+```bash
+python test/test_dashllm_single_node.py --model /path/to/local/model
+```
+
+Requires `redis-server`, `dashservingd`, and `v6d`. Random long-input requests
+verify cache growth via v6d's `POST /objects/list` (metadata, not KV payload).
+Services stop automatically; logs and snapshots remain in `tmp/dashllm-smoke-*`.
+Latency estimates depend on calibration and include real serving overhead.

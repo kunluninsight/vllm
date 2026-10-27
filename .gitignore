@@ -1,4 +1,7 @@
 .qoder/
 __pycache__/
+*egg-info/
+build/
 
 tmp/
+logs/

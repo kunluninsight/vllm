@@ -11,8 +11,9 @@
         "num_device_per_node": 8
     },
     "predictor": {
-        "name": "aiconfigurator",
-        "database_mode": "SOL"
+        "name": "linear",
+        "base_ms": 2.0, 
+        "per_token_ms": 0.01
     },
     "scheduler": {
         "tp_size": 1,

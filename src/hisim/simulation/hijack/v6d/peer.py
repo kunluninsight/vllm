@@ -1,0 +1,304 @@
+"""Keep native v6d cache accounting while bypassing payload copies.
+
+Use non-reserved bulkstore memory and TCP-only SRPC with soft-fail startup.
+Tiered reads retain native lookup/eviction and task-local hit/key logging.
+Remote metadata is fabricated by default, assuming a uniform learned object
+size and trusting tracker entries; V6D_SIM_STUB_META_PROBE=0 restores probing.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import logging
+import os
+
+from hisim.env import Envs
+from hisim.hook import BaseHook
+
+logger = logging.getLogger("hisim")
+
+# Avoid RDMA dependencies in the daemon process.
+os.environ.setdefault("SRPC_STREAM_DISABLE_RDMA", "1")
+
+# Attribute native hit counters to each asyncio read batch. Connector-local
+# cache shortcuts do not reach these hooks and are not counted.
+
+_HITSOURCE_COUNTERS = ("local", "p2p", "sharedfs", "tair_kvcm")
+
+# None outside a tracked read; otherwise this task's hit counters.
+_hit_bag: contextvars.ContextVar = contextvars.ContextVar(
+    "v6d_sim_hitsource_bag", default=None
+)
+
+
+def _hitsource_enabled() -> bool:
+    return Envs.v6d_hitsource_enabled()
+
+
+def _keysource_enabled() -> bool:
+    """Key-lineage logging: keys= suffix + CreateSource/EvictSource lines."""
+    return Envs.v6d_keysource_enabled()
+
+
+def _stub_meta_probe_enabled() -> bool:
+    return Envs.v6d_stub_meta_probe_enabled()
+
+
+def _fmt_keys(object_keys) -> str:
+    """Join nonempty object keys for lineage logging."""
+    keys = [k for k in (object_keys or ()) if k]
+    return ",".join(keys)
+
+
+# Transfer stubs leave native metadata, capacity, and eviction paths intact.
+
+
+def _sim_load_data_noop(*args, **kwargs):
+    """Skip synchronous remote payload copying."""
+    logger.debug("[v6d-sim] skip remote blob data transfer (no data plane)")
+    return None
+
+
+def _sim_async_load_data_noop(*args, **kwargs):
+    return []
+
+
+# The fabricated-meta path assumes uniform sizes; zero means not yet learned.
+_learned_page_size = 0
+
+
+def _learn_page_size_from_peer(peer) -> None:
+    """Cache the first positive vineyard object size for fabricated metadata."""
+    global _learned_page_size
+    if _learned_page_size > 0:
+        return
+    info = getattr(peer, "_object_info", None)
+    if not info:
+        return
+    for oi in info.values():
+        if getattr(oi, "tier", None) == "vineyard":
+            size = getattr(oi, "size", 0) or 0
+            if size > 0:
+                _learned_page_size = size
+                return
+
+
+def _sim_get_metas_by_names(names, endpoint, trace_id=""):
+    """Fabricate metadata without confirming remote existence or actual size."""
+    size = _learned_page_size
+    if size <= 0:
+        # No learned size: reject the probe rather than fabricate an arbitrary size.
+        raise KeyError(
+            f"[v6d-sim] remote meta probe {endpoint}: page size unknown "
+            f"(no local store yet), {len(names)} keys treated as unfetchable"
+        )
+    from v6d.lite.common.type import ObjectID, ObjectMeta
+
+    blob_meta = {
+        "id": ObjectID.invalid_object_id().to_string(),
+        "length": size,
+        "nbytes": size,
+        "transient": False,
+        "instance_id": 0,
+        "typename": "vineyard::Blob",
+    }
+    return [
+        ObjectMeta.from_dict(
+            {
+                "size": size,
+                # Include object/blob fields required by native metadata sealing.
+                "typename": "vineyard::Object",
+                "instance_id": 0,
+                "transient": False,
+                "user_name": "",
+                "buffer_num": 1,
+                "buffer_0": dict(blob_meta),
+            }
+        )
+        for _ in names
+    ]
+
+
+class C_VineyardPeerHook(BaseHook):
+    """Disable bulkstore pre-reservation and tolerate SRPC initialization failure."""
+
+    HOOK_CLASS_NAME = "VineyardPeer"
+    HOOK_MODULE_NAME = "v6d.server.peers.vineyard.peer"
+
+    @classmethod
+    def hook(cls, target):
+        original_init = target.__init__
+
+        def patched_init(self, argc=0, argv=None, *args, **kwargs):
+
+            import v6d.common.transfer as transfer
+
+            _original_init_srpc = transfer.init_srpc_transfer
+
+            def _init_srpc_soft_fail(*args, **kwargs):
+                try:
+                    return _original_init_srpc(*args, **kwargs)
+                except Exception as e:
+                    logger.warning(
+                        "[v6d-sim] SRPC init failed (%s); daemon continues, "
+                        "P2P meta probing will fail like a dead peer",
+                        e,
+                    )
+                    return None
+
+            transfer.init_srpc_transfer = _init_srpc_soft_fail
+
+            if argv is not None:
+                argv = [
+                    "--reserve_memory=false" if a == "--reserve_memory=true" else a
+                    for a in argv
+                ]
+            return original_init(self, argc, argv, *args, **kwargs)
+
+        target.__init__ = patched_init
+        logger.info(
+            "[v6d-sim] C_VineyardPeerHook installed: reserve_memory=false, "
+            "SRPC init soft-fail"
+        )
+
+
+class C_TieredVineyardPeerHook(BaseHook):
+    """Wrap native reads/create/eviction for logging and install transfer stubs."""
+
+    HOOK_CLASS_NAME = "TieredVineyardPeer"
+    HOOK_MODULE_NAME = "v6d.server.peers.tiered_vineyard.peer"
+
+    @classmethod
+    def hook(cls, target):
+        original_acquire_tiered_read = target._acquire_tiered_read
+
+        async def wrapped_acquire_tiered_read(self, *args, **kwargs):
+            if _stub_meta_probe_enabled():
+                # The process-wide metadata stub has no peer argument.
+                _learn_page_size_from_peer(self)
+            if not _hitsource_enabled():
+                return await original_acquire_tiered_read(self, *args, **kwargs)
+            object_keys = args[0] if args else kwargs.get("object_keys") or ()
+            request_id = kwargs.get("request_id")
+            bag = dict.fromkeys(_HITSOURCE_COUNTERS, 0)
+            token = _hit_bag.set(bag)
+            error = None
+            try:
+                return await original_acquire_tiered_read(self, *args, **kwargs)
+            except Exception as exc:
+                error = type(exc).__name__
+                raise
+            finally:
+                _hit_bag.reset(token)
+                queried = len(object_keys)
+                if queried:
+                    hits = sum(bag.values())
+                    keys_suffix = (
+                        " keys=" + _fmt_keys(object_keys)
+                        if _keysource_enabled()
+                        else ""
+                    )
+                    logger.info(
+                        "[V6D HitSource] request_id=%s queried=%d local=%d p2p=%d "
+                        "sharedfs=%d tair_kvcm=%d miss=%d%s%s",
+                        request_id,
+                        queried,
+                        bag["local"],
+                        bag["p2p"],
+                        bag["sharedfs"],
+                        bag["tair_kvcm"],
+                        max(queried - hits, 0),
+                        f" error={error}" if error else "",
+                        keys_suffix,
+                    )
+
+        target._acquire_tiered_read = wrapped_acquire_tiered_read
+
+        # Log requested CREATE keys, including existing objects merely touched.
+        original_acquire = target.acquire
+
+        async def wrapped_acquire(self, object_keys, scope, *args, **kwargs):
+            if not _keysource_enabled() or "CREATE" not in str(scope):
+                return await original_acquire(self, object_keys, scope, *args, **kwargs)
+            request_id = kwargs.get("request_id")
+            if request_id is None:
+                request_id = next((a for a in args[3:] if isinstance(a, str)), None)
+            try:
+                return await original_acquire(self, object_keys, scope, *args, **kwargs)
+            finally:
+                keys = _fmt_keys(object_keys)
+                if keys:
+                    logger.info(
+                        "[V6D CreateSource] request_id=%s n=%d keys=%s",
+                        request_id,
+                        len([k for k in (object_keys or ()) if k]),
+                        keys,
+                    )
+
+        target.acquire = wrapped_acquire
+
+        # Log evicted keys for cross-request cache lineage.
+        original_evict_batch = target._evict_batch_from_vineyard
+
+        async def wrapped_evict_batch(self, object_keys):
+            if not _keysource_enabled():
+                return await original_evict_batch(self, object_keys)
+            keys = _fmt_keys(object_keys)
+            try:
+                return await original_evict_batch(self, object_keys)
+            finally:
+                if keys:
+                    logger.info(
+                        "[V6D EvictSource] n=%d keys=%s",
+                        len([k for k in (object_keys or ()) if k]),
+                        keys,
+                    )
+
+        target._evict_batch_from_vineyard = wrapped_evict_batch
+
+        # Payload stubs apply process-wide; metadata probing is configurable.
+        import v6d.common.transfer as transfer
+
+        transfer.load_data = _sim_load_data_noop
+        transfer.async_load_data = _sim_async_load_data_noop
+        _stub_meta = _stub_meta_probe_enabled()
+        if _stub_meta:
+            transfer.get_metas_by_names = _sim_get_metas_by_names
+
+        logger.info(
+            "[v6d-sim] C_TieredVineyardPeerHook installed: real "
+            "_acquire_tiered_read + [V6D HitSource] stats + %s SRPC meta "
+            "probe (payload copies stubbed); key lineage (keys= suffix + "
+            "CreateSource/EvictSource) %s",
+            "stubbed" if _stub_meta else "real",
+            "on" if _keysource_enabled() else "off",
+        )
+
+
+class C_HitRateStatsHook(BaseHook):
+    """Count native hit classifications in the current read's context bag."""
+
+    HOOK_CLASS_NAME = "HitRateStats"
+    HOOK_MODULE_NAME = "v6d.server.peers.tiered_vineyard.stats"
+
+    @classmethod
+    def hook(cls, target):
+        def wrap(name, counter):
+            original = getattr(target, name)
+
+            def wrapped(self, size: int = 0):
+                bag = _hit_bag.get()
+                if bag is not None:
+                    bag[counter] += 1
+                return original(self, size)
+
+            setattr(target, name, wrapped)
+
+        wrap("record_local_vineyard_hit", "local")
+        wrap("record_remote_vineyard_hit", "p2p")
+        wrap("record_sharedfs_hit", "sharedfs")
+        wrap("record_tair_kvcm_hit", "tair_kvcm")
+        logger.info(
+            "[v6d-sim] C_HitRateStatsHook installed: record_*_hit -> "
+            "[V6D HitSource] bag"
+        )

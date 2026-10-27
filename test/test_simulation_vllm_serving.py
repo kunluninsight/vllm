@@ -7,7 +7,6 @@ Follows the pattern of test_simulation_sglang_serving.py:
 3. Validates that requests complete and timing is reasonable
 """
 
-import json
 import os
 import signal
 import subprocess
@@ -16,13 +15,14 @@ import time
 
 import requests
 
-os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = (
-    os.path.dirname(__file__) + "/assets/config_vllm.json"
-)
-os.environ["SGLANG_SIMULATOR_OUTPUT_MODE"] = "BLOCKING"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+from hisim.env import Envs
 
-MODEL_PATH = "/host/models/Qwen/Qwen3-0.6B/"
+Envs.set_config_path(os.path.dirname(__file__) + "/assets/config_vllm.json")
+Envs.set_output_mode("BLOCKING")
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["VLLM_FORCE_DETOKENIZE"] = "1"
+
+MODEL_PATH = "Qwen/Qwen3-0.6B"
 SERVER_PORT = 18100
 
 
@@ -31,16 +31,24 @@ class VLLMServingRunner:
         cmd = [
             sys.executable,
             "-m",
-            "sglang_simulator.simulation.vllm.launch_server",
-            "--model", model,
-            "--port", str(port),
-            "--dtype", "float16",
-            "--load-format", "dummy",
+            "hisim.simulation.hijack.vllm.launch_server",
+            "--model",
+            model,
+            "--port",
+            str(port),
+            "--dtype",
+            "float16",
+            "--load-format",
+            "dummy",
             "--enforce-eager",
-            "--block-size", "16",
-            "--gpu-memory-utilization", "0.9",
-            "--max-model-len", "8192",
-            "--num-gpu-blocks-override", "1000000",
+            "--block-size",
+            "16",
+            "--gpu-memory-utilization",
+            "0.9",
+            "--max-model-len",
+            "8192",
+            "--num-gpu-blocks-override",
+            "1000000",
         ]
         for k, v in extra_args.items():
             flag = "--" + k.replace("_", "-")
@@ -54,9 +62,7 @@ class VLLMServingRunner:
         env = os.environ.copy()
         self.port = port
         self.base_url = f"http://localhost:{port}"
-        self.server_proc = subprocess.Popen(
-            cmd, env=env, preexec_fn=os.setsid
-        )
+        self.server_proc = subprocess.Popen(cmd, env=env, preexec_fn=os.setsid)
 
         # Wait for server to be ready
         dur = 0
