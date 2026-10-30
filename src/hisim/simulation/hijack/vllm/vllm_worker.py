@@ -28,7 +28,7 @@ from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 # The benchmark-facing EngineArgs alias must support AsyncLLM-specific fields.
 EngineArgs = AsyncEngineArgs
 
-logger = get_logger("hisim")
+logger = get_logger()
 
 
 # Replace untouched engine defaults; keep async_scheduling user-controlled.

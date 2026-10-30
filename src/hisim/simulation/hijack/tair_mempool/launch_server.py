@@ -96,12 +96,12 @@ def make_parser():
         help="read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh",
     )
 
-    m = p.add_argument_group("mock options (env MOCK_PACE_<NAME>)")
+    m = p.add_argument_group("mock options (env HISIM_TAIR_MEMPOOL_<NAME>)")
     m.add_argument(
         "--config",
         help="JSON config keyed by option dest, plus an optional node_specs list",
     )
-    m.add_argument("--host", default="0.0.0.0")
+    m.add_argument("--host", default="0.0.0.0", help="bind address")
     m.add_argument(
         "--nodes",
         type=int,
@@ -220,7 +220,9 @@ def _provider_env_defaults(env):
 
     Only the capacity-relevant arguments are mapped: -s (DRAM MB) plus the tiering
     flags. push_only skips SSD init (and forces transparent), a tiering value other
-    than "true" leaves the Provider without an SSD backend.
+    than "true" leaves the Provider without an SSD backend. The virtual Provider
+    count has no real counterpart (each Provider is its own process), so it comes
+    from HISIM_TAIR_MEMPOOL_NODES like the other mock-only options.
     """
     out = {}
     raw = env.get("TAIR_MEMPOOL_SERVER_LOCAL_MEMORY_SIZE", "")
@@ -250,7 +252,7 @@ def _provider_env_defaults(env):
 
 
 def _mock_env_defaults(parser, env):
-    """Real Provider env plus MOCK_PACE_<DEST> -> argparse defaults (mock options only; MOCK_PACE_* wins)."""
+    """Real Provider env plus HISIM_TAIR_MEMPOOL_<DEST> -> argparse defaults (mock options only; HISIM_TAIR_MEMPOOL_* wins)."""
     out = _provider_env_defaults(env)
     for dest, _default, env_name in PROVIDER_TIERED_OPTS:
         raw = env.get(env_name, "")
@@ -264,7 +266,7 @@ def _mock_env_defaults(parser, env):
     )
     for action in mock_group._group_actions:
         dest = action.dest
-        raw = env.get("MOCK_PACE_" + dest.upper())
+        raw = env.get("HISIM_TAIR_MEMPOOL_" + dest.upper())
         if not raw or dest == "config":
             continue
         if action.nargs == 0:
@@ -276,7 +278,9 @@ def _mock_env_defaults(parser, env):
         else:
             value = action.type(raw) if action.type else raw
             if action.choices is not None and value not in action.choices:
-                raise SystemExit("invalid MOCK_PACE_%s=%r" % (dest.upper(), raw))
+                raise SystemExit(
+                    "invalid HISIM_TAIR_MEMPOOL_%s=%r" % (dest.upper(), raw)
+                )
             out[dest] = value
     return out
 
@@ -287,7 +291,7 @@ def parse_config(argv=None, env=None):
     parser = make_parser()
     pre, _ = parser.parse_known_args(argv)
     node_specs, defaults = None, {}
-    config_path = pre.config or env.get("MOCK_PACE_CONFIG")
+    config_path = pre.config or env.get("HISIM_TAIR_MEMPOOL_CONFIG")
     if config_path:
         with open(config_path) as fh:
             conf = json.load(fh)

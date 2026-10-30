@@ -4,6 +4,7 @@ Reads remain lazy: callers decide when to snapshot settings. Importing this
 module never imports inference frameworks or changes the process environment.
 """
 
+import json
 import logging
 import os
 
@@ -11,6 +12,7 @@ import os
 class Envs:
     ENABLE = "HISIM_ENABLE"
     CONFIG_PATH = "HISIM_CONFIG_PATH"
+    CONFIG_JSON = "HISIM_CONFIG_JSON"
     OUTPUT_DIR = "HISIM_OUTPUT_DIR"
     OUTPUT_MODE = "HISIM_OUTPUT_MODE"
     RECORD_STATS = "HISIM_RECORD_STATS"
@@ -45,6 +47,33 @@ class Envs:
                 )
             return None
         return path
+
+    @classmethod
+    def config_json(cls) -> str | None:
+        return os.getenv(cls.CONFIG_JSON, "").strip() or None
+
+    @classmethod
+    def load_config(cls) -> dict:
+        """Load the simulator config; HISIM_CONFIG_JSON overrides HISIM_CONFIG_PATH."""
+        text = cls.config_json()
+        if text is not None:
+            try:
+                config = json.loads(text)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Invalid JSON in {cls.CONFIG_JSON}: {e}") from e
+        else:
+            path = cls.config_path(required=False)
+            if path is None:
+                raise RuntimeError(
+                    f"The simulator configuration is not set. Set {cls.CONFIG_JSON} "
+                    f"to a JSON string or {cls.CONFIG_PATH} to an existing file "
+                    f"({os.getenv(cls.CONFIG_PATH)})."
+                )
+            with open(path) as f:
+                config = json.load(f)
+        if not isinstance(config, dict):
+            raise TypeError("The simulator configuration must be a JSON object.")
+        return config
 
     @classmethod
     def set_config_path(cls, path: str) -> None:

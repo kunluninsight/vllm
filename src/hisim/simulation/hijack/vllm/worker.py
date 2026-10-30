@@ -352,7 +352,15 @@ class C_VLLMWorkerHook(BaseHook):
                 )
 
                 return available_bytes
-            except Exception:
+            except Exception as e:
+                # Profiling needs the optional aiconfigurator extra; without it
+                # the fallback silently distorts the KV cache block count.
+                logger.warning(
+                    "[vLLM Hijack] Worker.determine_available_memory: profiling "
+                    "failed (%s), falling back to 80 gibibytes. Install "
+                    "hisim[aiconfigurator] for modeled KV capacity.",
+                    e,
+                )
                 return 80 * (1 << 30)  # 80 GiB fallback
 
         def override_get_kv_cache_spec(self):

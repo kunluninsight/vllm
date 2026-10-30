@@ -17,9 +17,10 @@ from hisim.spec.accelerator import AcceleratorInfo
 from hisim.spec.model import ModelInfo
 from hisim.time_predictor.base import InferTimePredictor, ScheduleBatch
 from hisim.utils import get_logger
+from hisim.utils.download import resolve_local_path
 
 
-logger = get_logger("sgl_simulator")
+logger = get_logger()
 
 
 class MLTimePredictor(InferTimePredictor):
@@ -65,6 +66,7 @@ class MLTimePredictor(InferTimePredictor):
         **kwargs,
     ):
         super().__init__(model, hw, config)
+        database_path = resolve_local_path(database_path)
         if not database_path or not os.path.exists(database_path):
             raise FileNotFoundError(
                 f"MLTimePredictor database_path not found: {database_path}"

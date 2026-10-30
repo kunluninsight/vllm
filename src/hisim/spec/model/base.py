@@ -3,7 +3,7 @@ from typing import Optional
 
 from hisim.utils import get_logger
 
-logger = get_logger("sgl_simulator")
+logger = get_logger()
 
 
 @dataclass

@@ -2,7 +2,7 @@ from typing import List, Optional, Union
 
 from hisim.utils import get_logger
 
-logger = get_logger("sgl_simulator")
+logger = get_logger()
 
 
 class BaseHook:

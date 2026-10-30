@@ -6,7 +6,7 @@ from typing import List, Union
 from hisim.hook.base_hook import BaseHook, _register_hooks
 from hisim.utils import get_logger
 
-logger = get_logger("sgl_simulator")
+logger = get_logger()
 
 MODULE_HOOKS: List[BaseHook] = []
 

@@ -74,7 +74,7 @@ MAP_DTYPE_TO_CommQunatMode = {
 }
 
 
-logger = get_logger("sgl_simulator")
+logger = get_logger()
 
 
 def get_perf_model(

@@ -1,6 +1,7 @@
 """Launch vLLM's OpenAI server with HiSim hooks.
 
-Pass vLLM arguments plus --sim-config-path, or set HISIM_CONFIG_PATH.
+Pass vLLM arguments plus --sim-config-path, or set HISIM_CONFIG_PATH or
+HISIM_CONFIG_JSON.
 Set HISIM_OUTPUT_MODE=BLOCKING for wall-clock serving; the simulation default
 is OFFLINE even though the launcher's status message defaults to BLOCKING.
 """
@@ -19,7 +20,7 @@ from hisim.utils import get_logger
 
 init_hook()
 
-logger = get_logger("sgl_simulator")
+logger = get_logger()
 
 
 if __name__ == "__main__":
@@ -47,7 +48,9 @@ if __name__ == "__main__":
 
     # An existing environment config takes precedence over the CLI path.
     config_path = Envs.config_path(required=False)
-    if config_path:
+    if Envs.config_json():
+        logger.info(f"Using config from env: {Envs.CONFIG_JSON}")
+    elif config_path:
         logger.info(f"Using config from env: {config_path}")
     elif args.sim_config_path:
         Envs.set_config_path(args.sim_config_path)

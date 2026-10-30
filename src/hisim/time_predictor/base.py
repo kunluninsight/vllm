@@ -6,7 +6,7 @@ from hisim.spec.accelerator import AcceleratorInfo
 from hisim.spec.model import ModelInfo
 from hisim.utils import get_logger
 
-logger = get_logger("sgl_simulator")
+logger = get_logger()
 
 
 @dataclass

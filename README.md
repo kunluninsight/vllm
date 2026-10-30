@@ -108,7 +108,10 @@ For calibrated prediction, replace the `predictor` section:
   (default `SILICON`), `prefill_scale_factor`, and `decode_scale_factor`. Set
   `scheduler.backend_name` and `backend_version` to the profiled backend.
 - `ml`: requires `database_path` pointing to a compatible trained model bundle;
-  `latency_scale` defaults to `1.0`.
+  `latency_scale` defaults to `1.0`. `database_path` may be an HTTP(S) URL; it is
+  downloaded once to `/tmp/hisim/downloads` and reused until that copy is deleted,
+  so publish updated bundles under a new URL. Bundles are loaded with `joblib`,
+  which can execute code: only use URLs you trust.
 
 See [predictor selection and options](src/hisim/simulation/manager/config.py).
 Restart serving processes after editing the JSON; configuration is cached in
@@ -149,7 +152,8 @@ Simulator settings are defined in [src/hisim/env.py](src/hisim/env.py).
 | --- | --- | --- |
 | `HISIM_ENABLE` | Install hooks automatically at Python startup | Disabled |
 | `HISIM_OUTPUT_MODE` | Use `BLOCKING` for live serving | `OFFLINE`; set explicitly |
-| `HISIM_CONFIG_PATH` | Simulator JSON path, readable by every worker | Required |
+| `HISIM_CONFIG_PATH` | Simulator JSON path, readable by every worker | Required unless `HISIM_CONFIG_JSON` is set |
+| `HISIM_CONFIG_JSON` | Inline simulator JSON string; overrides `HISIM_CONFIG_PATH` | Unset |
 | `HISIM_OUTPUT_DIR` | Directory for simulator outputs | `/tmp/hisim/output/`; the standalone worker wrapper uses `/tmp/hisim/<name>` |
 | `HISIM_LOG_LEVEL` | Simulator logging level | `INFO` |
 | `HISIM_RECORD_STATS` | Collect per-request/iteration simulator stats in `BLOCKING` mode | `0` |

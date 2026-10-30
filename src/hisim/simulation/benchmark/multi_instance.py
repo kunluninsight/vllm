@@ -18,7 +18,7 @@ from hisim.simulation.benchmark.load_balance import (
 from hisim.simulation.utils import calc_metrics
 from hisim.utils.logger import get_logger
 
-logger = get_logger("hisim")
+logger = get_logger()
 
 
 class MultiInstanceBenchmarkRunner(BaseBenchmarkRunner):

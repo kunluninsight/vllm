@@ -1,4 +1,3 @@
-import json
 from typing import Optional
 
 from hisim.env import Envs
@@ -25,8 +24,7 @@ class ConfigManager:
     @classmethod
     def _get_raw_config(cls) -> dict:
         if cls._raw_config is None:
-            with open(Envs.config_path()) as f:
-                cls._raw_config = json.load(f)
+            cls._raw_config = Envs.load_config()
         return cls._raw_config
 
     @classmethod

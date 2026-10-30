@@ -56,15 +56,15 @@ Start-up (launch_server.py owns the command line, env expansion, logging and bac
   rest is accepted and ignored), or --byenv to read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh.
   Placement tuning only reads the real env (TAIR_MEMPOOL_GA_* etc., see GA_INT_FIELDS) and can be
   changed at runtime through ga_alloc_config. Virtual Providers are described by mock options
-  --nodes/--dram/--ssd/--tiering-mode or node_specs in --config, also as env MOCK_PACE_<OPTION>;
+  --nodes/--dram/--ssd/--tiering-mode or node_specs in --config, also as env HISIM_TAIR_MEMPOOL_<OPTION>;
   their shape and tiering knobs are additionally taken from the real start_server_byenv.sh env
   (TAIR_MEMPOOL_SERVER_LOCAL_MEMORY_SIZE -s, SSD_SIZE_MB, ENABLE_TRANSPARENT_TIERING,
   PUSH_ONLY_MODE, TIERED_*), so one deployment env can drive both the real server and the mock
-  (precedence: default < --config < TAIR_MEMPOOL_* < MOCK_PACE_* < command line).
+  (precedence: default < --config < TAIR_MEMPOOL_* < HISIM_TAIR_MEMPOOL_* < command line).
 
   python3 -m hisim.simulation.hijack.tair_mempool.launch_server --nodes 3 --dram 64GB --ssd 512GB
   python3 -m hisim.simulation.hijack.tair_mempool.launch_server -p 12348 -b redis -l redis -o /tmp/meta.log
-  TAIR_MEMPOOL_META_LOG_PATH=/tmp/meta.log MOCK_PACE_NODES=8 \
+  TAIR_MEMPOOL_META_LOG_PATH=/tmp/meta.log HISIM_TAIR_MEMPOOL_NODES=8 \
       python3 -m hisim.simulation.hijack.tair_mempool.launch_server --byenv
   python3 test/test_tair_mempool_mocker.py        # self test (separate script)
 

@@ -84,9 +84,12 @@ def run():
         c.argv,
     )
     c = ls.parse_config(
-        ["--nodes", "2"], env={"MOCK_PACE_NODES": "7", "MOCK_PACE_DRAM": "8GB"}
+        ["--nodes", "2"],
+        env={"HISIM_TAIR_MEMPOOL_NODES": "7", "HISIM_TAIR_MEMPOOL_DRAM": "8GB"},
     )
-    check("MOCK_PACE_* env, CLI wins", c.nodes == 2 and c.dram == "8GB", vars(c))
+    check(
+        "HISIM_TAIR_MEMPOOL_* env, CLI wins", c.nodes == 2 and c.dram == "8GB", vars(c)
+    )
     c = ls.parse_config(
         [],
         env={
