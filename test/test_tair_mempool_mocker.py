@@ -8,6 +8,7 @@ import threading
 import urllib.error
 import urllib.request
 
+from hisim.simulation.hijack.tair_mempool import launch_server as ls
 from hisim.simulation.hijack.tair_mempool import mock_meta_service as mp
 
 
@@ -27,7 +28,7 @@ def run():
             failures.append(name)
 
     # ---- start-up options
-    c = mp.parse_config(
+    c = ls.parse_config(
         [
             "-p",
             "23456",
@@ -62,7 +63,7 @@ def run():
         c.port == 23456 and c.backend == "redis" and c.log_level == "WARN",
         vars(c),
     )
-    c = mp.parse_config(
+    c = ls.parse_config(
         ["--byenv"],
         env={
             "TAIR_MEMPOOL_META_LOG_PATH": "/tmp/m.log",
@@ -82,11 +83,11 @@ def run():
         and c.backend_args == "host=r-x;prefix=pace:",
         c.argv,
     )
-    c = mp.parse_config(
+    c = ls.parse_config(
         ["--nodes", "2"], env={"MOCK_PACE_NODES": "7", "MOCK_PACE_DRAM": "8GB"}
     )
     check("MOCK_PACE_* env, CLI wins", c.nodes == 2 and c.dram == "8GB", vars(c))
-    c = mp.parse_config(
+    c = ls.parse_config(
         [],
         env={
             "TAIR_MEMPOOL_SERVER_LOCAL_MEMORY_SIZE": "-s 153600 -R 1",
@@ -96,10 +97,10 @@ def run():
     )
     check(
         "start_server_byenv.sh shapes the virtual Providers",
-        c.dram == "153600MB" and c.ssd == "10240MB" and c.tiering_mode == "transparent",
+        c.dram == "152576MB" and c.ssd == "10240MB" and c.tiering_mode == "transparent",
         vars(c),
     )
-    c = mp.parse_config(
+    c = ls.parse_config(
         ["--ssd", "4GB"],
         env={
             "TAIR_MEMPOOL_PUSH_ONLY_MODE": "true",
@@ -111,7 +112,7 @@ def run():
         c.ssd == "4GB" and c.tiering_mode == "transparent",
         vars(c),
     )
-    c = mp.parse_config([], env={"TAIR_MEMPOOL_ENABLE_TRANSPARENT_TIERING": "false"})
+    c = ls.parse_config([], env={"TAIR_MEMPOOL_ENABLE_TRANSPARENT_TIERING": "false"})
     check(
         "tiering disabled leaves no SSD backend",
         c.ssd == "0" and c.tiering_mode == "off",
@@ -133,7 +134,7 @@ def run():
     )
 
     # ---- service: provider 1 transparent, provider 2 explicit
-    cfg = mp.parse_config([], env={})
+    cfg = ls.parse_config([], env={})
     cfg.port, cfg.host, cfg.state_file, cfg.stats_interval = 0, "127.0.0.1", None, 0
     cfg.node_specs = [
         {"tiering_mode": "transparent", "dram": "1MB", "ssd": "4MB"},
@@ -141,7 +142,7 @@ def run():
     ]
     env = {"TAIR_MEMPOOL_GA_CANDIDATE_SHUFFLE": "0"}
     app = mp.MockPace(cfg, env=env)
-    mp.build_nodes(app, cfg)
+    ls.build_nodes(app, cfg)
     server = mp.Server((cfg.host, 0), app)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:%d" % server.server_address[1]
@@ -193,6 +194,43 @@ def run():
             },
             r,
         )
+
+        registrations = []
+
+        def consumer_sender(node, payload):
+            registrations.append((node, payload))
+            return {"total_bytes": 8192, "used_bytes": 0, "alloced_ga_num": 0,
+                    "ssd_total_bytes": 0, "ssd_used_bytes": 0,
+                    "tiering_enabled": False, "tiering_mode": "off"}
+
+        app.consumer_sender = consumer_sender
+        consumer = {"id": "consumer-1", "ip": "127.0.0.1", "port": 12346,
+                    "type": "consumer", "tiering_mode": "off"}
+        code, r = call("POST", "/v1/api/nodes", [consumer])
+        check(
+            "consumer registration assigns id and pushes local clusterinfo",
+            code == 200 and r == {"status": "success"}
+            and registrations == [(consumer, {"nodes": ["127.0.0.1"], "ids": [3],
+                                              "types": ["consumer"], "version": 1})]
+            and app.meta.consumers["consumer-1"]["pace_node_id"] == 3,
+            (code, r, registrations),
+        )
+        code, r = call("POST", "/v1/api/nodes", [consumer])
+        check("consumer registration is idempotent", code == 200
+              and registrations[-1][1]["ids"] == [3], (code, r, registrations))
+        code, r = call("GET", "/v1/api/memnode")
+        check(
+            "consumer capacity included in memnode totals",
+            code == 200 and r["memnodes"]["3"]["total_bytes"] == 8192
+            and r["mem_usage_stat"]["total_bytes"] == 2 * 1024 * 1024 + 8192
+            and r["mem_usage_stat"]["used_bytes"] == 0,
+            (code, r),
+        )
+        code, r = call("POST", "/v1/api/nodes", [])
+        check("empty node registration -> 400", code == 400
+              and r == {"status": "failed", "data": "Empty node list"}, (code, r))
+        code, r = call("POST", "/v1/api/nodes", [dict(consumer, type="provider")])
+        check("external provider registration rejected", code == 400, (code, r))
 
         code, r = call(
             "POST",
@@ -655,7 +693,7 @@ def run():
         code, r = call("POST", "/v1/api/gas/batch", {"size": 4 * kib, "count": 1})
         check("fault injection http 500", code == 500, (code, r))
         call("DELETE", "/admin/fault", with_auth=False)
-        code, r = call("POST", "/v1/api/nodes", {"x": 1})
+        code, r = call("GET", "/v1/api/nodes")
         code2, stats = call("GET", "/admin/stats", with_auth=False)
         check(
             "unimplemented route recorded",

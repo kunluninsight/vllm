@@ -35,12 +35,13 @@ Implemented routes (same paths and auth as the real Meta)
   GET    /v1/api/healthy                                no auth
   POST   /v1/api/admin_user, DELETE /v1/api/admin_user  Basic accounts (default admin:123)
   GET    /v1/api/memnode[?id=|nodeid=|ip=]
+  POST   /v1/api/nodes                                    consumer registration
   POST   /v1/api/gas, POST /v1/api/gas/batch            allocate
   GET    /v1/api/gas[?ga=&provider_id=&status=]         query
   DELETE /v1/api/gas[?ga=a,b | ?id=|nodeid=|ip=]        free
   POST   /v1/api/copy_ga/sync, POST /v1/api/copy_ga/batch_sync
   GET|POST /v1/api/admin/ga_alloc_config, POST /v1/api/admin/ga_alloc_config/reset
-  Other real routes (nodes / segment / async copy_ga / tiering admin ...) are not implemented: they
+  Other real routes (node deletion/query / segment / async copy_ga / tiering admin ...) are not implemented: they
   return 404 and are recorded in unknown_requests of /admin/stats.
 
 Mock admin routes (not in the real service, no auth)
@@ -50,7 +51,7 @@ Mock admin routes (not in the real service, no auth)
   copy_sync ga_alloc_config admin_user, "*" for all; rule
   {delay_ms: [min, max], fail_ratio: 0~1, fail_mode: status|http|drop|hang, http_code: 500, hang_s: 30}
 
-Start-up
+Start-up (launch_server.py owns the command line, env expansion, logging and background threads)
   Same command line as tair_mempool_meta_service (-p defaults to 12348; -o / -L take effect, the
   rest is accepted and ignored), or --byenv to read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh.
   Placement tuning only reads the real env (TAIR_MEMPOOL_GA_* etc., see GA_INT_FIELDS) and can be
@@ -61,11 +62,11 @@ Start-up
   PUSH_ONLY_MODE, TIERED_*), so one deployment env can drive both the real server and the mock
   (precedence: default < --config < TAIR_MEMPOOL_* < MOCK_PACE_* < command line).
 
-  python3 -m hisim.simulation.hijack.pace.mock_meta --nodes 3 --dram 64GB --ssd 512GB
-  python3 -m hisim.simulation.hijack.pace.mock_meta -p 12348 -b redis -l redis -o /tmp/meta.log
+  python3 -m hisim.simulation.hijack.tair_mempool.launch_server --nodes 3 --dram 64GB --ssd 512GB
+  python3 -m hisim.simulation.hijack.tair_mempool.launch_server -p 12348 -b redis -l redis -o /tmp/meta.log
   TAIR_MEMPOOL_META_LOG_PATH=/tmp/meta.log MOCK_PACE_NODES=8 \
-      python3 -m hisim.simulation.hijack.pace.mock_meta --byenv
-  python3 test/test_mock_pace_server.py           # self test (separate script)
+      python3 -m hisim.simulation.hijack.tair_mempool.launch_server --byenv
+  python3 test/test_tair_mempool_mocker.py        # self test (separate script)
 
 KVCM caveat (follows from the real semantics)
   - A request with media_type=2 and no media_policy is treated as AUTO by the real Meta; AUTO on a
@@ -95,22 +96,19 @@ Deviations from the real services (cannot or need not be reproduced)
   - The 404 body of unregistered routes is mock specific.
 """
 
-import argparse
 import base64
 import collections
 import ipaddress
 import json
-import logging
 import os
 import random
-import signal
 import socket
 import socketserver
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
+import urllib.request
 
 from hisim.simulation.hijack.tair_mempool.mock_provider import (
     LOG,
@@ -119,7 +117,6 @@ from hisim.simulation.hijack.tair_mempool.mock_provider import (
     MEDIA_SSD,
     PROVIDER_DEFAULT_WATERMARK_PCT,
     TIERS,
-    TIERING_MODES,
     ApiError,
     Provider,
     TieringParams,
@@ -200,35 +197,6 @@ POLICY_ALIASES = {
     "dram_ssd_aware": "dram_ssd_aware",
     "mem_ssd": "dram_ssd_aware",
 }
-# Real Meta command-line options the mock accepts but does not use, as
-# (flag, argparse dest, type / bool for a flag, help tail).
-PACE_IGNORED_FLAGS = (
-    ("-P", "thread_num", int, "server threads"),
-    ("-b", "backend", None, "memory/redis/mysql"),
-    ("-c", "backend_args", None, "metadata backend connection string"),
-    ("-n", "no_delete_network_err_node", bool, ""),
-    ("-t", "delete_node_timeout_s", int, ""),
-    ("-l", "leader_election", None, "no/zookeeper/redis"),
-    ("-z", "zookeeper_args", None, ""),
-    ("-i", "poll_interval_s", int, ""),
-    ("-m", "monitor_type", None, "local/kmonitor/prometheus/otel"),
-    ("-M", "monitor_port", int, ""),
-    ("--exclude_network_interface", "exclude_network_interface", None, ""),
-    ("--network_interface", "network_interface", None, ""),
-    ("--exclude_subnet", "exclude_subnet", None, ""),
-    ("--client_io_threads", "client_io_threads", int, ""),
-    ("--meta_thread_pool_size", "meta_thread_pool_size", int, ""),
-)
-PACE_IGNORED_OPTS = tuple(dest for _, dest, _, _ in PACE_IGNORED_FLAGS)
-
-# WaterMarkLoop knobs the real Provider takes from env, as (argparse dest, default,
-# env); the flag is the dest with dashes. See mock_provider for their effect.
-PROVIDER_TIERED_OPTS = (
-    ("watermark_check_ms", 100, "TAIR_MEMPOOL_TIERED_WATERMARK_CHECK_MS"),
-    ("demote_worker_count", 8, "TAIR_MEMPOOL_TIERED_DEMOTE_WORKER_COUNT"),
-    ("demote_batch_size", 8, "TAIR_MEMPOOL_TIERED_DEMOTE_BATCH_SIZE"),
-    ("demote_batch_mb", 256, "TAIR_MEMPOOL_TIERED_DEMOTE_BATCH_MB"),
-)
 
 
 # ===================================================================== common helpers
@@ -514,7 +482,8 @@ class Meta(object):
         self.env = env
         self.lock = threading.RLock()
         self.ga_cfg = GaAllocConfigStore(env)
-        self.providers = {}  # pace_node_id -> Provider
+        self.providers = {}      # pace_node_id -> Provider
+        self.consumers = {}      # node UUID -> consumer registration
         self.users = {}
         for item in auth or []:
             user, _, password = item.partition(":")
@@ -574,6 +543,67 @@ class Meta(object):
                 raise ApiError(409, "pace_node_id %d already exists" % pid)
             self.providers[pid] = provider
             return provider
+
+    @staticmethod
+    def _send_cluster_info(node, payload):
+        url = "http://%s:%d/api/clusterinfo" % (node["ip"], node["port"])
+        request = urllib.request.Request(
+            url, data=json.dumps(payload).encode(), method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            result = json.loads(response.read() or b"{}")
+        if result.get("status") != "success":
+            raise ApiError(500, "RegisterNodes failed")
+        status_url = "http://%s:%d/api/status" % (node["ip"], node["port"])
+        with urllib.request.urlopen(status_url, timeout=5) as response:
+            status = json.loads(response.read() or b"{}")
+        return status.get("data", {})
+
+    def register_consumers(self, nodes, sender=None):
+        """Register native consumers and push their local identity, without virtual Provider RPCs."""
+        if not isinstance(nodes, list) or not nodes:
+            raise ApiError(400, "Empty node list")
+        sender = sender or self._send_cluster_info
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise ApiError(400, "invalid JSON request")
+            if node.get("type") != "consumer":
+                raise ApiError(400, "mock only supports external consumer registration")
+            if not all(isinstance(node.get(key), str) and node[key] for key in ("id", "ip")) \
+                    or not is_json_int(node.get("port")) or not 0 < node["port"] < 65536:
+                raise ApiError(400, "invalid JSON request")
+            if node.get("tiering_mode", "off") != "off":
+                raise ApiError(400, "consumer tiering_mode must match mock Provider mode off")
+            with self.lock:
+                existing = self.consumers.get(node["id"])
+                if existing is not None:
+                    pace_id = existing["pace_node_id"]
+                else:
+                    used = set(self.providers) | {c["pace_node_id"] for c in self.consumers.values()}
+                    pace_id = max(used | {0}) + 1
+                    if pace_id > MAX_PACE_NODE_ID:
+                        raise ApiError(400, "pace_node_id exceeds uint16")
+            payload = {"nodes": [node["ip"]], "ids": [pace_id],
+                       "types": ["consumer"], "version": 1}
+            try:
+                reported = sender(node, payload) or {}
+            except ApiError:
+                raise
+            except Exception as exc:
+                raise ApiError(500, "RegisterNodes failed: %s" % exc)
+            with self.lock:
+                self.consumers[node["id"]] = dict(
+                    node, pace_node_id=pace_id, healthy=True,
+                    status=NODE_STATUS_HEALTHY,
+                    total_bytes=reported.get("total_bytes", 0),
+                    used_bytes=reported.get("used_bytes", 0),
+                    alloced_ga_num=reported.get("alloced_ga_num", 0),
+                    ssd_total_bytes=reported.get("ssd_total_bytes", 0),
+                    ssd_used_bytes=reported.get("ssd_used_bytes", 0),
+                    tiering_enabled=reported.get("tiering_enabled", False),
+                    tiering_mode=reported.get("tiering_mode", "off"),
+                )
 
     def unregister(self, pace_id):
         with self.lock:
@@ -1052,10 +1082,31 @@ class Meta(object):
 
     # --------------------------------------------------------------------- views
     def memnode_view(self, providers=None):
-        """GetNodeMemStatus built from each Provider's status report."""
+        """GetNodeMemStatus built from Provider reports and registered consumer capacity."""
         providers = self.provider_list() if providers is None else providers
         memnodes = {}
         total = used = gas = 0
+        with self.lock:
+            consumers = list(self.consumers.values())
+        for consumer in consumers:
+            total += consumer["total_bytes"]
+            used += consumer["used_bytes"]
+            gas += consumer["alloced_ga_num"]
+            memnodes[str(consumer["pace_node_id"])] = {
+                "node": {"id": consumer["id"], "ip": consumer["ip"],
+                         "port": consumer["port"], "type": "consumer"},
+                "pace_node_id": consumer["pace_node_id"],
+                "healthy": consumer["healthy"], "status": consumer["status"],
+                "peer_registered": True, "allocatable": False,
+                "total_bytes": consumer["total_bytes"],
+                "used_bytes": consumer["used_bytes"],
+                "alloced_ga_num": consumer["alloced_ga_num"],
+                "ssd_total_bytes": consumer["ssd_total_bytes"],
+                "ssd_used_bytes": consumer["ssd_used_bytes"],
+                "tiering_enabled": consumer["tiering_enabled"],
+                "tiering_mode": consumer["tiering_mode"],
+                "tiering_mode_mismatch": False,
+            }
         for p in providers:
             st = p.status()
             total += st["total_bytes"]
@@ -1606,6 +1657,11 @@ def r_admin_user_del(app, query, body):
     return 200, {"status": "success"}
 
 
+def r_nodes_register(app, query, body):
+    app.meta.register_consumers(_parse_json(body), sender=getattr(app, "consumer_sender", None))
+    return 200, {"status": "success"}
+
+
 def r_memnode(app, query, body):
     return json_result(app.meta.memnode_view(app.meta.nodes_by_params(query)))
 
@@ -1918,6 +1974,7 @@ ROUTES = {
     ("POST", "/v1/api/admin_user"): ("admin_user", r_admin_user_add, True),
     ("DELETE", "/v1/api/admin_user"): ("admin_user", r_admin_user_del, True),
     ("GET", "/v1/api/memnode"): ("memnode", r_memnode, True),
+    ("POST", "/v1/api/nodes"): ("nodes_register", r_nodes_register, True),
     ("POST", "/v1/api/gas"): ("gas_create", r_gas_create, True),
     ("POST", "/v1/api/gas/batch"): ("gas_batch", r_gas_batch, True),
     ("GET", "/v1/api/gas"): ("gas_get", r_gas_get, True),
@@ -2111,384 +2168,12 @@ class Server(ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
-# ======================================================================== bootstrap
-def build_nodes(app, cfg):
-    if cfg.node_specs:
-        for spec in cfg.node_specs:
-            app.add_provider(
-                spec.get("dram", cfg.dram),
-                spec.get("ssd", cfg.ssd),
-                ip=spec.get("ip"),
-                port=spec.get("port"),
-                uid=spec.get("id"),
-                healthy=spec.get("healthy", True),
-                pace_id=spec.get("pace_node_id"),
-                tiering_mode=spec.get("tiering_mode"),
-            )
-    else:
-        for _ in range(cfg.nodes):
-            app.add_provider(cfg.dram, cfg.ssd)
-
-
-def make_parser():
-    p = argparse.ArgumentParser(
-        description="Bookkeeping-only PACE (Tair Mempool) MetaService + Provider mock; accepts "
-        "tair_mempool_meta_service command-line options.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        allow_abbrev=False,
-    )
-    g = p.add_argument_group(
-        "tair_mempool_meta_service options (pace_meta_service.cpp)"
-    )
-    g.add_argument("-p", dest="port", type=int, default=12348, help="listen port")
-    g.add_argument("-o", dest="log_file", default="", help="log file, empty for stderr")
-    g.add_argument("-L", dest="log_level", default="INFO", help="log level")
-    g.add_argument("-v", action="version", version=VERSION)
-    for flag, dest, kind, tail in PACE_IGNORED_FLAGS:
-        note = "(ignored)" + (" " + tail if tail else "")
-        if kind is bool:
-            g.add_argument(flag, dest=dest, action="store_true", help=note)
-        else:
-            g.add_argument(flag, dest=dest, type=kind, default=None, help=note)
-    g.add_argument(
-        "--byenv",
-        action="store_true",
-        help="read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh",
-    )
-
-    m = p.add_argument_group("mock options (env MOCK_PACE_<NAME>)")
-    m.add_argument(
-        "--config",
-        help="JSON config keyed by option dest, plus an optional node_specs list",
-    )
-    m.add_argument("--host", default="0.0.0.0")
-    m.add_argument(
-        "--nodes",
-        type=int,
-        default=3,
-        help="number of virtual Providers (node_specs wins)",
-    )
-    m.add_argument("--dram", default="64GB", help="DRAM pool per Provider")
-    m.add_argument(
-        "--ssd", default="512GB", help="LocalSSD capacity per Provider, 0 for none"
-    )
-    m.add_argument(
-        "--tiering-mode",
-        choices=TIERING_MODES,
-        default="transparent",
-        help="default Provider tiering mode",
-    )
-    m.add_argument(
-        "--node-ip-base",
-        default="127.0.1.1",
-        help="first virtual Provider IP (incremented by pace_node_id)",
-    )
-    m.add_argument("--node-port", type=int, default=12346)
-    for dest, default, env_name in PROVIDER_TIERED_OPTS:
-        m.add_argument(
-            "--" + dest.replace("_", "-"),
-            type=int,
-            default=default,
-            help="env " + env_name,
-        )
-    m.add_argument(
-        "--demote-high-watermark-pct",
-        type=int,
-        default=85,
-        help="Provider --demote_high_watermark_pct (DramSlotPool clamps to <=85)",
-    )
-    m.add_argument(
-        "--demote-low-watermark-pct",
-        type=int,
-        default=70,
-        help="Provider --demote_low_watermark_pct",
-    )
-    m.add_argument(
-        "--alloc-ssd-full-pct",
-        type=int,
-        default=95,
-        help="SSD-full threshold of SyncDemoteForAlloc fail_fast",
-    )
-    m.add_argument(
-        "--auth",
-        action="append",
-        default=None,
-        metavar="USER:PASS",
-        help="initial Basic account, default admin:123",
-    )
-    m.add_argument("--no-auth", action="store_true", help="disable WithAuth")
-    m.add_argument(
-        "--delay-ms",
-        type=float,
-        nargs=2,
-        metavar=("MIN", "MAX"),
-        default=None,
-        help="global injected delay",
-    )
-    m.add_argument(
-        "--state-file",
-        default=None,
-        help="ledger snapshot file, loaded at start-up when present",
-    )
-    m.add_argument(
-        "--snapshot-interval",
-        type=float,
-        default=60.0,
-        help="periodic snapshot interval (s), 0 to disable",
-    )
-    m.add_argument(
-        "--stats-interval",
-        type=float,
-        default=30.0,
-        help="periodic stats log interval (s), 0 to disable",
-    )
-    m.add_argument("--access-log", action="store_true", help="log every request")
-    return p
-
-
-def expand_byenv(argv, env):
-    """Reproduce start_metaservice_byenv.sh: -o LOG "$@" EXACT STORAGE HA env_args."""
-    if "--byenv" not in argv:
-        return argv
-    rest = [a for a in argv if a != "--byenv"]
-    log_path = env.get("TAIR_MEMPOOL_META_LOG_PATH", "")
-    if not log_path:
-        raise SystemExit("Error: TAIR_MEMPOOL_META_LOG_PATH is not set")
-    extra = []
-    for key in (
-        "TAIR_MEMPOOL_META_EXACT_ARGS",
-        "TAIR_MEMPOOL_META_STORAGE",
-        "TAIR_MEMPOOL_META_HA",
-    ):
-        extra += env.get(key, "").split()
-    for key, opt in (
-        ("TAIR_MEMPOOL_META_EXCLUDE_NIC", "--exclude_network_interface"),
-        ("TAIR_MEMPOOL_META_NIC", "--network_interface"),
-        ("TAIR_MEMPOOL_META_EXCLUDE_SUBNET", "--exclude_subnet"),
-        ("TAIR_MEMPOOL_META_BACKEND_ARGS", "-c"),
-    ):
-        if env.get(key):
-            extra += [opt, env[key]]
-    # otel_env.sh appends this last when the exporter falls back to local metrics.
-    if env.get("TAIR_MEMPOOL_OTEL_FALLBACK_METRIC_TYPE") == "local":
-        extra += ["-m", "local"]
-    return ["-o", log_path] + rest + extra
-
-
-def _provider_env_defaults(env):
-    """start_server_byenv.sh provider shape -> virtual Provider defaults.
-
-    Only the capacity-relevant arguments are mapped: -s (DRAM MB) plus the tiering
-    flags. push_only skips SSD init (and forces transparent), a tiering value other
-    than "true" leaves the Provider without an SSD backend.
-    """
-    out = {}
-    raw = env.get("TAIR_MEMPOOL_SERVER_LOCAL_MEMORY_SIZE", "")
-    if raw:
-        tokens = raw.split()
-        size = tokens[tokens.index("-s") + 1] if "-s" in tokens[:-1] else ""
-        if size.isdigit():
-            out["dram"] = size + "MB"  # -s is MB, like info.mps_size_mb
-        else:
-            LOG.warning(
-                "ignore TAIR_MEMPOOL_SERVER_LOCAL_MEMORY_SIZE=%r without -s <MB>", raw
-            )
-    push_only = env.get("TAIR_MEMPOOL_PUSH_ONLY_MODE") == "true"
-    if push_only or "TAIR_MEMPOOL_ENABLE_TRANSPARENT_TIERING" in env:
-        transparent = (
-            push_only or env.get("TAIR_MEMPOOL_ENABLE_TRANSPARENT_TIERING") == "true"
-        )
-        out["tiering_mode"] = "transparent" if transparent else "off"
-        if transparent and not push_only:
-            # The script materializes 10240M when SSD_SIZE_MB is unset.
-            out["ssd"] = (env.get("TAIR_MEMPOOL_SSD_SIZE_MB") or "10240") + "MB"
-        else:
-            out["ssd"] = "0"
-    return out
-
-
-def _mock_env_defaults(parser, env):
-    """Real Provider env plus MOCK_PACE_<DEST> -> argparse defaults (mock options only; MOCK_PACE_* wins)."""
-    out = _provider_env_defaults(env)
-    for dest, _default, env_name in PROVIDER_TIERED_OPTS:
-        raw = env.get(env_name, "")
-        if raw:
-            try:
-                out[dest] = int(raw)
-            except ValueError:
-                LOG.warning("ignore invalid %s=%r", env_name, raw)
-    mock_group = next(
-        gr for gr in parser._action_groups if gr.title.startswith("mock options")
-    )
-    for action in mock_group._group_actions:
-        dest = action.dest
-        raw = env.get("MOCK_PACE_" + dest.upper())
-        if not raw or dest == "config":
-            continue
-        if action.nargs == 0:
-            out[dest] = str(raw).strip().lower() in ("1", "true", "yes", "on")
-        elif action.nargs == 2:
-            out[dest] = [float(x) for x in str(raw).replace(",", " ").split()]
-        elif dest == "auth":
-            out[dest] = [x for x in str(raw).split(",") if x]
-        else:
-            value = action.type(raw) if action.type else raw
-            if action.choices is not None and value not in action.choices:
-                raise SystemExit("invalid MOCK_PACE_%s=%r" % (dest.upper(), raw))
-            out[dest] = value
-    return out
-
-
-def parse_config(argv=None, env=None):
-    env = os.environ if env is None else env
-    argv = expand_byenv(list(sys.argv[1:] if argv is None else argv), env)
-    parser = make_parser()
-    pre, _ = parser.parse_known_args(argv)
-    node_specs, defaults = None, {}
-    config_path = pre.config or env.get("MOCK_PACE_CONFIG")
-    if config_path:
-        with open(config_path) as fh:
-            conf = json.load(fh)
-        node_specs = conf.pop("node_specs", None)
-        unknown = set(conf) - {a.dest for a in parser._actions}
-        if unknown:
-            parser.error("unknown config keys: %s" % sorted(unknown))
-        defaults.update(conf)
-    defaults.update(_mock_env_defaults(parser, env))
-    parser.set_defaults(**defaults)
-    cfg = parser.parse_args(argv)
-    cfg.node_specs = node_specs
-    cfg.argv = argv
-    cfg.auth = [] if cfg.no_auth else (cfg.auth or ["admin:123"])
-    for key in ("dram", "ssd"):
-        parse_size(getattr(cfg, key))
-    if (
-        cfg.demote_worker_count <= 0
-        or not 1 <= cfg.demote_batch_size <= 1024
-        or cfg.demote_batch_mb <= 0
-        or cfg.watermark_check_ms <= 0
-    ):
-        parser.error(
-            "demote worker/batch/batch_mb/watermark_check_ms must be positive (batch_size <= 1024)"
-        )
-    return cfg
-
-
-def setup_logging(cfg):
-    name = str(cfg.log_level).upper()
-    level = {"WARN": logging.WARNING, "FATAL": logging.CRITICAL}.get(
-        name, getattr(logging, name, logging.INFO)
-    )
-    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    if cfg.log_file:
-        if os.path.dirname(cfg.log_file):
-            os.makedirs(os.path.dirname(cfg.log_file), exist_ok=True)
-        logging.basicConfig(level=level, format=fmt, filename=cfg.log_file)
-    else:
-        logging.basicConfig(level=level, format=fmt)
-
-
-def start_background(app):
-    """Harness threads: periodic snapshot / stats log, and the Providers' WaterMarkLoop clock."""
-    stop = threading.Event()
-
-    def housekeeping():
-        last_snap = last_stats = time.monotonic()
-        last_line = ""
-        while not stop.wait(1.0):
-            now = time.monotonic()
-            if (
-                app.cfg.state_file
-                and app.cfg.snapshot_interval > 0
-                and now - last_snap >= app.cfg.snapshot_interval
-            ):
-                last_snap = now
-                try:
-                    app.save()
-                except Exception:
-                    LOG.exception("periodic snapshot failed")
-            if (
-                app.cfg.stats_interval > 0
-                and now - last_stats >= app.cfg.stats_interval
-            ):
-                last_stats = now
-                line = app.summary_line()
-                if line != last_line:
-                    LOG.info("stats: %s", line)
-                    last_line = line
-
-    def watermark_loop():
-        interval = app.cfg.watermark_check_ms / 1000.0
-        while not stop.wait(interval):
-            try:
-                app.tiering_tick_all()
-            except Exception:
-                LOG.exception("tiering tick failed")
-
-    threading.Thread(target=housekeeping, name="mock-pace-bg", daemon=True).start()
-    threading.Thread(
-        target=watermark_loop, name="mock-pace-tiering", daemon=True
-    ).start()
-    return stop
-
-
-def serve(cfg):
-    app = MockPace(cfg)
-    if cfg.state_file and os.path.exists(cfg.state_file):
-        app.load(cfg.state_file)
-    else:
-        build_nodes(app, cfg)
-    server = Server((cfg.host, cfg.port), app)
-    stop = start_background(app)
-
-    def on_signal(signum, _frame):
-        LOG.info("signal %d received, shutting down", signum)
-        app.meta.shutting_down = True
-        stop.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
-    ignored = [
-        "%s=%s" % (d, "(hidden)" if d == "backend_args" else getattr(cfg, d))
-        for d in PACE_IGNORED_OPTS
-        if getattr(cfg, d, None) not in (None, False)
-    ]
-    if ignored:
-        LOG.info(
-            "pace meta options accepted but not used by mock: %s", ", ".join(ignored)
-        )
-    LOG.info(
-        "mock pace listening on http://%s:%d auth=%s providers=%d ga_alloc_config=%s",
-        cfg.host,
-        server.server_address[1],
-        "on" if app.meta.users else "off",
-        len(app.meta.provider_list()),
-        app.meta.ga_cfg.get(),
-    )
-    LOG.info("stats: %s", app.summary_line())
-    print(
-        "mock pace listening on http://%s:%d (log: %s)"
-        % (cfg.host, server.server_address[1], cfg.log_file or "stderr"),
-        flush=True,
-    )
-    try:
-        server.serve_forever(poll_interval=0.5)
-    finally:
-        server.server_close()
-        if cfg.state_file:
-            try:
-                app.save()
-            except Exception:
-                LOG.exception("final snapshot failed")
-
-
 def main(argv=None):
-    cfg = parse_config(argv)
-    setup_logging(cfg)
-    serve(cfg)
-    return 0
+    """Kept so `python -m ...mock_meta_service` still works; startup lives in launch_server."""
+    from hisim.simulation.hijack.tair_mempool.launch_server import main as launch_main
+
+    return launch_main(argv)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

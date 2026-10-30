@@ -240,12 +240,12 @@ class C_TieredVineyardPeerHook(BaseHook):
         # Log evicted keys for cross-request cache lineage.
         original_evict_batch = target._evict_batch_from_vineyard
 
-        async def wrapped_evict_batch(self, object_keys):
+        async def wrapped_evict_batch(self, object_keys, *args, **kwargs):
             if not _keysource_enabled():
-                return await original_evict_batch(self, object_keys)
+                return await original_evict_batch(self, object_keys, *args, **kwargs)
             keys = _fmt_keys(object_keys)
             try:
-                return await original_evict_batch(self, object_keys)
+                return await original_evict_batch(self, object_keys, *args, **kwargs)
             finally:
                 if keys:
                     logger.info(
