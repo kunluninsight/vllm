@@ -42,6 +42,9 @@ PACE_IGNORED_FLAGS = (
 )
 PACE_IGNORED_OPTS = tuple(dest for _, dest, _, _ in PACE_IGNORED_FLAGS)
 
+# --byenv log file when TAIR_MEMPOOL_META_LOG_PATH is unset.
+DEFAULT_META_LOG_PATH = "/tmp/meta.log"
+
 # WaterMarkLoop knobs the real Provider takes from env, as (argparse dest, default,
 # env); the flag is the dest with dashes. See mock_provider for their effect.
 PROVIDER_TIERED_OPTS = (
@@ -93,7 +96,8 @@ def make_parser():
     g.add_argument(
         "--byenv",
         action="store_true",
-        help="read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh",
+        help="read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh "
+        "(TAIR_MEMPOOL_META_LOG_PATH defaults to %s)" % DEFAULT_META_LOG_PATH,
     )
 
     m = p.add_argument_group("mock options (env HISIM_TAIR_MEMPOOL_<NAME>)")
@@ -191,9 +195,8 @@ def expand_byenv(argv, env):
     if "--byenv" not in argv:
         return argv
     rest = [a for a in argv if a != "--byenv"]
-    log_path = env.get("TAIR_MEMPOOL_META_LOG_PATH", "")
-    if not log_path:
-        raise SystemExit("Error: TAIR_MEMPOOL_META_LOG_PATH is not set")
+    # The real script requires it; the mock falls back to a default.
+    log_path = env.get("TAIR_MEMPOOL_META_LOG_PATH") or DEFAULT_META_LOG_PATH
     extra = []
     for key in (
         "TAIR_MEMPOOL_META_EXACT_ARGS",

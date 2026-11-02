@@ -53,7 +53,8 @@ Mock admin routes (not in the real service, no auth)
 
 Start-up (launch_server.py owns the command line, env expansion, logging and background threads)
   Same command line as tair_mempool_meta_service (-p defaults to 12348; -o / -L take effect, the
-  rest is accepted and ignored), or --byenv to read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh.
+  rest is accepted and ignored), or --byenv to read TAIR_MEMPOOL_META_* like start_metaservice_byenv.sh
+  (TAIR_MEMPOOL_META_LOG_PATH defaults to /tmp/meta.log).
   Placement tuning only reads the real env (TAIR_MEMPOOL_GA_* etc., see GA_INT_FIELDS) and can be
   changed at runtime through ga_alloc_config. Virtual Providers are described by mock options
   --nodes/--dram/--ssd/--tiering-mode or node_specs in --config, also as env HISIM_TAIR_MEMPOOL_<OPTION>;
@@ -64,8 +65,7 @@ Start-up (launch_server.py owns the command line, env expansion, logging and bac
 
   python3 -m hisim.simulation.hijack.tair_mempool.launch_server --nodes 3 --dram 64GB --ssd 512GB
   python3 -m hisim.simulation.hijack.tair_mempool.launch_server -p 12348 -b redis -l redis -o /tmp/meta.log
-  TAIR_MEMPOOL_META_LOG_PATH=/tmp/meta.log HISIM_TAIR_MEMPOOL_NODES=8 \
-      python3 -m hisim.simulation.hijack.tair_mempool.launch_server --byenv
+  HISIM_TAIR_MEMPOOL_NODES=8 python3 -m hisim.simulation.hijack.tair_mempool.launch_server --byenv
   python3 test/test_tair_mempool_mocker.py        # self test (separate script)
 
 KVCM caveat (follows from the real semantics)
@@ -482,8 +482,8 @@ class Meta(object):
         self.env = env
         self.lock = threading.RLock()
         self.ga_cfg = GaAllocConfigStore(env)
-        self.providers = {}      # pace_node_id -> Provider
-        self.consumers = {}      # node UUID -> consumer registration
+        self.providers = {}  # pace_node_id -> Provider
+        self.consumers = {}  # node UUID -> consumer registration
         self.users = {}
         for item in auth or []:
             user, _, password = item.partition(":")
@@ -548,7 +548,9 @@ class Meta(object):
     def _send_cluster_info(node, payload):
         url = "http://%s:%d/api/clusterinfo" % (node["ip"], node["port"])
         request = urllib.request.Request(
-            url, data=json.dumps(payload).encode(), method="POST",
+            url,
+            data=json.dumps(payload).encode(),
+            method="POST",
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=5) as response:
@@ -570,22 +572,35 @@ class Meta(object):
                 raise ApiError(400, "invalid JSON request")
             if node.get("type") != "consumer":
                 raise ApiError(400, "mock only supports external consumer registration")
-            if not all(isinstance(node.get(key), str) and node[key] for key in ("id", "ip")) \
-                    or not is_json_int(node.get("port")) or not 0 < node["port"] < 65536:
+            if (
+                not all(
+                    isinstance(node.get(key), str) and node[key] for key in ("id", "ip")
+                )
+                or not is_json_int(node.get("port"))
+                or not 0 < node["port"] < 65536
+            ):
                 raise ApiError(400, "invalid JSON request")
             if node.get("tiering_mode", "off") != "off":
-                raise ApiError(400, "consumer tiering_mode must match mock Provider mode off")
+                raise ApiError(
+                    400, "consumer tiering_mode must match mock Provider mode off"
+                )
             with self.lock:
                 existing = self.consumers.get(node["id"])
                 if existing is not None:
                     pace_id = existing["pace_node_id"]
                 else:
-                    used = set(self.providers) | {c["pace_node_id"] for c in self.consumers.values()}
+                    used = set(self.providers) | {
+                        c["pace_node_id"] for c in self.consumers.values()
+                    }
                     pace_id = max(used | {0}) + 1
                     if pace_id > MAX_PACE_NODE_ID:
                         raise ApiError(400, "pace_node_id exceeds uint16")
-            payload = {"nodes": [node["ip"]], "ids": [pace_id],
-                       "types": ["consumer"], "version": 1}
+            payload = {
+                "nodes": [node["ip"]],
+                "ids": [pace_id],
+                "types": ["consumer"],
+                "version": 1,
+            }
             try:
                 reported = sender(node, payload) or {}
             except ApiError:
@@ -594,7 +609,9 @@ class Meta(object):
                 raise ApiError(500, "RegisterNodes failed: %s" % exc)
             with self.lock:
                 self.consumers[node["id"]] = dict(
-                    node, pace_node_id=pace_id, healthy=True,
+                    node,
+                    pace_node_id=pace_id,
+                    healthy=True,
                     status=NODE_STATUS_HEALTHY,
                     total_bytes=reported.get("total_bytes", 0),
                     used_bytes=reported.get("used_bytes", 0),
@@ -1093,11 +1110,17 @@ class Meta(object):
             used += consumer["used_bytes"]
             gas += consumer["alloced_ga_num"]
             memnodes[str(consumer["pace_node_id"])] = {
-                "node": {"id": consumer["id"], "ip": consumer["ip"],
-                         "port": consumer["port"], "type": "consumer"},
+                "node": {
+                    "id": consumer["id"],
+                    "ip": consumer["ip"],
+                    "port": consumer["port"],
+                    "type": "consumer",
+                },
                 "pace_node_id": consumer["pace_node_id"],
-                "healthy": consumer["healthy"], "status": consumer["status"],
-                "peer_registered": True, "allocatable": False,
+                "healthy": consumer["healthy"],
+                "status": consumer["status"],
+                "peer_registered": True,
+                "allocatable": False,
                 "total_bytes": consumer["total_bytes"],
                 "used_bytes": consumer["used_bytes"],
                 "alloced_ga_num": consumer["alloced_ga_num"],
@@ -1658,7 +1681,9 @@ def r_admin_user_del(app, query, body):
 
 
 def r_nodes_register(app, query, body):
-    app.meta.register_consumers(_parse_json(body), sender=getattr(app, "consumer_sender", None))
+    app.meta.register_consumers(
+        _parse_json(body), sender=getattr(app, "consumer_sender", None)
+    )
     return 200, {"status": "success"}
 
 

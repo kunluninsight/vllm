@@ -83,6 +83,12 @@ def run():
         and c.backend_args == "host=r-x;prefix=pace:",
         c.argv,
     )
+    c = ls.parse_config(["--byenv"], env={})
+    check(
+        "--byenv default log path",
+        c.log_file == ls.DEFAULT_META_LOG_PATH,
+        c.argv,
+    )
     c = ls.parse_config(
         ["--nodes", "2"],
         env={"HISIM_TAIR_MEMPOOL_NODES": "7", "HISIM_TAIR_MEMPOOL_DRAM": "8GB"},
