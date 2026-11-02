@@ -119,32 +119,47 @@ class SimulatedKVController:
             state = self.hybrid._saving.get(rid)
             if state is None:
                 raise RuntimeError(f"Store request {rid} is missing")
+            # Group info begins with (keys, gpu_block_ids); newer engines append fields.
             wanted = Counter(
                 bid
-                for gid, (_keys, ids) in groups.items()
+                for gid, info in groups.items()
                 if gid in self.cache.mamba_group_ids
-                for bid in ids
+                for bid in info[1]
             )
             with self._lock:
-                taken, remaining = [], []
-                for block in self.cache._swap_protected_blocks.get(rid, ()):
-                    if wanted[block.block_id]:
-                        wanted[block.block_id] -= 1
-                        taken.append(block)
-                    else:
-                        remaining.append(block)
-                if remaining:
-                    self.cache._swap_protected_blocks[rid] = remaining
-                else:
-                    self.cache._swap_protected_blocks.pop(rid, None)
+                taken = self._detach_protected_blocks(rid, wanted)
             self._staged.append(
                 self.Store(
                     state._req,
                     taken,
-                    sum(len(keys) for keys, _ids in groups.values()),
+                    sum(len(info[0]) for info in groups.values()),
                     last,
                 )
             )
+
+    def _detach_protected_blocks(self, rid, wanted):
+        """Take wanted pins from per-request state or the legacy scheduler dict."""
+        legacy = getattr(self.cache, "_swap_protected_blocks", None)
+        if legacy is None:
+            state = self.cache._get_state(rid)
+            pinned = state.protected_blocks if state is not None else ()
+        else:
+            pinned = legacy.get(rid, ())
+        taken, remaining = [], []
+        for block in pinned:
+            if wanted[block.block_id]:
+                wanted[block.block_id] -= 1
+                taken.append(block)
+            else:
+                remaining.append(block)
+        if legacy is None:
+            if state is not None:
+                state.protected_blocks = remaining
+        elif remaining:
+            legacy[rid] = remaining
+        else:
+            legacy.pop(rid, None)
+        return taken
 
     def prepare(self, coroutine):
         future = Future()

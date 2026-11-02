@@ -363,7 +363,10 @@ def wait_for_stored_objects(v6d_url, before, timeout=30):
 def main():
     args = parse_args()
 
-    from dashserving.client._rust import LLMClient
+    try:
+        from dashserving.client.llm_client import LLMClient
+    except ImportError:  # Older DashServing releases
+        from dashserving.client._rust import LLMClient
     from dashserving.config import DashClientConfig
 
     ports = reserve_ports()
