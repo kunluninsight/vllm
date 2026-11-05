@@ -545,7 +545,27 @@ class C_V6dObjectBackendHook(BaseHook):
             result = await original_prepare(self, request, blocks, num_external_tokens)
             if result is not None or num_external_tokens <= 0:
                 return result
-            groups = self._scheduler._reqs_to_load.get(request.request_id, {})
+            scheduler = self._scheduler
+            if hasattr(scheduler, "_reqs_to_load"):
+                groups = scheduler._reqs_to_load.get(request.request_id)
+            elif hasattr(scheduler, "_get_state"):
+                # Newer vLLM keeps the prepared load plan in per-request state.
+                state = scheduler._get_state(request.request_id)
+                groups = state.pending_load_meta if state is not None else None
+            else:
+                raise RuntimeError(
+                    "[V6D Hijack] Unsupported scheduler load-plan contract"
+                )
+            if not groups:
+                raise RuntimeError(
+                    f"[V6D Hijack] Missing prepared load plan for {request.request_id} "
+                    f"with {num_external_tokens} external tokens"
+                )
+            # Preserve native ownership while snapshotting every group for timing.
+            groups = {
+                gid: (list(keys), list(block_ids))
+                for gid, (keys, block_ids) in groups.items()
+            }
             self._sim_controller.queue_load(request, num_external_tokens, groups)
             return result
 

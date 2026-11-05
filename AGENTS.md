@@ -10,3 +10,7 @@
 - This project targets PAI-vLLM; run E2E tests inside the serving image.
 - Once v6d and a local model are available, run `python test/test_dashllm_single_node.py --model <local-model-path>` and ensure it passes.
 - On upstream vLLM (no `dashservingd`/`v6d` on PATH), skip this test and report it as skipped rather than failed.
+
+
+## Env
+- Read `tmp/env.local.md` first if present; it contains developer-specific setup that takes precedence over your assumptions.

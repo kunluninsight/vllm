@@ -5,15 +5,14 @@ Run in the serving image with an existing local model (no downloads):
 
 The Python entrypoint is the serving worker used by `dashllm_cmd serving`.
 A private Redis, ports, sockets, and logs isolate this run from other services.
+Populate v6d, reset only GPU L1, then replay identical prompts to verify L2 loads.
 """
 
 import argparse
-from collections import namedtuple
-from contextlib import ExitStack
 import json
 import os
-from pathlib import Path
 import random
+import re
 import shutil
 import signal
 import socket
@@ -22,10 +21,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from collections import namedtuple
+from contextlib import ExitStack
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
-import uuid
-
 
 Ports = namedtuple("Ports", "grpc control worker_control redis v6d v6d_rpc sched_rpc")
 MAX_MODEL_LEN = 16384
@@ -58,7 +59,12 @@ def list_v6d_objects(base_url):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument(
+        "--requests",
+        type=int,
+        default=3,
+        help="Long requests per populate/replay phase",
+    )
     parser.add_argument(
         "--timeout", type=int, default=180, help="Startup timeout in seconds"
     )
@@ -175,6 +181,8 @@ def build_environment(root, work, model, ports):
             ),
             "HISIM_ENABLE": "1",
             "HISIM_OUTPUT_MODE": "BLOCKING",
+            # BLOCKING admission hit snapshots are opt-in.
+            "HISIM_RECORD_STATS": "1",
             "HISIM_MAX_TOKENS": "1",
             "HISIM_CONFIG_PATH": str(work / "config.json"),
             "HISIM_OUTPUT_DIR": str(work),
@@ -190,6 +198,12 @@ def build_environment(root, work, model, ports):
             "model_path": str(model),
             "DS_LLM_MULTI_ENGINE_NUM": "1",
             "DS_LLM_IGNORE_WARMUP": "1",
+            # Expose L1 invalidation only in these private workers, without SCR lifecycle.
+            "SCR_NEXT_CONTAINER": "1",
+            "SCR_ENABLE": "0",
+            "DS_LLM_ENABLE_SCR_CROSS_DEPLOYMENT_RESTORE": "0",
+            "VLLM_V6D_ASYNC_REGISTER": "0",
+            "DASHGEN_DEPLOYMENT_ROLE": "",
             "DSV_CONTROL_SERVER_BASE_PORT": str(ports.worker_control),
             "DS_LOG_ROOT_DIR": str(work / "logs"),
             "DS_MODEL_AGENT": "0",
@@ -326,35 +340,116 @@ def generate_once(client, prompt, log_path):
     return tokens
 
 
-def run_requests(client, request_count, block_size, log_path):
+def make_prompts(request_count, block_size):
     rng = random.Random(42)
-    for index in range(request_count):
-        # Schedule two complete physical blocks to trigger KV stores,
-        # including hybrid models whose effective blocks exceed 2K tokens.
+    prompts = []
+    for _ in range(request_count):
+        # Schedule two complete physical blocks, including large hybrid blocks.
         prompt_length = 2 * block_size + rng.randint(1, max(1, block_size // 4))
-        prompt = [rng.randint(100, 1000) for _ in range(prompt_length)]
+        prompts.append([rng.randint(100, 1000) for _ in range(prompt_length)])
+    return prompts
+
+
+def wait_for_request_hit(log_path, offset, prompt_length, timeout=5):
+    """Read the completed request's admission snapshot, not stale hit counters."""
+    pattern = re.compile(
+        r"\[HitRate\] rid=(\S+) input_len=(\d+) local_hit=(-?\d+) ext_hit=(\d+)"
+    )
+    deadline = time.monotonic() + timeout
+    while True:
+        with log_path.open("rb") as log:
+            log.seek(offset)
+            text = log.read().decode(errors="replace")
+        matches = [
+            match for match in pattern.finditer(text) if int(match[2]) == prompt_length
+        ]
+        if len(matches) == 1:
+            match = matches[0]
+            return {
+                "engine_request_id": match[1],
+                "local_hit_tokens": int(match[3]),
+                "external_hit_tokens": int(match[4]),
+            }
+        if len(matches) > 1:
+            raise AssertionError(f"Ambiguous request hit snapshots; inspect {log_path}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Missing request hit snapshot; inspect {log_path}")
+        time.sleep(0.1)
+
+
+def run_requests(client, prompts, log_path, phase, require_external=False):
+    rows = []
+    for index, prompt in enumerate(prompts):
+        offset = log_path.stat().st_size
         started = time.monotonic()
         tokens = generate_once(client, prompt, log_path)
+        elapsed = time.monotonic() - started
+        hit = wait_for_request_hit(log_path, offset, len(prompt))
+        if require_external and (
+            hit["external_hit_tokens"] <= 0 or hit["local_hit_tokens"] != 0
+        ):
+            raise AssertionError(f"Replay did not load L2 after L1 reset: {hit}")
+        rows.append(
+            {
+                "phase": phase,
+                "input_length": len(prompt),
+                "output_length": len(tokens),
+                "elapsed_s": elapsed,
+                **hit,
+            }
+        )
         print(
-            f"Request {index + 1}: input={len(prompt)}, output={len(tokens)}, "
-            f"elapsed={time.monotonic() - started:.3f}s",
+            f"{phase} request {index + 1}: input={len(prompt)}, output={len(tokens)}, "
+            f"local_hit={hit['local_hit_tokens']}, ext_hit={hit['external_hit_tokens']}, "
+            f"elapsed={elapsed:.3f}s",
             flush=True,
         )
+    return rows
+
+
+def reset_l1(port):
+    """Use the worker control callback; never reset the v6d connector."""
+    request = Request(
+        f"http://127.0.0.1:{port}/invalidate_kv_cache",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=30) as response:
+        status, result = response.status, json.load(response)
+    if status != 200 or result.get("status") != "kv_cache_invalidated":
+        raise AssertionError(f"L1 cache reset failed: HTTP {status}, {result}")
+
+
+def assert_l2_retained(before, after):
+    sizes = {obj["key"]: obj["size"] for obj in after["objects"]}
+    missing = [
+        obj["key"] for obj in before["objects"] if sizes.get(obj["key"]) != obj["size"]
+    ]
+    if missing:
+        raise AssertionError(f"L1 reset removed or changed L2 objects: {missing}")
 
 
 def wait_for_stored_objects(v6d_url, before, timeout=30):
     """Inspect only daemon-owned metadata; never create objects here."""
     before_keys = {obj["key"] for obj in before["objects"]}
     deadline = time.monotonic() + timeout
+    previous = None
     while True:
         after = list_v6d_objects(v6d_url)
-        stored = [
+        new_objects = [
             obj
             for obj in after["objects"]
-            if obj["key"] not in before_keys and obj["size"] > 0 and not obj["leased"]
+            if obj["key"] not in before_keys and obj["size"] > 0
         ]
-        if after["total"] > before["total"] and stored:
-            return after, stored
+        signature = {(obj["key"], obj["size"]) for obj in new_objects}
+        # Require all visible stores to release leases and settle across polls.
+        if new_objects and all(not obj["leased"] for obj in new_objects):
+            if signature == previous:
+                return after, new_objects
+            previous = signature
+        else:
+            previous = None
         if time.monotonic() >= deadline:
             raise AssertionError(f"No completed KV cache stores in v6d: {after}")
         time.sleep(0.5)
@@ -395,7 +490,10 @@ def main():
                 capability={"type": "generate"},
                 config=DashClientConfig(request_timeout_ms=60000),
             )
-            run_requests(client, args.requests, block_size, log_path)
+            short_prompt = [100] * max(1, min(64, block_size - 1))
+            rows = run_requests(client, [short_prompt], log_path, "short")
+            prompts = make_prompts(args.requests, block_size)
+            rows.extend(run_requests(client, prompts, log_path, "populate"))
             after, stored = wait_for_stored_objects(v6d_url, before)
             (work / "v6d-after.json").write_text(json.dumps(after, indent=2))
             declared_bytes = sum(obj["size"] for obj in stored)
@@ -404,8 +502,24 @@ def main():
                 f"declared_cache_bytes={declared_bytes}",
                 flush=True,
             )
+            reset_l1(ports.worker_control)
+            retained = snapshot_objects(v6d_url, work / "v6d-after-l1-reset.json")
+            assert_l2_retained(after, retained)
+            print("L1 reset succeeded; v6d L2 objects retained", flush=True)
+            rows.extend(
+                run_requests(
+                    client,
+                    prompts,
+                    log_path,
+                    "replay",
+                    require_external=True,
+                )
+            )
+            (work / "cache-replay.json").write_text(json.dumps(rows, indent=2))
+            snapshot_objects(v6d_url, work / "v6d-after-replay.json")
             print(
-                "PASS: single-node DashLLM/vLLM/v6d, BLOCKING + linear, native v6d cache populated",
+                "PASS: single-node DashLLM/vLLM/v6d, BLOCKING + linear, "
+                "native KV stores and L2 loads after L1 reset",
                 flush=True,
             )
         finally:

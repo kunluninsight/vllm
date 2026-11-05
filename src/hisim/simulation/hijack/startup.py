@@ -11,10 +11,12 @@ import torch
 def _patch_triton_for_cpu():
     """Allow driverless Triton imports and preload its CUDA language helpers.
 
-    vLLM permits zero active drivers with an empty device mask. Preserve an
-    existing mask; missing Triton helpers remain optional.
+    vLLM permits zero active drivers only with an empty device mask, so clear
+    masks assigned by launchers (e.g. DS_GPU_NUM) when no CUDA device exists.
+    Real GPU hosts keep their mask; missing Triton helpers remain optional.
     """
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    if not torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     try:
         import triton.language.extra.cuda  # noqa: F401

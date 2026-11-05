@@ -11,6 +11,7 @@ import warnings
 
 import joblib
 from sklearn.exceptions import InconsistentVersionWarning
+from threadpoolctl import ThreadpoolController
 
 from hisim.simulation.types import SchedulerConfig
 from hisim.spec.accelerator import AcceleratorInfo
@@ -101,6 +102,9 @@ class MLTimePredictor(InferTimePredictor):
                 "MLTimePredictor feature schema mismatch: "
                 f"saved={list(saved_features)!r}, expected={self.FEATURE_NAMES!r}"
             )
+        # Single-row predicts spend most time spinning up OpenMP threads on
+        # many-core hosts (~17ms vs ~1ms for HistGradientBoosting on 224 CPUs).
+        self._threadpool = ThreadpoolController()
 
         self._latency_scale = float(latency_scale)
         # Extra linear cost for requests that enable logprobs (GPU topk /
@@ -268,7 +272,8 @@ class MLTimePredictor(InferTimePredictor):
         features = self._extract_features(batch)
         is_decode = features[-2] == 1
         model = self._decode_model if is_decode else self._prefill_model
-        latency = float(model.predict([features])[0]) * self._latency_scale
+        with self._threadpool.limit(limits=1, user_api="openmp"):
+            latency = float(model.predict([features])[0]) * self._latency_scale
         return max(latency, 0.0)
 
     def predict_sample_tokens_time(self, batch: ScheduleBatch) -> float:
