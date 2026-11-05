@@ -15,7 +15,7 @@ logger = get_logger()
 
 
 class C_V6dObjectManagerHook(BaseHook):
-    """Connect through the native retry helper without invoking _on_connected."""
+    """Connect through the native retry helper, then run native connect callbacks."""
 
     HOOK_CLASS_NAME = "V6dObjectManager"
     HOOK_MODULE_NAME = (
@@ -45,6 +45,18 @@ class C_V6dObjectManagerHook(BaseHook):
                     getattr(self, "_v6d_url", "?"),
                 )
                 return
+            # With VLLM_V6D_ASYNC_REGISTER=1 this pushes the KV cache spec; skipping it
+            # leaves v6d at tair_kvcm.spec_received=false, never registered with KVCM.
+            on_connected = getattr(self, "_on_connected", None)
+            if on_connected is not None:
+                try:
+                    on_connected(self.client)
+                except Exception:
+                    logger.warning(
+                        "[V6D P2P] Manager group=%d on_connected callback failed",
+                        self._group_id,
+                        exc_info=True,
+                    )
             if self._v6d_backend is not None:
                 self._v6d_backend.mark_manager_connected(self._group_id)
 
@@ -111,6 +123,50 @@ class C_V6dObjectFetchHelperHook(BaseHook):
         )
 
 
+class _CapturingLoadPlans(dict):
+    """Snapshot each load plan on write.
+
+    build_connector_meta on the core thread swaps ``_reqs_to_load`` for a new
+    dict, so a plan published on the connector loop can vanish before the
+    backend reads it ("Missing prepared load plan").
+    """
+
+    __slots__ = ("captured",)
+
+    def __init__(self, data, captured):
+        super().__init__(data)
+        self.captured = captured
+
+    def __setitem__(self, req_id, groups):
+        self.captured[req_id] = {
+            gid: (list(keys), list(block_ids))
+            for gid, (keys, block_ids) in groups.items()
+        }
+        super().__setitem__(req_id, groups)
+
+    def __reduce__(self):
+        # Connector metadata reaches workers as a plain dict.
+        return dict, (dict(self),)
+
+
+def pop_captured_load_plan(scheduler, req_id):
+    """Return and forget the plan snapshot captured for ``req_id``, if any."""
+    captured = getattr(scheduler, "__dict__", {}).get("_sim_load_plans")
+    return captured.pop(req_id, None) if captured is not None else None
+
+
+def _get_reqs_to_load(self):
+    try:
+        return self.__dict__["_sim_reqs_to_load"]
+    except KeyError:
+        raise AttributeError("_reqs_to_load") from None
+
+
+def _set_reqs_to_load(self, value):
+    captured = self.__dict__.setdefault("_sim_load_plans", {})
+    self.__dict__["_sim_reqs_to_load"] = _CapturingLoadPlans(value, captured)
+
+
 class C_V6dObjectConnectorSchedulerHook(BaseHook):
     """Finish CPU no-op stores without waiting; leave matching/allocation native."""
 
@@ -121,6 +177,7 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        target._reqs_to_load = property(_get_reqs_to_load, _set_reqs_to_load)
         original_request_finished = getattr(target, "request_finished", None)
         original_request_finished_all_groups = getattr(
             target, "request_finished_all_groups", None

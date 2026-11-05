@@ -18,6 +18,7 @@ from hisim.simulation.manager import StateManager
 from hisim.hook import BaseHook
 from hisim.simulation.hijack.vllm.cpu_stubs import DummyEvent
 from hisim.simulation.hijack.v6d.bandwidth import BandwidthModel
+from hisim.simulation.hijack.vllm.v6d.manager import pop_captured_load_plan
 from hisim.utils import get_logger
 
 logger = get_logger()
@@ -542,15 +543,19 @@ class C_V6dObjectBackendHook(BaseHook):
 
         async def prepare_load(self, request, blocks, num_external_tokens):
             # Finish lookup/allocation, then queue a deadline without awaiting DMA.
+            scheduler = self._scheduler
+            rid = request.request_id
+            # Drop a snapshot left by an earlier (e.g. preempted) round.
+            pop_captured_load_plan(scheduler, rid)
             result = await original_prepare(self, request, blocks, num_external_tokens)
+            captured = pop_captured_load_plan(scheduler, rid)
             if result is not None or num_external_tokens <= 0:
                 return result
-            scheduler = self._scheduler
             if hasattr(scheduler, "_reqs_to_load"):
-                groups = scheduler._reqs_to_load.get(request.request_id)
+                groups = captured or scheduler._reqs_to_load.get(rid)
             elif hasattr(scheduler, "_get_state"):
                 # Newer vLLM keeps the prepared load plan in per-request state.
-                state = scheduler._get_state(request.request_id)
+                state = scheduler._get_state(rid)
                 groups = state.pending_load_meta if state is not None else None
             else:
                 raise RuntimeError(
@@ -558,7 +563,7 @@ class C_V6dObjectBackendHook(BaseHook):
                 )
             if not groups:
                 raise RuntimeError(
-                    f"[V6D Hijack] Missing prepared load plan for {request.request_id} "
+                    f"[V6D Hijack] Missing prepared load plan for {rid} "
                     f"with {num_external_tokens} external tokens"
                 )
             # Preserve native ownership while snapshotting every group for timing.
