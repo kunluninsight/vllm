@@ -15,4 +15,4 @@
 - If Hugging Face downloads fail, retry with `HF_ENDPOINT=https://hf-mirror.com`.
 
 ## Environment
-- Read `tmp/env.local.md` first if present — it contains developer-specific setup that overrides default assumptions.
+- At session start, read `tmp/env.local.md` once if it exists; it contains deployment-specific configuration that overrides all defaults.

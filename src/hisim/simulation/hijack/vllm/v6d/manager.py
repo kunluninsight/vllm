@@ -178,6 +178,16 @@ class C_V6dObjectConnectorSchedulerHook(BaseHook):
     @classmethod
     def hook(cls, target):
         target._reqs_to_load = property(_get_reqs_to_load, _set_reqs_to_load)
+        original_layout = getattr(target, "_compute_group_block_bytes", None)
+        if original_layout is not None:
+
+            def compute_group_block_bytes(self, spec, group_id):
+                from hisim.simulation.hijack.vllm.kv_layout import layout_backend_view
+
+                # Storage represents target shards, not the single CPU executor.
+                return original_layout(layout_backend_view(self), spec, group_id)
+
+            target._compute_group_block_bytes = compute_group_block_bytes
         original_request_finished = getattr(target, "request_finished", None)
         original_request_finished_all_groups = getattr(
             target, "request_finished_all_groups", None

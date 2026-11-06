@@ -15,8 +15,20 @@ class C_VLLMEngineArgsHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_post_init = target.__post_init__
+        original_create_config = target.create_engine_config
 
         def wrapped_post_init(self):
+            if not hasattr(self, "_hisim_layout_inputs"):
+                self._hisim_layout_inputs = {
+                    "tp_size": self.tensor_parallel_size,
+                    "pp_size": self.pipeline_parallel_size,
+                    "dp_size": getattr(self, "data_parallel_size", 1),
+                    "block_size": getattr(self, "block_size", None),
+                    "mamba_block_size": getattr(self, "mamba_block_size", None),
+                    "mamba_page_size_padded": getattr(
+                        self, "mamba_page_size_padded", None
+                    ),
+                }
             parallel_attrs = [
                 "tensor_parallel_size",
                 "pipeline_parallel_size",
@@ -53,4 +65,13 @@ class C_VLLMEngineArgsHook(BaseHook):
                 self.pipeline_parallel_size,
             )
 
+        def create_engine_config(self, *args, **kwargs):
+            from hisim.simulation.hijack.vllm.kv_layout import align_target_cache
+
+            config = original_create_config(self, *args, **kwargs)
+            config._hisim_layout_inputs = dict(self._hisim_layout_inputs)
+            align_target_cache(config)
+            return config
+
         target.__post_init__ = wrapped_post_init
+        target.create_engine_config = create_engine_config

@@ -33,9 +33,10 @@ MAX_MODEL_LEN = 16384
 
 
 def stop(process):
-    if process is None or process.poll() is not None:
+    if process is None:
         return
     try:
+        # The leader can exit before its EngineCore children; still stop its group.
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=15)
     except ProcessLookupError:
@@ -59,6 +60,16 @@ def list_v6d_objects(base_url):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--target-tp", type=int)
+    parser.add_argument("--kv-cache-dtype")
+    parser.add_argument("--mamba-cache-dtype")
+    parser.add_argument("--block-align-size", type=int)
+    parser.add_argument("--speculative-tokens", type=int)
+    parser.add_argument("--speculative-method", default="qwen4_exp_mtp")
+    parser.add_argument("--csa-cp-local", action="store_true")
+    parser.add_argument("--csa-indexer-backend", choices=("triton", "pai_deep_gemm"))
+    parser.add_argument("--expected-block-size", type=int)
+    parser.add_argument("--expected-spec-sizes", type=int, nargs="+")
     parser.add_argument(
         "--requests",
         type=int,
@@ -74,6 +85,10 @@ def parse_args():
         parser.error("--model must contain a local config.json")
     if args.requests < 1 or args.timeout < 1:
         parser.error("requests and timeout must be positive")
+    if args.target_tp is not None and args.target_tp < 1:
+        parser.error("target-tp must be positive")
+    if args.speculative_tokens is not None and args.speculative_tokens < 0:
+        parser.error("speculative-tokens must be nonnegative")
     for binary in ("redis-server", "dashservingd", "v6d"):
         if shutil.which(binary) is None:
             parser.error(f"Required serving-image binary is missing: {binary}")
@@ -172,7 +187,13 @@ def build_environment(root, work, model, ports):
     for key in list(env):
         if key.startswith(("HISIM_", "VLLM_", "DS_LLM_", "DS_MODEL_AGENT", "SCR_")):
             env.pop(key)
-    for key in ("MASTER_ADDRESS", "MASTER_PORT", "DASH_GEN_ARGS"):
+    for key in (
+        "MASTER_ADDRESS",
+        "MASTER_PORT",
+        "DASH_GEN_ARGS",
+        "DS_AUTH_TOKEN",
+        "_DS_DEPENDENCY_WHEELS",
+    ):
         env.pop(key, None)
     env.update(
         {
@@ -468,6 +489,39 @@ def main():
     root = Path(__file__).resolve().parents[1]
     work = create_workspace(root)
     env = build_environment(root, work, args.model, ports)
+    engine = json.loads(env["DS_LLM_ENGINE_CONFIG"])
+    for field, value in (
+        ("tensor_parallel_size", args.target_tp),
+        ("kv_cache_dtype", args.kv_cache_dtype),
+        ("mamba_cache_dtype", args.mamba_cache_dtype),
+        ("block_align_size", args.block_align_size),
+    ):
+        if value is not None:
+            engine[field] = value
+    if args.speculative_tokens is not None:
+        engine["speculative_config"] = (
+            {
+                "method": args.speculative_method,
+                "num_speculative_tokens": args.speculative_tokens,
+            }
+            if args.speculative_tokens
+            else None
+        )
+    env["DS_LLM_ENGINE_CONFIG"] = json.dumps(engine)
+    if args.target_tp is not None:
+        simulator = json.loads(
+            env.get("HISIM_CONFIG_JSON") or (work / "config.json").read_text()
+        )
+        simulator["scheduler"].update(tp_size=args.target_tp, ep_size=args.target_tp)
+        env["HISIM_CONFIG_JSON"] = json.dumps(simulator)
+    if args.csa_cp_local:
+        env.update(
+            VLLM_GATED_RESIDUAL_TPSP="1",
+            VLLM_QSA_PREFILL_ONLY_INDEXER_USE_CP="1",
+            VLLM_DSA_USE_CONTEXT_PARALLEL_THRESHOLD="0",
+        )
+    if args.csa_indexer_backend is not None:
+        env["VLLM_CSA_INDEXER_BACKEND"] = args.csa_indexer_backend
     print(f"Artifacts: {work}", flush=True)
     processes = []
     log_path = work / "service.log"
@@ -475,11 +529,45 @@ def main():
         try:
             start_services(processes, work, ports, env, log)
             wait_until_healthy(processes, ports.worker_control, args.timeout, log_path)
+            # Worker health can precede the serving port bind.
+            deadline = time.monotonic() + 30
+            while True:
+                if any(p.poll() is not None for p in processes):
+                    raise RuntimeError(
+                        f"Service exited before serving bind: {log_path}"
+                    )
+                try:
+                    with socket.create_connection(("127.0.0.1", ports.grpc), timeout=1):
+                        break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Serving port did not bind: {log_path}"
+                        ) from None
+                    time.sleep(0.2)
             assert stat.S_ISSOCK((work / "v6d/vineyard.sock").stat().st_mode), (
                 "DashLLM did not launch v6d"
             )
             v6d_url = f"http://127.0.0.1:{ports.v6d}"
             block_size = cache_block_size(v6d_url)
+            with urlopen(f"{v6d_url}/kv-cache/spec", timeout=5) as response:
+                layout = json.load(response)
+            (work / "kv-spec.json").write_text(json.dumps(layout, indent=2))
+            spec_sizes = [int(group["object_size_bytes"]) for group in layout["groups"]]
+            if args.expected_block_size is not None:
+                assert block_size == args.expected_block_size, (
+                    block_size,
+                    args.expected_block_size,
+                )
+            if args.expected_spec_sizes is not None:
+                assert spec_sizes == args.expected_spec_sizes, (
+                    spec_sizes,
+                    args.expected_spec_sizes,
+                )
+            print(
+                f"KV layout: block_size={block_size}, spec_sizes={spec_sizes}",
+                flush=True,
+            )
             before = snapshot_objects(v6d_url, work / "v6d-before.json")
             print(
                 f"v6d: {v6d_url}, block_size={block_size} tokens, objects_before={before['total']}",
@@ -496,6 +584,13 @@ def main():
             rows.extend(run_requests(client, prompts, log_path, "populate"))
             after, stored = wait_for_stored_objects(v6d_url, before)
             (work / "v6d-after.json").write_text(json.dumps(after, indent=2))
+            declared_sizes = {
+                str(g["group_id"]): int(g["object_size_bytes"])
+                for g in layout["groups"]
+            }
+            for obj in stored:
+                group_id = obj["key"].rsplit("_", 1)[1]
+                assert obj["size"] == declared_sizes[group_id], obj
             declared_bytes = sum(obj["size"] for obj in stored)
             print(
                 f"v6d: objects_after={after['total']}, new_released_objects={len(stored)}, "
@@ -523,8 +618,26 @@ def main():
                 flush=True,
             )
         finally:
+            # EngineCore can detach from the daemon's process group during shutdown.
+            import psutil
+
+            descendants = []
+            for process in processes:
+                try:
+                    descendants.extend(
+                        psutil.Process(process.pid).children(recursive=True)
+                    )
+                except psutil.NoSuchProcess:
+                    pass
             for process in reversed(processes):
                 stop(process)
+            _, alive = psutil.wait_procs(descendants, timeout=5)
+            for process in alive:
+                try:
+                    process.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            psutil.wait_procs(alive, timeout=5)
 
 
 if __name__ == "__main__":

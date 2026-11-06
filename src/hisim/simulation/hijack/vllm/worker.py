@@ -1,6 +1,6 @@
 """Simulate vLLM worker execution without constructing a GPU model runner.
 
-Build KV specs from model dimensions for native cache accounting, but allocate
+Discover native KV specs with a meta-device model walk, but allocate
 at most 4 KiB per CPU backing tensor. v6d object sizes follow the specs, not
 these buffers. Mock token output retains the connector lifecycle.
 """
@@ -47,195 +47,10 @@ def _noop(*args, **kwargs):
 
 
 def _build_kv_cache_spec(vllm_config) -> dict:
-    """Build attention/Mamba accounting specs without allocating their payloads."""
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+    """Discover native layer metadata without loading weights or payload buffers."""
+    from hisim.simulation.hijack.vllm.kv_layout import build_kv_cache_spec
 
-    # MambaAttentionBackendEnum moved between vLLM versions
-    try:
-        from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-
-        _mamba_gdn_type = MambaAttentionBackendEnum.GDN_ATTN
-    except (ImportError, ModuleNotFoundError):
-        try:
-            from vllm.attention.backends.registry import MambaAttentionBackendEnum
-
-            _mamba_gdn_type = MambaAttentionBackendEnum.GDN_ATTN
-        except (ImportError, ModuleNotFoundError):
-            _mamba_gdn_type = None
-
-    model_config = vllm_config.model_config
-    cache_config = vllm_config.cache_config
-    hf_config = model_config.hf_text_config
-
-    # Use target TP for per-shard KV heads when scheduler config is available.
-    scheduler_config = None
-    try:
-        scheduler_config = ConfigManager.get_scheduler_config()
-    except Exception:
-        pass
-
-    tp_size = scheduler_config.tp_size if scheduler_config else 1
-    if hasattr(model_config, "get_total_num_kv_heads"):
-        total_num_kv_heads = model_config.get_total_num_kv_heads()
-    else:
-        total_num_kv_heads = getattr(
-            hf_config, "num_key_value_heads", hf_config.num_attention_heads
-        )
-    num_kv_heads = max(total_num_kv_heads // tp_size, 1)
-
-    if hasattr(model_config, "get_head_size"):
-        head_size = model_config.get_head_size()
-    else:
-        head_size = getattr(hf_config, "head_dim", None) or (
-            hf_config.hidden_size // hf_config.num_attention_heads
-        )
-
-    block_size = cache_config.block_size
-    # Read the optional physical size before scheduler config initialization;
-    # update cache_config so scheduling and KV specs use the same block size.
-    try:
-        _injected_block_size = (
-            ConfigManager._get_raw_config()
-            .get("scheduler", {})
-            .get("physical_block_size")
-        )
-    except Exception:
-        _injected_block_size = None
-    if _injected_block_size:
-        block_size = int(_injected_block_size)
-        cache_config.block_size = block_size
-        if getattr(cache_config, "mamba_block_size", None) is not None:
-            cache_config.mamba_block_size = block_size
-    # Mamba padding must include the merged attention pack's page growth.
-    attn_pack_size = getattr(cache_config, "attn_pack_size", 1) or 1
-    dtype = model_config.dtype
-    if isinstance(dtype, str):
-        dtype = getattr(torch, dtype)
-
-    layer_types = getattr(hf_config, "layer_types", None)
-    num_hidden_layers = hf_config.num_hidden_layers
-
-    # Determine KV cache dtype ("auto" keeps the model dtype)
-    cache_dtype = getattr(cache_config, "cache_dtype", "auto")
-    if cache_dtype == "fp8":
-        dtype = torch.float8_e4m3fn
-
-    # Detect FullAttentionSpec supported fields (varies across vLLM versions)
-    _fa_fields = {f.name for f in dataclasses.fields(FullAttentionSpec)}
-    _fa_kwargs = dict(num_kv_heads=num_kv_heads, head_size=head_size, dtype=dtype)
-    if "use_mla" in _fa_fields:
-        _fa_kwargs["use_mla"] = False
-    if "block_size" in _fa_fields:
-        _fa_kwargs["block_size"] = block_size
-
-    full_attn_spec = FullAttentionSpec(**_fa_kwargs)
-    attn_page_size = full_attn_spec.page_size_bytes
-
-    if not layer_types or "linear_attention" not in layer_types:
-        # Explicit attention-only layer metadata does not require a Mamba spec.
-        kv_cache_spec: dict = {
-            f"model.layers.{i}": full_attn_spec for i in range(num_hidden_layers)
-        }
-    else:
-        # Hybrid model: build per-layer specs with uniform page size.
-        mamba_block_size = getattr(cache_config, "mamba_block_size", None)
-        if mamba_block_size is None or _injected_block_size:
-            mamba_block_size = block_size
-
-        # Resolve model-specific state shapes/dtypes; retain placeholders on failure.
-        mamba_shapes = ((1, 1), (1, 1, 1))
-        mamba_dtypes = (dtype, dtype)
-        try:
-            try:
-                from vllm.model_executor.models import ModelRegistry
-            except ImportError:
-                from vllm.model_executor.models.registry import ModelRegistry
-            model_cls, _ = ModelRegistry.resolve_model_cls(
-                model_config.architecture, model_config=model_config
-            )
-            mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
-            mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
-        except Exception:
-            logger.warning(
-                "[V6D Hijack] failed to resolve real mamba state spec, "
-                "falling back to placeholder shapes/dtypes",
-                exc_info=True,
-            )
-
-        # Match the padded Mamba page to the merged attention page.
-        mamba_kwargs = dict(
-            block_size=mamba_block_size,
-            shapes=mamba_shapes,
-            dtypes=mamba_dtypes,
-            page_size_padded=attn_page_size * attn_pack_size,
-            mamba_cache_mode=getattr(cache_config, "mamba_cache_mode", "none"),
-        )
-        # Speculative blocks contribute to per-request Mamba cache pressure.
-        _mamba_fields = {f.name for f in dataclasses.fields(MambaSpec)}
-        if "state_align_size" in _mamba_fields:
-            # light_flex uses 64-token state boundaries; other modes use alignment 1.
-            mamba_kwargs["state_align_size"] = (
-                64 if mamba_kwargs["mamba_cache_mode"] == "light_flex" else 1
-            )
-        if "num_speculative_blocks" in _mamba_fields:
-            spec_cfg = getattr(vllm_config, "speculative_config", None)
-            num_spec_tokens = (
-                (getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
-                if spec_cfg is not None
-                else 0
-            )
-            mamba_kwargs["num_speculative_blocks"] = num_spec_tokens
-        mamba_type_field = next(
-            (f for f in dataclasses.fields(MambaSpec) if f.name == "mamba_type"),
-            None,
-        )
-        if mamba_type_field is not None:
-            if mamba_type_field.type == str or mamba_type_field.type == "str":
-                mamba_kwargs["mamba_type"] = "gdn_attention"
-            elif _mamba_gdn_type is not None:
-                mamba_kwargs["mamba_type"] = _mamba_gdn_type
-
-        mamba_spec = MambaSpec(**mamba_kwargs)
-
-        kv_cache_spec = {}
-        for i, layer_type in enumerate(layer_types):
-            layer_name = f"model.layers.{i}"
-            if layer_type == "full_attention":
-                kv_cache_spec[layer_name] = full_attn_spec
-            elif layer_type == "linear_attention":
-                kv_cache_spec[layer_name] = mamba_spec
-            else:
-                kv_cache_spec[layer_name] = full_attn_spec
-
-    # Include configured MTP attention layers in declared KV object sizes.
-    # Lookup-only speculative methods do not add draft-model layers.
-    spec_cfg = getattr(vllm_config, "speculative_config", None)
-    spec_method = getattr(spec_cfg, "method", None) if spec_cfg else None
-    num_mtp_layers = (
-        getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
-        if spec_method not in (None, "ngram", "suffix")
-        else 0
-    )
-    for idx in range(num_mtp_layers):
-        layer_name = f"model.mtp.layers.{num_hidden_layers + idx}"
-        kv_cache_spec[layer_name] = full_attn_spec
-
-    logger.info(
-        "[V6D Hijack] Built KV cache spec: %d layers (incl. %d MTP draft), "
-        "num_kv_heads=%d (total=%d, tp=%d), head_size=%d, block_size=%d, "
-        "page_size=%d bytes, mamba_page_padded=%d bytes, attn_pack_size=%d",
-        len(kv_cache_spec),
-        num_mtp_layers,
-        num_kv_heads,
-        total_num_kv_heads,
-        tp_size,
-        head_size,
-        block_size,
-        attn_page_size,
-        attn_page_size * attn_pack_size,
-        attn_pack_size,
-    )
-    return kv_cache_spec
+    return build_kv_cache_spec(vllm_config)
 
 
 class C_VLLMWorkerHook(BaseHook):
@@ -321,6 +136,12 @@ class C_VLLMWorkerHook(BaseHook):
             set_random_seed(self.vllm_config.model_config.seed)
 
             self.device = torch.device("cpu")
+            ConfigManager.set_model_info(
+                resolve_model_info(self.vllm_config.model_config)
+            )
+            ConfigManager.set_scheduler_config(
+                resolve_scheduler_config(self.vllm_config)
+            )
 
             kv_spec = _build_kv_cache_spec(self.vllm_config)
             self.model_runner = _ModelRunnerStub(kv_spec=kv_spec)

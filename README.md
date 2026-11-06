@@ -51,14 +51,9 @@ A single-node configuration using `linear`:
 {
   "platform": {
     "accelerator": {
-      "name": "h100_sxm",
-      "hbm_capacity_gb": 80
-    },
-    "memory_read_bandwidth_gb": 64,
-    "memory_write_bandwidth_gb": 64,
-    "disk_read_bandwidth_gb": 8,
-    "disk_write_bandwidth_gb": 8,
-    "num_device_per_node": 1
+      "name": "l20b",
+      "hbm_capacity_gb": 288
+    }
   },
   "predictor": {
     "name": "linear",
@@ -67,8 +62,7 @@ A single-node configuration using `linear`:
   },
   "scheduler": {
     "tp_size": 1,
-    "ep_size": 1,
-    "dp_size": 1
+    "ep_size": 1
   }
 }
 ```
