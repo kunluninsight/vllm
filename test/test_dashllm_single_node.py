@@ -28,7 +28,9 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-Ports = namedtuple("Ports", "grpc control worker_control redis v6d v6d_rpc sched_rpc")
+Ports = namedtuple(
+    "Ports", "grpc control worker_control redis v6d v6d_rpc sched_rpc vl_v6d vl_v6d_rpc"
+)
 MAX_MODEL_LEN = 16384
 
 
@@ -71,6 +73,22 @@ def parse_args():
     parser.add_argument("--expected-block-size", type=int)
     parser.add_argument("--expected-spec-sizes", type=int, nargs="+")
     parser.add_argument(
+        "--num-layers",
+        type=int,
+        help="Truncate decoder layers via hf_overrides to shorten large-model startup",
+    )
+    parser.add_argument(
+        "--remote-ple",
+        action="store_true",
+        help="Serve a PLE model in remote_v6d mode; HiSim models admission",
+    )
+    parser.add_argument(
+        "--ple-admission-ms",
+        type=float,
+        default=500.0,
+        help="Constant simulated PLE admission per request with --remote-ple",
+    )
+    parser.add_argument(
         "--requests",
         type=int,
         default=3,
@@ -85,10 +103,14 @@ def parse_args():
         parser.error("--model must contain a local config.json")
     if args.requests < 1 or args.timeout < 1:
         parser.error("requests and timeout must be positive")
+    if args.ple_admission_ms <= 0:
+        parser.error("ple-admission-ms must be positive")
     if args.target_tp is not None and args.target_tp < 1:
         parser.error("target-tp must be positive")
     if args.speculative_tokens is not None and args.speculative_tokens < 0:
         parser.error("speculative-tokens must be nonnegative")
+    if args.num_layers is not None and args.num_layers < 1:
+        parser.error("num-layers must be positive")
     for binary in ("redis-server", "dashservingd", "v6d"):
         if shutil.which(binary) is None:
             parser.error(f"Required serving-image binary is missing: {binary}")
@@ -182,16 +204,34 @@ def v6d_args(work, vineyard_size="8G"):
     )
 
 
+def layer_overrides(model, num_layers):
+    """hf_overrides keeping the first num_layers decoder layers and their types."""
+    config = json.loads((model / "config.json").read_text())
+    text = config.get("text_config")
+    target = config if text is None else text
+    total = target["num_hidden_layers"]
+    if num_layers > total:
+        raise ValueError(f"num-layers {num_layers} exceeds the model's {total}")
+    overrides = {"num_hidden_layers": num_layers}
+    if "layer_types" in target:
+        overrides["layer_types"] = target["layer_types"][:num_layers]
+    return overrides if text is None else {"text_config": overrides}
+
+
 def build_environment(root, work, model, ports):
     env = os.environ.copy()
     for key in list(env):
-        if key.startswith(("HISIM_", "VLLM_", "DS_LLM_", "DS_MODEL_AGENT", "SCR_")):
+        # RANK_* and DS_UNIT_NODE_NUM describe a multi-node deployment.
+        if key.startswith(
+            ("HISIM_", "VLLM_", "DS_LLM_", "DS_MODEL_AGENT", "SCR_", "RANK_")
+        ):
             env.pop(key)
     for key in (
         "MASTER_ADDRESS",
         "MASTER_PORT",
         "DASH_GEN_ARGS",
         "DS_AUTH_TOKEN",
+        "DS_UNIT_NODE_NUM",
         "_DS_DEPENDENCY_WHEELS",
     ):
         env.pop(key, None)
@@ -239,6 +279,11 @@ def build_environment(root, work, model, ports):
             "DS_LLM_V6D_SOCKET_DIR": str(work / "v6d"),
             "V6D_PORT": str(ports.v6d),
             "V6D_RPC_PORT": str(ports.v6d_rpc),
+            # VL models start a DataRouter v6d whose default socket is shared in
+            # /dev/shm; a stale one from an earlier run would be "reused" forever.
+            "DS_VL_V6D_SOCKET": str(work / "v6d" / "vineyard.vl.sock"),
+            "DS_VL_V6D_PORT": str(ports.vl_v6d),
+            "DS_VL_V6D_RPC_PORT": str(ports.vl_v6d_rpc),
             "V6D_ENABLE_TRACKER": "1",
             "V6D_KVCM_MODE": "disabled",
             "KVS_METASERVICE_REDIS_URI": f"redis://127.0.0.1:{ports.redis}",
@@ -342,10 +387,10 @@ def snapshot_objects(v6d_url, destination):
     return objects
 
 
-def generate_once(client, prompt, log_path):
+def generate_once(client, prompt, log_path, request_id):
     tokens, finished = [], False
     for response in client.generate(
-        request_id=f"smoke-{uuid.uuid4().hex}",
+        request_id=request_id,
         prompt={"prompt_token_ids": prompt},
         params={"max_tokens": 1, "ignore_eos": True},
         capability={"type": "generate"},
@@ -371,8 +416,12 @@ def make_prompts(request_count, block_size):
     return prompts
 
 
-def wait_for_request_hit(log_path, offset, prompt_length, timeout=5):
-    """Read the completed request's admission snapshot, not stale hit counters."""
+def wait_for_request_hit(log_path, offset, request_id, timeout=5):
+    """Read the completed request's admission snapshot, not stale hit counters.
+
+    DashLLM suffixes the engine request ID, and some builds hand vLLM one
+    prompt token fewer, so match the client ID prefix rather than the length.
+    """
     pattern = re.compile(
         r"\[HitRate\] rid=(\S+) input_len=(\d+) local_hit=(-?\d+) ext_hit=(\d+)"
     )
@@ -382,7 +431,9 @@ def wait_for_request_hit(log_path, offset, prompt_length, timeout=5):
             log.seek(offset)
             text = log.read().decode(errors="replace")
         matches = [
-            match for match in pattern.finditer(text) if int(match[2]) == prompt_length
+            match
+            for match in pattern.finditer(text)
+            if match[1] == request_id or match[1].startswith(f"{request_id}-")
         ]
         if len(matches) == 1:
             match = matches[0]
@@ -398,18 +449,26 @@ def wait_for_request_hit(log_path, offset, prompt_length, timeout=5):
         time.sleep(0.1)
 
 
-def run_requests(client, prompts, log_path, phase, require_external=False):
+def run_requests(
+    client, prompts, log_path, phase, require_external=False, min_elapsed=0.0
+):
     rows = []
     for index, prompt in enumerate(prompts):
+        request_id = f"smoke-{uuid.uuid4().hex}"
         offset = log_path.stat().st_size
         started = time.monotonic()
-        tokens = generate_once(client, prompt, log_path)
+        tokens = generate_once(client, prompt, log_path, request_id)
         elapsed = time.monotonic() - started
-        hit = wait_for_request_hit(log_path, offset, len(prompt))
+        hit = wait_for_request_hit(log_path, offset, request_id)
         if require_external and (
             hit["external_hit_tokens"] <= 0 or hit["local_hit_tokens"] != 0
         ):
             raise AssertionError(f"Replay did not load L2 after L1 reset: {hit}")
+        if elapsed < min_elapsed:
+            raise AssertionError(
+                f"{phase} request finished in {elapsed:.3f}s, before the "
+                f"{min_elapsed:.3f}s simulated PLE admission"
+            )
         rows.append(
             {
                 "phase": phase,
@@ -507,13 +566,22 @@ def main():
             if args.speculative_tokens
             else None
         )
+    if args.num_layers is not None:
+        engine["hf_overrides"] = layer_overrides(args.model, args.num_layers)
     env["DS_LLM_ENGINE_CONFIG"] = json.dumps(engine)
+    simulator = json.loads((work / "config.json").read_text())
     if args.target_tp is not None:
-        simulator = json.loads(
-            env.get("HISIM_CONFIG_JSON") or (work / "config.json").read_text()
-        )
         simulator["scheduler"].update(tp_size=args.target_tp, ep_size=args.target_tp)
-        env["HISIM_CONFIG_JSON"] = json.dumps(simulator)
+    min_elapsed = 0.0
+    if args.remote_ple:
+        # Non-PD serving; HiSim restores the v6d+KVT connector remote PLE needs.
+        env.update(VLLM_PLE_OFFLOAD_BACKEND="remote_v6d", VLLM_PLE_CPU_OFFLOAD="1")
+        # A constant, large admission keeps the delay visible in request latency.
+        simulator["ple"] = {
+            "admission": {"base_ms": args.ple_admission_ms, "per_1k_tokens_ms": 0}
+        }
+        min_elapsed = args.ple_admission_ms / 1000
+    env["HISIM_CONFIG_JSON"] = json.dumps(simulator)
     if args.csa_cp_local:
         env.update(
             VLLM_GATED_RESIDUAL_TPSP="1",
@@ -579,9 +647,15 @@ def main():
                 config=DashClientConfig(request_timeout_ms=60000),
             )
             short_prompt = [100] * max(1, min(64, block_size - 1))
-            rows = run_requests(client, [short_prompt], log_path, "short")
+            rows = run_requests(
+                client, [short_prompt], log_path, "short", min_elapsed=min_elapsed
+            )
             prompts = make_prompts(args.requests, block_size)
-            rows.extend(run_requests(client, prompts, log_path, "populate"))
+            rows.extend(
+                run_requests(
+                    client, prompts, log_path, "populate", min_elapsed=min_elapsed
+                )
+            )
             after, stored = wait_for_stored_objects(v6d_url, before)
             (work / "v6d-after.json").write_text(json.dumps(after, indent=2))
             declared_sizes = {
@@ -608,10 +682,24 @@ def main():
                     log_path,
                     "replay",
                     require_external=True,
+                    min_elapsed=min_elapsed,
                 )
             )
             (work / "cache-replay.json").write_text(json.dumps(rows, indent=2))
             snapshot_objects(v6d_url, work / "v6d-after-replay.json")
+            if args.remote_ple:
+                text = log_path.read_text(errors="replace")
+                for marker in (
+                    "remote PLE uses HybridConnector backend v6d_object+kvt",
+                    "[PLE Hijack] PLEConnector uses simulated admission",
+                ):
+                    assert marker in text, (
+                        f"Missing remote PLE marker {marker!r}; inspect {log_path}"
+                    )
+                print(
+                    "Remote PLE: every request waited for simulated admission",
+                    flush=True,
+                )
             print(
                 "PASS: single-node DashLLM/vLLM/v6d, BLOCKING + linear, "
                 "native KV stores and L2 loads after L1 reset",

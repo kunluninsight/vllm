@@ -14,7 +14,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 
 from hisim.env import Envs
-from hisim.simulation.manager import StateManager
+from hisim.simulation.manager import ConfigManager, StateManager
 from hisim.hook import BaseHook
 from hisim.simulation.hijack.vllm.cpu_stubs import DummyEvent
 from hisim.simulation.hijack.v6d.bandwidth import BandwidthModel
@@ -22,6 +22,25 @@ from hisim.simulation.hijack.vllm.v6d.manager import pop_captured_load_plan
 from hisim.utils import get_logger
 
 logger = get_logger()
+
+
+def _ple_admission_model(vllm_config):
+    """Configured admission model, disabled when the served model has no PLE.
+
+    remote_v6d is an environment switch, so it can be set for any model.
+    """
+    from hisim.time_predictor.ple import PLEAdmissionModel, model_has_ple
+
+    model = ConfigManager.get_ple_admission_model()
+    model_config = getattr(vllm_config, "model_config", None)
+    if (
+        model.enabled
+        and model_config is not None
+        and not model_has_ple(model_config.hf_text_config)
+    ):
+        logger.info("[V6D Hijack] PLE admission disabled: model has no PLE layers")
+        return PLEAdmissionModel(enabled=False)
+    return model
 
 
 class SimulatedKVController:
@@ -47,6 +66,8 @@ class SimulatedKVController:
         self._staged = []
         self._stores = []
         self._loads = {}
+        self._ple = {}
+        self._ple_model = _ple_admission_model(getattr(hybrid, "_cfg", None))
         self._store_tails = {}
         self._aborted_stores = {}
         self._preparing = []
@@ -202,6 +223,20 @@ class SimulatedKVController:
         with self._lock:
             self._loads.setdefault(request.request_id, (deadline, num_tokens))
 
+    def queue_ple(self, request, run) -> bool:
+        """Defer ``run`` (native mark_loaded) by the remote PLE admission time.
+
+        Returns False when no delay applies, so the caller runs it inline.
+        """
+        latency = self._ple_model.latency(request.num_prompt_tokens)
+        if latency <= 0:
+            return False
+        with self._lock:
+            if request.request_id in self._ple:
+                raise RuntimeError(f"PLE admission for {request.request_id} is queued")
+            self._ple[request.request_id] = (self.now() + latency, run)
+        return True
+
     def _run_control(self, coroutine):
         try:
             current = asyncio.get_running_loop()
@@ -279,7 +314,18 @@ class SimulatedKVController:
                 del self._loads[rid]
         for rid, n in loads:
             self._load_done(rid, n)
-        return len(due) + len(loads) + len(aborted)
+        # Loads settled above queue PLE with a future deadline, never due here.
+        with self._lock:
+            ples = [
+                (rid, run)
+                for rid, (deadline, run) in self._ple.items()
+                if deadline <= now
+            ]
+            for rid, _run in ples:
+                del self._ple[rid]
+        for _rid, run in ples:
+            self._run_control(run())
+        return len(due) + len(loads) + len(aborted) + len(ples)
 
     def next_wakeup(self):
         if self._staged or any(
@@ -288,6 +334,7 @@ class SimulatedKVController:
             return self.now()
         with self._lock:
             deadlines = [deadline for deadline, _n in self._loads.values()]
+            deadlines.extend(deadline for deadline, _run in self._ple.values())
         deadlines.extend(store.ready_at for store in self._stores)
         return min(deadlines, default=None)
 
@@ -311,8 +358,9 @@ class SimulatedKVController:
             return False
         self.settle_preparations()
         with self._lock:
-            dropped_loads = len(self._loads)
+            dropped_loads = len(self._loads) + len(self._ple)
             self._loads.clear()
+            self._ple.clear()
             for store in self._staged + self._stores:
                 if store.blocks:
                     self.cache._block_pool.free_blocks(store.blocks)
@@ -345,6 +393,7 @@ class C_HybridControlPlaneHook(BaseHook):
         original_prepare = target._on_add_req
         original_waiting = target._step_waiting
         original_step = target.step
+        original_mark_loaded = getattr(target, "mark_loaded", None)
 
         def init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
@@ -385,6 +434,44 @@ class C_HybridControlPlaneHook(BaseHook):
         target._on_add_req = prepare
         target._step_waiting = step_waiting
         target.step = step
+
+        async def mark_loaded(self, req, ioret=None, *args, **kwargs):
+            # Native Prefill awaits the remote PLE fetch here, after KV load.
+            controller = self._sim_controller
+            if (
+                controller is None
+                or getattr(self, "_ple", None) is None
+                or (ioret is not None and ioret.ex is not None)
+                or getattr(req, "ple_ready", None) is not None
+                or _req_aborted(req)
+            ):
+                return await original_mark_loaded(self, req, ioret, *args, **kwargs)
+            # Native stamps KV completion before awaiting PLE; keep those times.
+            kv_finished_at = time.monotonic()
+            if getattr(
+                req, "worker_status_remote_kv_wait_started_time_ms", 0
+            ) > 0 and not getattr(
+                req, "worker_status_remote_kv_wait_finished_time_ms", 0
+            ):
+                req.worker_status_remote_kv_wait_finished_time_ms = int(
+                    time.time() * 1000
+                )
+
+            async def run():
+                await original_mark_loaded(self, req, ioret, *args, **kwargs)
+                req.ple_kv_finished_at = kv_finished_at
+
+            if not controller.queue_ple(req, run):
+                await run()
+
+        if original_mark_loaded is not None:
+            target.mark_loaded = mark_loaded
+
+
+def _req_aborted(req) -> bool:
+    from vllm.v1.hybrid_connector import req_aborted
+
+    return req_aborted(req)
 
 
 class C_HybridBackendHook(BaseHook):

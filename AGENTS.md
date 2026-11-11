@@ -7,6 +7,8 @@
   - If a new feature's metrics are observable via E2E, extend the existing E2E test 
   (by adding startup args and result assertions) once it has been validated by separate unit tests.
 - Run `ruff format` on all changed Python files before finishing.
+- New model adaptation:
+  - Check `src/hisim/simulation/hijack/vllm/kv_layout.py` first: every simulated KV cache group (attention and state specs such as Mamba) and its page size must match the real engine.
 
 ## Testing
 - This project targets PAI-vLLM; run E2E tests inside the serving image.

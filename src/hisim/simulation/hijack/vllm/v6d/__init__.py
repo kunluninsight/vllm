@@ -18,12 +18,14 @@ def get_class_hooks() -> list[type[BaseHook]]:
         C_V6dObjectFetchHelperHook,
         C_V6dObjectManagerHook,
     )
+    from .ple import C_PLEConnectorHook
     from .worker import C_V6dObjectConnectorWorkerHook
 
     return [
         C_HybridBackendHook,
         C_HybridConnectorHook,
         C_HybridControlPlaneHook,
+        C_PLEConnectorHook,
         C_V6dObjectConnectorWorkerHook,
         C_V6dObjectBackendHook,
         C_KVTPBackendHook,

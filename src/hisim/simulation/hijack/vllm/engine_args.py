@@ -1,9 +1,45 @@
 """Force a single vLLM executor; target parallelism comes from HiSim config."""
 
+import os
+
 from hisim.hook import BaseHook
 from hisim.utils import get_logger
 
 logger = get_logger()
+
+
+def _keep_remote_ple_connector(kv_transfer_config) -> None:
+    """Restore the Prefill connector that vLLM requires for remote PLE.
+
+    Native Remote PLE accepts only kv_producer or kv_both with a v6d+KVT
+    backend, while DashLLM keeps KVT only for a disaggregated Prefill role.
+    Simulation runs without PD, so it gets plain v6d_object; KVT stays idle
+    because no request asks for a remote decode.
+    """
+    if kv_transfer_config is None or os.getenv("VLLM_PLE_OFFLOAD_BACKEND") != (
+        "remote_v6d"
+    ):
+        return
+    if isinstance(kv_transfer_config, dict):
+        connector = kv_transfer_config.get("kv_connector")
+        role = kv_transfer_config.get("kv_role")
+        extra = kv_transfer_config.get("kv_connector_extra_config")
+    else:
+        connector = getattr(kv_transfer_config, "kv_connector", None)
+        role = getattr(kv_transfer_config, "kv_role", None)
+        extra = getattr(kv_transfer_config, "kv_connector_extra_config", None)
+    if (
+        connector != "HybridConnector"
+        or role != "kv_both"
+        or not isinstance(extra, dict)
+        or extra.get("backend") != "v6d_object"
+    ):
+        return
+    extra["backend"] = "v6d_object+kvt"
+    logger.info(
+        "[vLLM Hijack] EngineArgs: remote PLE uses HybridConnector backend "
+        "v6d_object+kvt (simulation has no PD role)"
+    )
 
 
 class C_VLLMEngineArgsHook(BaseHook):
@@ -48,6 +84,8 @@ class C_VLLMEngineArgsHook(BaseHook):
             # Keep execution in-process with the hooked Worker.
             if hasattr(self, "distributed_executor_backend"):
                 self.distributed_executor_backend = "uni"
+
+            _keep_remote_ple_connector(getattr(self, "kv_transfer_config", None))
 
             original_post_init(self)
 

@@ -111,6 +111,28 @@ See [predictor selection and options](src/hisim/simulation/manager/config.py).
 Restart serving processes after editing the JSON; configuration is cached in
 each process.
 
+### Remote PLE admission
+Qwen4-style models served with `VLLM_PLE_OFFLOAD_BACKEND=remote_v6d` fetch PLE
+rows for the whole prompt after external KV load and before the request is
+schedulable. HiSim skips the PLE service and offload consumer and delays this
+step by:
+
+```text
+admission_ms = base_ms + per_1k_tokens_ms × prompt_tokens / 1024
+```
+
+Prefix hits do not shorten it. Models without PLE layers (no `use_ple` /
+`ple_layer_ids` in the text config) get no delay even when `remote_v6d` is set.
+Defaults (`base_ms=5.56`, `per_1k_tokens_ms=0.383`)
+were measured on L20B; override or disable them with an optional section:
+
+```json
+"ple": {"admission": {"enabled": true, "base_ms": 5.56, "per_1k_tokens_ms": 0.383}}
+```
+
+Per-step PLE compute is part of the forward and must come from the predictor,
+e.g. an `ml` bundle trained on traces from the PLE-enabled deployment.
+
 ## DashLLM engine settings
 Keep your usual model, transport, service-discovery, and v6d configuration.
 Merge the following settings into your existing `DS_LLM_ENGINE_CONFIG` for a

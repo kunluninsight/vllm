@@ -139,6 +139,16 @@ class ConfigManager:
         return cls._scheduler_config
 
     @classmethod
+    def get_ple_admission_model(cls):
+        from hisim.time_predictor.ple import PLEAdmissionModel
+
+        ple_config = cls._get_raw_config().get("ple") or {}
+        unknown = set(ple_config) - {"admission"}
+        if unknown:
+            raise ValueError(f"Unknown ple config keys: {sorted(unknown)}")
+        return PLEAdmissionModel.from_config(ple_config.get("admission"))
+
+    @classmethod
     def _parse_server_args(cls, server_args: dict, backend: str) -> SchedulerConfig:
         if backend == "sglang":
             return SchedulerConfig(
