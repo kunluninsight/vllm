@@ -2,6 +2,8 @@
 __pycache__/
 *egg-info/
 build/
+dist/
+src/hisim/_version.py
 
 tmp/
 logs/
