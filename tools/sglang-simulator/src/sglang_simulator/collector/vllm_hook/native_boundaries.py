@@ -146,6 +146,34 @@ def install(module, sync_module, expected_digest=DRAIN_SHA256, target=None):
         sync._sim_native_observer = True
         sync_module.synchronize = sync
 
+    # _drain_slice imports dist.barrier at call time. Capture only its scoped
+    # WORLD handoff, including padding launches; enqueue the event after return.
+    import torch.distributed as dist
+    if not getattr(dist.barrier, '_sim_pp_barrier_observer', False):
+        original_barrier = dist.barrier
+
+        @wraps(original_barrier)
+        def barrier(*args, **kwargs):
+            state = _SYNC.get()
+            if state is None or state[0] != 'local_drain':
+                return original_barrier(*args, **kwargs)
+            _, item, task = state
+            entered = time.monotonic_ns()
+            try:
+                result = original_barrier(*args, **kwargs)
+            except BaseException:
+                exited = time.monotonic_ns()
+                _emit('handoff_barrier_call', item, enter_mono_ns=entered,
+                      exit_mono_ns=exited, native_ok=False, **task)
+                raise
+            exited = time.monotonic_ns()
+            _emit('handoff_barrier_call', item, enter_mono_ns=entered,
+                  exit_mono_ns=exited, native_ok=True, **task)
+            return result
+
+        barrier._sim_pp_barrier_observer = True
+        dist.barrier = barrier
+
     drain = module._drain_slice
 
     @wraps(drain)

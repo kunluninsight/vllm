@@ -25,7 +25,7 @@ TRAINING_CONTROLLER_KINDS = CONTROLLER_LIFECYCLE_KINDS | frozenset({
 })
 # 跨机barrier对齐时钟与节拍分解所需；barrier为world集合操作，pcp0即可代表本stage
 TICK_WORKER_KINDS = frozenset({
-    'native.handoff_submit_enter', 'native.handoff_submitted', 'native.handoff_barrier_done',
+    'native.handoff_barrier_call', 'native.handoff_submit_enter', 'native.handoff_submitted', 'native.handoff_barrier_done',
     'native.receive_reference_returned', 'native.forward_dispatch_enter', 'native.forward_dispatch_return',
 })
 TICK_HOST_KINDS = frozenset({
@@ -37,7 +37,7 @@ TICK_HOST_KINDS = frozenset({
 TICK_CONTROLLER_KINDS = frozenset({'engine.dispatch.observed', 'rpc.sample_tokens.dispatch'})
 
 PROTOCOL_KINDS = frozenset({
-    'handoff_submit_enter', 'handoff_submitted', 'handoff_barrier_done',
+    'handoff_barrier_call', 'handoff_submit_enter', 'handoff_submitted', 'handoff_barrier_done',
     'local_drain.enter', 'local_drain.ready', 'local_drain.error',
     'handoff_flush.enter', 'handoff_flush.submitted', 'handoff_flush.error',
     'payload_metadata',

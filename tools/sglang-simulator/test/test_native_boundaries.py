@@ -120,6 +120,10 @@ def test_middle_stage_previous_chunk_and_ready_before_world_barrier(rig):
     assert ready[0][3]['start_mono_ns'] is not None
     names = [e[0] for e in rig.events]
     assert names.index('native.local_drain.ready') < names.index('BARRIER') < names.index('native.handoff_barrier_done')
+    call, = [e for e in rig.events if e[0]=='native.handoff_barrier_call']
+    assert call[1:3] == ready[0][1:3] and call[3]['native_ok']
+    assert call[3]['enter_mono_ns'] <= call[3]['exit_mono_ns']
+    assert names.index('BARRIER') < names.index('native.handoff_barrier_call') < names.index('native.handoff_barrier_done')
     assert rig.calls == [('sync', True, True), ('barrier', 'world32'), ('sync', False, True), ('sync', False, False)]
     assert names.index('native.handoff_submitted') < names.index('native.receive_reference_returned')
     assert [e for e in rig.events if e[0]=='native.receive_reference_returned'][0][3]['receive_device_ready'] is False
