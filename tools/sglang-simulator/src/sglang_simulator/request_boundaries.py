@@ -225,7 +225,12 @@ def _business_metadata(bound):
 
 
 def _yield_metadata(result):
+    # Same header check as r58's Prefill consumer; a capacity frame is not TTFT.
+    first = next(iter(_rows(result)), None)
+    header = getattr(getattr(first, "engine_output", None), "request_id", None)
     return {
+        "capacity_info_frame": (type(header) is str and header == "capacity_info_pack"
+                                if first is not None else None),
         "output_count": _cpu_len(result),
         "output_token_counts": tuple(
             _cpu_len(getattr(row, "token_ids", None)) for row in _rows(result)
@@ -516,5 +521,55 @@ class C_PrivateRequestEngineHook(BaseHook):
         return target
 
 
+class C_PrivateAsyncBackendHook(BaseHook):
+    HOOK_MODULE_NAME = "dashllm.core.backend.engine._vllm_v1_async"
+    HOOK_CLASS_NAME = "vLLMEngine"
+
+    @classmethod
+    def hook(cls, target):
+        if _enabled():
+            source = cls.HOOK_MODULE_NAME + "." + cls.HOOK_CLASS_NAME
+            # r58 exposes a sync generator over the async backend.
+            _install(target, "generate", source + ".generate",
+                     None, _business_metadata, generator=True)
+            _install(target, "_parse_output", source + "._parse_output",
+                     "request.private_parsed", _parse_metadata,
+                     lambda bound, result: _yield_metadata(result))
+        return target
+
+
+def _pd_session(bound):
+    session = bound["self"]
+    return {"business_request_id_sha256": _hash_id(session.request_id),
+            "pd_session_uuid_sha256": _hash_id(session.request_uuid),
+            "delivery_observed": False}
+
+
+def _pd_result(bound):
+    delay = bound.get("first_token_delay_ms")
+    # Native r58 freezes this clock BEFORE yielding the handshake.
+    return {**_pd_session(bound),
+            "native_prefill_first_token_delay_ms":
+                delay if type(delay) is int and delay >= 0 else None}
+
+
+class C_PrefillProtocolHook(BaseHook):
+    HOOK_MODULE_NAME = "dashllm.core.backend.engine.pd_protocol.session"
+    HOOK_CLASS_NAME = "PrefillProtocolSession"
+
+    @classmethod
+    def hook(cls, target):
+        if _enabled():
+            source = cls.HOOK_MODULE_NAME + "." + cls.HOOK_CLASS_NAME
+            for method, event in (("prefill_running", "request.pd_prefill_running"),
+                                  ("handshake", "request.pd_handshake_built"),
+                                  ("prefill_result", "request.pd_first_token_built"),
+                                  ("kv_ready", "request.pd_kv_ready_built")):
+                _install(target, method, source + "." + method, event,
+                         _pd_result if method == "prefill_result" else _pd_session)
+        return target
+
+
 HOOKS = [C_RequestInputProcessorHook, C_RequestOutputProcessorHook,
-         C_RequestStateOutputHook, C_PrivateRequestEngineHook]
+         C_RequestStateOutputHook, C_PrivateRequestEngineHook,
+         C_PrivateAsyncBackendHook, C_PrefillProtocolHook]
