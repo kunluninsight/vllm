@@ -23,6 +23,7 @@ class Envs:
     STORE_RANK_SYNC_MS = "HISIM_STORE_RANK_SYNC_MS"
     SEG1_FLOOR_MS = "HISIM_SEG1_FLOOR_MS"
     SEG1_PER_BLK_MS = "HISIM_SEG1_PER_BLK_MS"
+    DP_MAX_REQUESTS = "HISIM_DP_MAX_REQUESTS"
 
     # Existing integration-owned names retain their upstream spelling.
     V6D_HITSOURCE_LOG = "V6D_HITSOURCE_LOG"
@@ -123,6 +124,12 @@ class Envs:
     @classmethod
     def max_tokens(cls) -> int | None:
         value = os.getenv(cls.MAX_TOKENS)
+        return int(value) if value is not None else None
+
+    @classmethod
+    def dp_max_requests(cls) -> int | None:
+        """Per-rank request capacity of the DP payload; None uses max_num_seqs."""
+        value = os.getenv(cls.DP_MAX_REQUESTS)
         return int(value) if value is not None else None
 
     @classmethod

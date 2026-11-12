@@ -139,7 +139,6 @@ def write_platform_config(work):
             "num_device_per_node": 1,
         },
         "predictor": {"name": "linear", "base_ms": 2.0, "per_token_ms": 0.01},
-        "scheduler": {"tp_size": 1, "ep_size": 1, "dp_size": 1},
     }
     (work / "config.json").write_text(json.dumps(config))
 
@@ -570,8 +569,6 @@ def main():
         engine["hf_overrides"] = layer_overrides(args.model, args.num_layers)
     env["DS_LLM_ENGINE_CONFIG"] = json.dumps(engine)
     simulator = json.loads((work / "config.json").read_text())
-    if args.target_tp is not None:
-        simulator["scheduler"].update(tp_size=args.target_tp, ep_size=args.target_tp)
     min_elapsed = 0.0
     if args.remote_ple:
         # Non-PD serving; HiSim restores the v6d+KVT connector remote PLE needs.

@@ -1,9 +1,10 @@
 """Coordinate request replay, inference timing, and statistics.
 
 EngineCore parks OFFLINE arrivals before native cache admission. Scheduler
-counts keep parked arrivals visible to the engine loop. Executor predicts each
-step: BLOCKING defers completion on the wall clock; OFFLINE advances virtual
-time. The hooks share predictor, mode, and iteration state on EngineCoreHook.
+counts keep parked arrivals visible to the engine loop. The worker's model
+runner predicts each step from its DP-wide batch; the executor then defers
+completion on the wall clock (BLOCKING) or advances virtual time (OFFLINE).
+The hooks share mode and iteration state on EngineCoreHook.
 """
 
 import heapq
@@ -14,16 +15,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 
 from hisim.hook import BaseHook
-from hisim.simulation.manager import ConfigManager
 from hisim.simulation.manager import StateManager
 from hisim.env import Envs
 from hisim.simulation.req_stats_manager import request_stats_manager
 from hisim.simulation.types import SimulationMode
-from hisim.simulation.hijack.vllm.utils import (
-    resolve_model_info,
-    resolve_scheduler_config,
-)
-from hisim.time_predictor import InferTimePredictor
 from hisim.time_predictor import ScheduleBatch
 from hisim.time_predictor import ScheduleRequest
 from hisim.utils import get_logger
@@ -185,7 +180,7 @@ def _finalize_step_stats(scheduler_output, event_time: float) -> None:
 
 
 class C_VLLMEngineCoreHook(BaseHook):
-    """Initialize prediction, gate OFFLINE admission, and export per-round stats.
+    """Gate OFFLINE admission and export per-round stats.
 
     Parking before native add_request prevents early connector lookup and KV
     allocation. Input preprocessing remains native; BLOCKING admits immediately.
@@ -194,7 +189,6 @@ class C_VLLMEngineCoreHook(BaseHook):
     HOOK_CLASS_NAME = "EngineCore"
     HOOK_MODULE_NAME = "vllm.v1.engine.core"
 
-    INFERENCE_PREDICTOR: InferTimePredictor = None
     SIM_MODE: SimulationMode = SimulationMode(Envs.simulation_mode())
 
     # Publish iteration stats after wall-clock or virtual-clock completion.
@@ -210,30 +204,12 @@ class C_VLLMEngineCoreHook(BaseHook):
         dispatcher.original_core_add_request = original_add_request
 
         def wrapped_init(self, vllm_config, *args, **kwargs):
-            """Reset replay/statistics and initialize the configured predictor."""
+            """Reset replay/statistics before the native engine starts."""
             ReqDispatcher().reset()
             request_stats_manager.reset()
             cls.ITERATION_STATS.clear()
 
             original_init(self, vllm_config, *args, **kwargs)
-
-            try:
-                model_config = vllm_config.model_config
-                model = resolve_model_info(model_config)
-                ConfigManager.set_model_info(model)
-
-                hw = ConfigManager.get_accelerator_info()
-
-                sched_config = resolve_scheduler_config(vllm_config)
-                ConfigManager.set_scheduler_config(sched_config)
-
-                cls.INFERENCE_PREDICTOR = ConfigManager.get_inference_time_predictor(
-                    model, hw, sched_config
-                )
-                logger.info("AIConfigurator predictor initialized for vLLM.")
-            except Exception as e:
-                logger.error("Failed to initialize inference time predictor: %s", e)
-                raise
 
         def wrapped_add_request(self, request, request_wave=0, *args, **kwargs):
             """Queue timestamped OFFLINE requests; admit all others immediately."""
@@ -315,6 +291,13 @@ class C_VLLMEngineCoreHook(BaseHook):
         def wrapped_profile(self, is_start: bool = True):
             req_stats = request_stats_manager.get_all_req_stats()
             output_dir = Envs.output_dir()
+            parallel = self.vllm_config.parallel_config
+            if parallel.data_parallel_size > 1:
+                # DP ranks are separate engine processes sharing the output dir.
+                output_dir = os.path.join(
+                    output_dir, f"dp{parallel.data_parallel_rank}"
+                )
+                os.makedirs(output_dir, exist_ok=True)
             with open(os.path.join(output_dir, "request.jsonl"), "w") as f:
                 for item in req_stats:
                     f.write(json.dumps(asdict(item), default=str) + "\n")
@@ -354,10 +337,11 @@ def _connector_has_pending(scheduler) -> bool:
 
 
 class C_VLLMExecutorHook(BaseHook):
-    """Predict from SchedulerOutput and defer or virtually advance completion.
+    """Annotate SchedulerOutput and defer or virtually advance completion.
 
-    Async scheduling attaches the span to worker output; non-async scheduling
-    returns a deferred executor future. Both leave native connector polling
+    The worker attaches the predicted span (`_sim_step`). Async scheduling
+    consumes it in worker output; non-async scheduling and DP dummy steps
+    return a deferred executor future. Both leave native connector polling
     available while BLOCKING inference is pending.
     """
 
@@ -379,6 +363,7 @@ class C_VLLMExecutorHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_execute_model = target.execute_model
+        original_execute_dummy_batch = target.execute_dummy_batch
 
         # Retain prompt length/logprobs across cached steps; discard on finish.
         req_info: dict[str, tuple] = {}
@@ -462,98 +447,94 @@ class C_VLLMExecutorHook(BaseHook):
                     )
                 )
             scheduler_output._sim_token_emitted = token_emitted
+            scheduler_output._sim_logprobs_tokens = logprobs_tokens
 
             if simulation_batch.is_empty():
                 return original_execute_model(self, scheduler_output, *args, **kwargs)
 
-            # Predict before execution so the worker receives timing annotations.
             StateManager.inc_iteration()
-            predictor = C_VLLMEngineCoreHook.INFERENCE_PREDICTOR
-            if predictor is not None:
-                predicted_latency = float(
-                    predictor.predict_infer_time(simulation_batch)
+            # The worker coordinates the DP-wide batch, then predicts the span.
+            result = original_execute_model(self, scheduler_output, *args, **kwargs)
+            if isinstance(result, Future) and result.exception() is not None:
+                return result
+            step = getattr(scheduler_output, "_sim_step", None)
+            if step is None:
+                raise RuntimeError(
+                    "scheduler_output lacks the worker's _sim_step annotation "
+                    "(sim worker hook not active?)"
                 )
-            else:
-                predicted_latency = 0.001  # fallback: 1ms per step
-
-            # Optional logprobs cost applies only to tokens requesting logprobs.
-            lp_cost = getattr(predictor, "logprobs_cost_s_per_token", 0.0)
-            logprobs_latency = lp_cost * logprobs_tokens
-
-            # Keep optional sampling cost separate from the forward prediction
-            # so training-label and iteration-stat meanings remain distinct.
-            total_tokens = sum(num_scheduled_tokens.values())
-            sample_tokens_latency = 0.0
-            if predictor is not None and hasattr(
-                predictor, "predict_sample_tokens_time"
-            ):
-                sample_tokens_latency = float(
-                    predictor.predict_sample_tokens_time(simulation_batch)
-                )
-
-            # The modeled step includes forward, sampling, and logprobs costs.
-            full_step_latency = (
-                predicted_latency + sample_tokens_latency + logprobs_latency
-            )
-
-            is_blocking = C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING
-            simulated_gpu_span = abs(full_step_latency)
+            full_step_latency = step.full_step_latency
 
             # Publish these annotations only when the modeled step completes.
             scheduler_output._sim_iteration_stat = {
-                "requests": simulation_batch.request_info(),
+                "requests": step.requests,
                 # RPC-1 only, matching the predictor's training label.
-                "forward_latency": predicted_latency,
-                "sample_tokens_latency": sample_tokens_latency,
-                "logprobs_latency": logprobs_latency,
+                "forward_latency": step.forward_latency,
+                "sample_tokens_latency": step.sample_tokens_latency,
+                "logprobs_latency": step.logprobs_latency,
                 "full_step_latency": full_step_latency,
-                "total_tokens": total_tokens,
+                "total_tokens": sum(num_scheduled_tokens.values()),
                 "l2_load_latency": 0.0,
                 "l2_backup_latency": 0.0,
+                **step.dp_fields(),
             }
 
-            if not is_blocking:
+            if C_VLLMEngineCoreHook.SIM_MODE != SimulationMode.BLOCKING:
                 # Virtual time includes modeled costs, not real engine/IPC overhead.
-                result = original_execute_model(self, scheduler_output, *args, **kwargs)
                 StateManager.set_current_inference_dur(full_step_latency)
                 StateManager.step_global_clock(full_step_latency)
                 _finalize_step_stats(scheduler_output, StateManager.get_global_clock())
                 return result
 
-            async_scheduling = bool(
-                getattr(
-                    getattr(self, "scheduler_config", None), "async_scheduling", False
-                )
-            )
-
-            if async_scheduling:
+            if _async_scheduling(self):
                 # Async scheduling consumes the span in the worker's sample output.
-                scheduler_output._sim_full_step_latency = simulated_gpu_span
-                return original_execute_model(self, scheduler_output, *args, **kwargs)
+                return result
 
-            # Non-async scheduling builds mock output now and delays its future.
+            # Non-async scheduling delays the mock output's future.
             # The native bypass loop can still process input and connector work.
-            result = original_execute_model(self, scheduler_output, *args, **kwargs)
+            return cls._defer(result, abs(full_step_latency), scheduler_output)
+
+        def wrapped_execute_dummy_batch(self, *args, non_block=False, **kwargs):
+            """Hold an idle DP rank's dummy step for the coordinated span."""
+            result = original_execute_dummy_batch(
+                self, *args, non_block=non_block, **kwargs
+            )
+            if C_VLLMEngineCoreHook.SIM_MODE != SimulationMode.BLOCKING or (
+                isinstance(result, Future) and result.exception() is not None
+            ):
+                return result
             model_output = result.result() if isinstance(result, Future) else result
-
-            deferred: Future = Future()
-            _span = simulated_gpu_span
-            _sout = scheduler_output
-
-            def _consume_gpu_span():
-                try:
-                    time.sleep(_span)
-                    # Finalize before resolving the future and admitting the next step.
-                    _finalize_step_stats(_sout, time.time())
-                    deferred.set_result(model_output)
-                except BaseException as exc:  # pragma: no cover
-                    deferred.set_exception(exc)
-
-            cls._gpu_span_pool().submit(_consume_gpu_span)
-            return deferred
+            step = model_output.__dict__.pop("_sim_step")
+            deferred = cls._defer(result, abs(step.full_step_latency), None)
+            return deferred if non_block else deferred.result()
 
         target.execute_model = wrapped_execute_model
+        target.execute_dummy_batch = wrapped_execute_dummy_batch
         logger.info(
             "[vLLM Hijack] UniProcExecutor hook installed "
-            "(GPU prediction at execute_model; BLOCKING span deferred)"
+            "(DP-coordinated prediction in worker; BLOCKING span deferred)"
         )
+
+    @classmethod
+    def _defer(cls, result, span: float, scheduler_output) -> Future:
+        """Resolve the model output after the span, serialized like a GPU stream."""
+        model_output = result.result() if isinstance(result, Future) else result
+        deferred: Future = Future()
+
+        def _consume_gpu_span():
+            try:
+                time.sleep(span)
+                # Finalize before resolving the future and admitting the next step.
+                if scheduler_output is not None:
+                    _finalize_step_stats(scheduler_output, time.time())
+                deferred.set_result(model_output)
+            except BaseException as exc:  # pragma: no cover
+                deferred.set_exception(exc)
+
+        cls._gpu_span_pool().submit(_consume_gpu_span)
+        return deferred
+
+
+def _async_scheduling(executor) -> bool:
+    scheduler_config = getattr(executor, "scheduler_config", None)
+    return bool(getattr(scheduler_config, "async_scheduling", False))

@@ -12,20 +12,25 @@ class SchedulerConfig:
     )
     kv_cache_data_type: Optional[DataType] = None
     mem_fraction_static: Optional[float] = None
-    max_total_tokens: Optional[int] = None
 
     tp_size: int = 1
-    ep_size: int = 1
-    dp_size: int = 1
     pp_size: int = 1
+    dp_size: int = 1
+    enable_expert_parallel: bool = False
 
     # framework backend
-    backend_name: str = "sglang"
+    backend_name: str = "vllm"
     backend_version: Optional[str] = None
 
     @property
+    def ep_size(self) -> int:
+        # vLLM's expert parallelism spans every TP and DP rank.
+        return self.tp_size * self.dp_size if self.enable_expert_parallel else 1
+
+    # AIConfigurator views: without EP, MoE layers are TP-sharded across DP.
+    @property
     def attn_tp_size(self) -> int:
-        return self.tp_size / self.dp_size
+        return self.tp_size
 
     @property
     def attn_dp_size(self) -> int:
@@ -33,7 +38,7 @@ class SchedulerConfig:
 
     @property
     def moe_tp_size(self) -> int:
-        return self.tp_size / self.ep_size
+        return self.tp_size * self.dp_size // self.ep_size
 
     @property
     def moe_ep_size(self) -> int:

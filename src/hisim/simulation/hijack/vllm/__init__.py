@@ -23,6 +23,6 @@ def get_class_hooks() -> list[type[BaseHook]]:
 
 
 def get_module_hooks() -> list[type[BaseHook]]:
-    from . import v6d
+    from . import dp, v6d
 
-    return v6d.get_module_hooks()
+    return [dp.M_VLLMDPUtilsHook, dp.M_VLLMEngineUtilsHook, *v6d.get_module_hooks()]

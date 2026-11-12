@@ -1,8 +1,9 @@
-"""Simulate vLLM worker execution without constructing a GPU model runner.
+"""Simulate vLLM worker execution with a CPU model runner.
 
 Discover native KV specs with a meta-device model walk, but allocate
 at most 4 KiB per CPU backing tensor. v6d object sizes follow the specs, not
-these buffers. Mock token output retains the connector lifecycle.
+these buffers. Mock token output retains the connector lifecycle; step timing
+comes from `SimModelRunner`.
 """
 
 import asyncio
@@ -14,36 +15,31 @@ import torch
 
 from hisim.hook import BaseHook
 from hisim.simulation.manager import ConfigManager
+from hisim.simulation.types import SimulationMode
 from hisim.simulation.utils import profile_device_available_bytes
-from hisim.simulation.hijack.vllm.utils import (
-    resolve_model_info,
-    resolve_scheduler_config,
-)
+from hisim.simulation.hijack.vllm.engine_core_pipeline import C_VLLMEngineCoreHook
+from hisim.simulation.hijack.vllm.model_runner import SimModelRunner
 from hisim.utils import get_logger
 
 logger = get_logger()
 
 
-class _ModelRunnerStub:
-    """Picklable model-runner placeholder with cached KV specs."""
-
-    def __init__(self, kv_spec=None):
-        self._kv_spec = kv_spec
-        self.model_memory_usage = 0
-
-    def get_kv_cache_spec(self):
-        return self._kv_spec
-
-    def __getattr__(self, name):
-        # Public fallback methods are no-ops; private attributes stay absent.
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return _noop
-
-
-def _noop(*args, **kwargs):
-    """Module-level no-op function (picklable)."""
-    return None
+def _local_requests(scheduler_output) -> list[tuple[int, int, int]]:
+    """Collector-compatible `(extend, past_kv, output_len)` rows of this rank."""
+    new_reqs = scheduler_output.scheduled_new_reqs or ()
+    past = {r.req_id: r.num_computed_tokens for r in new_reqs}
+    output_len = dict.fromkeys(past, 0)
+    cached = scheduler_output.scheduled_cached_reqs
+    if cached is not None:
+        past.update(zip(cached.req_ids, cached.num_computed_tokens))
+        num_output = getattr(cached, "num_output_tokens", None)
+        if num_output:
+            output_len.update(zip(cached.req_ids, num_output))
+    return [
+        (int(num_tokens), max(0, int(past[req_id])), int(output_len.get(req_id, 0)))
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items()
+        if req_id in past
+    ]
 
 
 def _build_kv_cache_spec(vllm_config) -> dict:
@@ -98,7 +94,7 @@ class C_VLLMWorkerHook(BaseHook):
             pass
 
         def override_init_device(self):
-            """Initialize Gloo, CPU workspace, and the KV-spec runner stub."""
+            """Initialize Gloo, CPU workspace, and the CPU model runner."""
             try:
                 from vllm.v1.worker.gpu_worker import (
                     init_worker_distributed_environment,
@@ -136,35 +132,28 @@ class C_VLLMWorkerHook(BaseHook):
             set_random_seed(self.vllm_config.model_config.seed)
 
             self.device = torch.device("cpu")
-            ConfigManager.set_model_info(
-                resolve_model_info(self.vllm_config.model_config)
+            self.model_runner = SimModelRunner(
+                self.vllm_config, kv_spec=_build_kv_cache_spec(self.vllm_config)
             )
-            ConfigManager.set_scheduler_config(
-                resolve_scheduler_config(self.vllm_config)
-            )
-
-            kv_spec = _build_kv_cache_spec(self.vllm_config)
-            self.model_runner = _ModelRunnerStub(kv_spec=kv_spec)
 
             self.init_snapshot = None
             self.requested_memory = 0
             init_workspace_manager(self.device, 1)
-            logger.info("[vLLM Hijack] Worker.init_device: stub initialized")
+            logger.info(
+                "[vLLM Hijack] Worker.init_device: CPU model runner initialized"
+            )
 
         def override_load_model(self, *args, **kwargs):
-            """Skip model loading entirely."""
-            logger.info("[vLLM Hijack] Worker.load_model: skipped")
+            """Load the latency predictor in place of model weights."""
+            self.model_runner.load_model()
 
         def override_determine_available_memory(self):
             """Profile modeled KV capacity, with an 80 GiB fallback on failure."""
             try:
-                model = resolve_model_info(self.vllm_config.model_config)
-                ConfigManager.set_model_info(model)
-                hw = ConfigManager.get_accelerator_info()
-                sched_config = resolve_scheduler_config(self.vllm_config)
-                ConfigManager.set_scheduler_config(sched_config)
                 available_bytes = profile_device_available_bytes(
-                    model, hw, sched_config
+                    self.model_runner.model_info,
+                    ConfigManager.get_accelerator_info(),
+                    self.model_runner.scheduler_config,
                 )
 
                 logger.info(
@@ -305,11 +294,8 @@ class C_VLLMWorkerHook(BaseHook):
             """Return generate task (default for causal LM)."""
             return ("generate",)
 
-        def override_execute_model(self, scheduler_output):
-            """Return mock ModelRunnerOutput with KV connector lifecycle."""
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-
-            # KV connector pre-forward
+        def _kv_pre_forward(scheduler_output):
+            """Bind connector metadata and start loads; return the connector."""
             kv_connector = None
             try:
                 if _has_kv_transfer_group and _has_kv_transfer_group():
@@ -339,6 +325,45 @@ class C_VLLMWorkerHook(BaseHook):
                     "deadlines keep draining",
                     exc_info=True,
                 )
+            return kv_connector
+
+        def _kv_post_forward(kv_connector, scheduler_output, output) -> None:
+            """Harvest finished transfers into the output, then unbind metadata."""
+            if kv_connector is None or _KVConnectorOutput is None:
+                return
+            try:
+                kv_connector.wait_for_save()
+                kv_output = _KVConnectorOutput()
+                finished_req_ids = getattr(scheduler_output, "finished_req_ids", set())
+                kv_output.finished_sending, kv_output.finished_recving = (
+                    kv_connector.get_finished(finished_req_ids)
+                )
+                if kv_output.finished_sending or kv_output.finished_recving:
+                    logger.info(
+                        "[V6D Hijack] execute_model: finished_sending=%s "
+                        "finished_recving=%s",
+                        sorted(kv_output.finished_sending or []),
+                        sorted(kv_output.finished_recving or []),
+                    )
+                else:
+                    logger.debug(
+                        "[V6D Hijack] execute_model: finished_sending=[] "
+                        "finished_recving=[]"
+                    )
+                if hasattr(kv_connector, "build_connector_worker_meta"):
+                    kv_output.kv_connector_worker_meta = (
+                        kv_connector.build_connector_worker_meta()
+                    )
+                kv_connector.clear_connector_metadata()
+                output.kv_connector_output = kv_output
+            except Exception:
+                logger.exception(
+                    "[V6D Hijack] execute_model: KV post-forward lifecycle failed"
+                )
+
+        def override_execute_model(self, scheduler_output):
+            """Return mock ModelRunnerOutput with KV connector lifecycle."""
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
             req_ids = list(num_scheduled_tokens.keys()) if num_scheduled_tokens else []
             # Executor annotations suppress tokens for incomplete prefill chunks;
@@ -349,6 +374,23 @@ class C_VLLMWorkerHook(BaseHook):
                     "scheduler_output lacks _sim_token_emitted annotation "
                     "(sim executor hook not active?)"
                 )
+
+            # Like GPUModelRunner, coordinate the batch across DP before forward.
+            step = None
+            requests = _local_requests(scheduler_output) if req_ids else []
+            if requests:
+                step = self.model_runner.run_step(
+                    requests,
+                    num_context_tokens=getattr(
+                        scheduler_output, "total_num_scheduled_context_tokens", 0
+                    ),
+                    logprobs_tokens=getattr(
+                        scheduler_output, "_sim_logprobs_tokens", 0
+                    ),
+                )
+                scheduler_output._sim_step = step
+
+            kv_connector = _kv_pre_forward(scheduler_output)
 
             sampled_token_ids = []
             for req_id in req_ids:
@@ -372,52 +414,23 @@ class C_VLLMWorkerHook(BaseHook):
                 mro_kwargs["pooler_output"] = [None] * len(req_ids)
             output = _ModelRunnerOutput(**mro_kwargs)
 
-            # KV connector post-forward
-            if kv_connector is not None and _KVConnectorOutput is not None:
-                try:
-                    kv_connector.wait_for_save()
-                    kv_output = _KVConnectorOutput()
-                    finished_req_ids = getattr(
-                        scheduler_output, "finished_req_ids", set()
-                    )
-                    kv_output.finished_sending, kv_output.finished_recving = (
-                        kv_connector.get_finished(finished_req_ids)
-                    )
-                    if kv_output.finished_sending or kv_output.finished_recving:
-                        logger.info(
-                            "[V6D Hijack] execute_model: finished_sending=%s "
-                            "finished_recving=%s",
-                            sorted(kv_output.finished_sending or []),
-                            sorted(kv_output.finished_recving or []),
-                        )
-                    else:
-                        logger.debug(
-                            "[V6D Hijack] execute_model: finished_sending=[] "
-                            "finished_recving=[]"
-                        )
-                    if hasattr(kv_connector, "build_connector_worker_meta"):
-                        kv_output.kv_connector_worker_meta = (
-                            kv_connector.build_connector_worker_meta()
-                        )
-                    kv_connector.clear_connector_metadata()
-                    output.kv_connector_output = kv_output
-                except Exception:
-                    logger.exception(
-                        "[V6D Hijack] execute_model: KV post-forward lifecycle failed"
-                    )
+            _kv_post_forward(kv_connector, scheduler_output, output)
 
             self._last_model_output = output
-            latency = getattr(scheduler_output, "_sim_full_step_latency", None)
             scheduler_config = getattr(
                 getattr(self, "vllm_config", None), "scheduler_config", None
             )
             async_scheduling = bool(
                 getattr(scheduler_config, "async_scheduling", False)
             )
-            self._last_sim_full_step_latency = latency if async_scheduling else None
-            if latency is not None and not async_scheduling:
-                # Honor an explicitly attached span even without async scheduling.
-                return _SimAsyncOutput(output, latency)
+            # Async BLOCKING scheduling sleeps the span in the sample output.
+            self._last_sim_full_step_latency = (
+                abs(step.full_step_latency)
+                if step is not None
+                and async_scheduling
+                and C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING
+                else None
+            )
             return output
 
         def override_sample_tokens(self, grammar_output):
@@ -427,6 +440,27 @@ class C_VLLMWorkerHook(BaseHook):
             self._last_sim_full_step_latency = None
             if latency is not None:
                 return _SimAsyncOutput(output, latency)
+            return output
+
+        def override_execute_dummy_batch(self, *args, **kwargs):
+            """Join an idle DP rank's step, like GPUModelRunner._dummy_run.
+
+            The coordinated span rides on the output for the executor hook.
+            """
+            from vllm.v1.core.sched.output import SchedulerOutput
+            from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+
+            step = self.model_runner.run_step([], is_dummy=True)
+            # The native dummy run sees an empty SchedulerOutput but still
+            # harvests finished KV transfers.
+            empty = SchedulerOutput.make_empty()
+            output = dataclasses.replace(EMPTY_MODEL_RUNNER_OUTPUT)
+            _kv_post_forward(_kv_pre_forward(empty), empty, output)
+            kv_output = output.kv_connector_output
+            if kv_output is not None and kv_output.is_empty():
+                output.kv_connector_output = None
+            # Consumed in-process by the executor hook before the span is deferred.
+            output._sim_step = step
             return output
 
         def override_take_draft_token_ids(self):
@@ -466,6 +500,7 @@ class C_VLLMWorkerHook(BaseHook):
         target.execute_model = override_execute_model
         target.take_draft_token_ids = override_take_draft_token_ids
         target.sample_tokens = override_sample_tokens
+        target.execute_dummy_batch = override_execute_dummy_batch
         target.sleep = override_sleep
         target.wake_up = override_wake_up
         target.get_attn_backends_type = override_get_attn_backends_type

@@ -5,58 +5,6 @@ import os
 import re
 import sys
 
-import torch
-
-
-def _patch_triton_for_cpu():
-    """Allow driverless Triton imports and preload its CUDA language helpers.
-
-    vLLM permits zero active drivers only with an empty device mask, so clear
-    masks assigned by launchers (e.g. DS_GPU_NUM) when no CUDA device exists.
-    Real GPU hosts keep their mask; missing Triton helpers remain optional.
-    """
-    if not torch.cuda.is_available():
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
-    try:
-        import triton.language.extra.cuda  # noqa: F401
-    except (ImportError, AttributeError, ModuleNotFoundError):
-        pass
-
-
-def _patch_torch_cuda_for_cpu():
-    """Supply fallback CUDA properties and initialization on driverless hosts."""
-    if torch.cuda.is_available():
-        return
-
-    class _FakeDeviceProperties:
-        major = 9
-        minor = 0
-        name = "NVIDIA Simulated GPU"
-        total_memory = 80 * (1 << 30)  # 80 GiB
-        multi_processor_count = 132
-
-    _original_get_device_properties = torch.cuda.get_device_properties
-
-    def _mock_get_device_properties(device=None):
-        try:
-            return _original_get_device_properties(device)
-        except (RuntimeError, AssertionError):
-            return _FakeDeviceProperties()
-
-    torch.cuda.get_device_properties = _mock_get_device_properties
-
-    _original_lazy_init = torch.cuda._lazy_init
-
-    def _mock_lazy_init():
-        try:
-            _original_lazy_init()
-        except RuntimeError:
-            pass
-
-    torch.cuda._lazy_init = _mock_lazy_init
-
-
 # Explicit entrypoints and the .pth bootstrap can share the same interpreter.
 _HOOKS_INSTALLED = False
 
@@ -75,18 +23,22 @@ def init_hook():
             "[init_hook] PYTHONHASHSEED not set, defaulting to 42 for cross-node hash consistency"
         )
 
-    _patch_triton_for_cpu()
-    _patch_torch_cuda_for_cpu()
+    # Runtime torch/Triton patches must precede any framework import.
+    from hisim.simulation.hijack import torch as torch_hijack
+
+    torch_hijack.patch_runtime()
 
     import hisim.hook as hisim_hook
     from hisim.simulation.hijack import dashllm, v6d, vllm
 
     class_hooks = [
+        *torch_hijack.get_class_hooks(),
         *vllm.get_class_hooks(),
         *dashllm.get_class_hooks(),
         *v6d.get_class_hooks(),
     ]
     module_hooks = [
+        *torch_hijack.get_module_hooks(),
         *vllm.get_module_hooks(),
         *dashllm.get_module_hooks(),
         *v6d.get_module_hooks(),

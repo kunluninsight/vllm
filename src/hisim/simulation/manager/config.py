@@ -2,10 +2,6 @@ from typing import Optional
 
 from hisim.env import Envs
 from hisim.simulation.types import PlatformConfig, SchedulerConfig
-from hisim.simulation.utils import (
-    calc_kv_cache_cell_elems,
-    calc_kv_cache_per_layer_elems,
-)
 from hisim.spec import AcceleratorInfo, DataType, ModelInfo
 from hisim.time_predictor import InferTimePredictor, LinearTimePredictor
 from hisim.utils import get_logger
@@ -92,15 +88,9 @@ class ConfigManager:
 
     @classmethod
     def set_scheduler_config(cls, config: SchedulerConfig):
-        # The configuration from the external config file has higher priority.
+        """Apply simulator overrides for data types and the predictor backend."""
         external_config = cls._get_raw_config().get("scheduler", {})
-        for field_name in [
-            "tp_size",
-            "dp_size",
-            "ep_size",
-            "backend_name",
-            "backend_version",
-        ]:
+        for field_name in ["backend_name", "backend_version"]:
             field_value = external_config.get(field_name)
             if field_value is not None:
                 setattr(config, field_name, field_value)
@@ -111,28 +101,6 @@ class ConfigManager:
                 setattr(config, field_name, DataType(field_value))
 
         cls._scheduler_config = config
-
-    @classmethod
-    def get_kv_cache_bytes(cls) -> int:
-        model = cls._model_info
-        scheduler_config = cls._scheduler_config
-        return (
-            calc_kv_cache_cell_elems(
-                model, scheduler_config.tp_size, scheduler_config.pp_size
-            )
-            * scheduler_config.data_type.bytes
-        )
-
-    @classmethod
-    def get_kv_cache_bytes_per_layer(cls) -> int:
-        model = cls._model_info
-        scheduler_config = cls._scheduler_config
-        return (
-            calc_kv_cache_per_layer_elems(
-                model, scheduler_config.tp_size, scheduler_config.pp_size
-            )
-            * scheduler_config.data_type.bytes
-        )
 
     @classmethod
     def get_scheduler_config(cls):
@@ -147,19 +115,6 @@ class ConfigManager:
         if unknown:
             raise ValueError(f"Unknown ple config keys: {sorted(unknown)}")
         return PLEAdmissionModel.from_config(ple_config.get("admission"))
-
-    @classmethod
-    def _parse_server_args(cls, server_args: dict, backend: str) -> SchedulerConfig:
-        if backend == "sglang":
-            return SchedulerConfig(
-                tp_size=server_args.get("tp_size", 1),
-                ep_size=server_args.get("ep_size", 1),
-                dp_size=server_args.get("dp_size", 1),
-                mem_fraction_static=server_args.get("mem_fraction_static"),
-                backend_name="sglang",
-            )
-        else:
-            raise RuntimeError(f"Unsupported backend[{backend}] server args parser.")
 
     @classmethod
     def get_inference_time_predictor(

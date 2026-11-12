@@ -7,12 +7,26 @@ is OFFLINE even though the launcher's status message defaults to BLOCKING.
 """
 
 import os
+import sys
 
 from hisim.env import Envs
 
+
+def _data_parallel_size(argv: list[str]) -> int:
+    for i, arg in enumerate(argv):
+        for flag in ("--data-parallel-size", "-dp"):
+            if arg == flag and i + 1 < len(argv):
+                return int(argv[i + 1])
+            if arg.startswith(flag + "="):
+                return int(arg.split("=", 1)[1])
+    return 1
+
+
 # Configure framework defaults before importing vLLM.
 os.environ.setdefault("HISIM_ENABLE", "1")
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+# DP engines run in their own processes behind the DP clients.
+if _data_parallel_size(sys.argv[1:]) == 1:
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 
 from hisim.simulation.hijack.startup import init_hook

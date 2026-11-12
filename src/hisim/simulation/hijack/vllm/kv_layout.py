@@ -228,8 +228,7 @@ def _cuda_metadata_platform():
 def target_layout_config(vllm_config):
     """A shallow config view for layout-only native calls, never for RPC execution."""
     inputs = getattr(vllm_config, "_hisim_layout_inputs", {})
-    scheduler = ConfigManager._get_raw_config().get("scheduler", {})
-    tp = int(scheduler.get("tp_size", inputs.get("tp_size", 1)))
+    tp = int(inputs.get("tp_size", 1))
     if tp < 1:
         raise ValueError("Target TP must be positive")
     layout = copy.copy(vllm_config)

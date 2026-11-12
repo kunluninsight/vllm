@@ -41,9 +41,9 @@ Set `HISIM_ENABLE=0` and restart the service to stop automatic hook installation
 Restore any simulation-specific engine settings when returning to real serving.
 
 ## Simulator configuration
-`HISIM_CONFIG_PATH` points to a JSON file describing the simulated hardware,
-predictor, and target parallelism. It is separate from DashLLM's
-`DS_LLM_ENGINE_CONFIG`, which configures the serving engine.
+`HISIM_CONFIG_PATH` points to a JSON file describing the simulated hardware
+and predictor. It is separate from DashLLM's `DS_LLM_ENGINE_CONFIG`, which
+configures the serving engine, including target parallelism.
 
 A single-node configuration using `linear`:
 
@@ -59,10 +59,6 @@ A single-node configuration using `linear`:
     "name": "linear",
     "base_ms": 2.0,
     "per_token_ms": 0.01
-  },
-  "scheduler": {
-    "tp_size": 1,
-    "ep_size": 1
   }
 }
 ```
@@ -76,9 +72,14 @@ These are example values, not calibrated performance estimates.
   [configuration parsing](src/hisim/simulation/manager/config.py).
 - `memory_*_bandwidth_gb` and `disk_*_bandwidth_gb` describe memory and disk
   bandwidth in GB/s; `num_device_per_node` describes the simulated node.
-- `scheduler.tp_size`, `ep_size`, and `dp_size` describe target parallelism for
-  simulation. HiSim forces vLLM engine parallelism to one and uses a single
-  executor; target parallelism does not launch corresponding GPU workers.
+- Target parallelism comes from the engine arguments (`tensor_parallel_size`,
+  `pipeline_parallel_size`, `data_parallel_size`, `enable_expert_parallel`).
+  HiSim runs each DP rank with a single CPU executor, so TP/PP/EP do not
+  launch corresponding workers.
+- With `data_parallel_size > 1` (`BLOCKING` only), every step is synchronized
+  across DP ranks like vLLM's model runner, and each rank predicts the same
+  latency from the DP-wide batch. Each rank exports its stats to
+  `$HISIM_OUTPUT_DIR/dp<rank>/`.
 - `scheduler.physical_block_size` can override the modeled KV block size when
   matching a production cache layout. Leave it unset for framework-derived
   sizing, especially for hybrid attention/Mamba models.
@@ -106,6 +107,12 @@ For calibrated prediction, replace the `predictor` section:
   downloaded once to `/tmp/hisim/downloads` and reused until that copy is deleted,
   so publish updated bundles under a new URL. Bundles are loaded with `joblib`,
   which can execute code: only use URLs you trust.
+
+With DP, `predictor.dp_batch_scope` selects the predictor input: `global`
+(default) predicts the concatenated DP-wide batch, matching DP collector
+training rows; `max_rank` predicts each rank's batch and keeps the slowest.
+`predictor.dp_idle_step_ms` (default `0`) is the latency of steps where every
+rank runs a dummy batch.
 
 See [predictor selection and options](src/hisim/simulation/manager/config.py).
 Restart serving processes after editing the JSON; configuration is cached in
@@ -175,8 +182,11 @@ Simulator settings are defined in [src/hisim/env.py](src/hisim/env.py).
 | `HISIM_RECORD_STATS` | Collect per-request/iteration simulator stats in `BLOCKING` mode | `0` |
 | `HISIM_MAX_TOKENS` | Override request output length and ignore EOS for controlled tests | Unset: keep request limits |
 | `HISIM_BW_PROFILE` | JSON calibration profile for v6d transfer-latency modeling | Unset: model disabled |
+| `HISIM_DP_MAX_REQUESTS` | Per-rank request capacity of the DP synchronization payload; must match on every rank | Engine `max_num_seqs` |
 
 Leave `HISIM_MAX_TOKENS` unset when testing the client's requested output lengths.
+Leave `HISIM_DP_MAX_REQUESTS` unset unless DP ranks run with different
+`max_num_seqs`; a step with more requests than the capacity fails.
 Enable `HISIM_RECORD_STATS=1` only when internal statistics are needed; collection
 adds overhead beyond the normal client-side measurements.
 

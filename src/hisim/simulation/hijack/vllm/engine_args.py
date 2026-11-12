@@ -1,4 +1,8 @@
-"""Force a single vLLM executor; target parallelism comes from HiSim config."""
+"""Force one vLLM executor per DP rank; target parallelism comes from HiSim config.
+
+DP stays native (engine processes, LB clients, DP coordination); each DP rank
+runs a single CPU worker whose DP group uses Gloo.
+"""
 
 import os
 
@@ -42,8 +46,20 @@ def _keep_remote_ple_connector(kv_transfer_config) -> None:
     )
 
 
+def _check_dp_supported() -> None:
+    from hisim.env import Envs
+    from hisim.simulation.types import SimulationMode
+
+    if SimulationMode(Envs.simulation_mode()) != SimulationMode.BLOCKING:
+        raise ValueError("HiSim DP simulation supports only HISIM_OUTPUT_MODE=BLOCKING")
+    if os.getenv("VLLM_ENABLE_ELASTIC", "0").lower() in ("1", "true"):
+        raise ValueError("HiSim DP simulation requires VLLM_ENABLE_ELASTIC=0")
+    if os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1").lower() in ("0", "false"):
+        raise ValueError("vLLM DP requires VLLM_ENABLE_V1_MULTIPROCESSING=1")
+
+
 class C_VLLMEngineArgsHook(BaseHook):
-    """Hook EngineArgs to force parallelism to 1 for simulation."""
+    """Hook EngineArgs to force per-rank parallelism to 1 for simulation."""
 
     HOOK_CLASS_NAME = "EngineArgs"
     HOOK_MODULE_NAME = "vllm.engine.arg_utils"
@@ -58,18 +74,19 @@ class C_VLLMEngineArgsHook(BaseHook):
                 self._hisim_layout_inputs = {
                     "tp_size": self.tensor_parallel_size,
                     "pp_size": self.pipeline_parallel_size,
-                    "dp_size": getattr(self, "data_parallel_size", 1),
+                    "enable_expert_parallel": getattr(
+                        self, "enable_expert_parallel", False
+                    ),
                     "block_size": getattr(self, "block_size", None),
                     "mamba_block_size": getattr(self, "mamba_block_size", None),
                     "mamba_page_size_padded": getattr(
                         self, "mamba_page_size_padded", None
                     ),
                 }
+            # DP attributes stay native so LB modes and DP coordination run.
             parallel_attrs = [
                 "tensor_parallel_size",
                 "pipeline_parallel_size",
-                "data_parallel_size",
-                "data_parallel_size_local",
                 "expert_parallel_size",
                 "prefill_context_parallel_size",
                 "decode_context_parallel_size",
@@ -85,6 +102,11 @@ class C_VLLMEngineArgsHook(BaseHook):
             if hasattr(self, "distributed_executor_backend"):
                 self.distributed_executor_backend = "uni"
 
+            if getattr(self, "data_parallel_size", 1) > 1:
+                _check_dp_supported()
+                # The mock platform has no device group; sync DP on Gloo/CPU.
+                self.disable_nccl_for_dp_synchronization = True
+
             _keep_remote_ple_connector(getattr(self, "kv_transfer_config", None))
 
             original_post_init(self)
@@ -98,9 +120,11 @@ class C_VLLMEngineArgsHook(BaseHook):
                     profiler_config.profiler = "cuda"
 
             logger.info(
-                "[vLLM Hijack] EngineArgs: forced parallelism to 1 (tp=%d, pp=%d)",
+                "[vLLM Hijack] EngineArgs: forced parallelism to 1 (tp=%d, pp=%d), "
+                "dp=%d",
                 self.tensor_parallel_size,
                 self.pipeline_parallel_size,
+                getattr(self, "data_parallel_size", 1),
             )
 
         def create_engine_config(self, *args, **kwargs):

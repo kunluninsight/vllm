@@ -2,6 +2,7 @@
     "platform": {
         "accelerator": {
             "name": "b300_sxm",
+            "compute_capability": "10.3",
             "hbm_capacity_gb": 80000
         },
         "disk_read_bandwidth_gb": 8,
@@ -16,9 +17,6 @@
         "per_token_ms": 0.01
     },
     "scheduler": {
-        "tp_size": 1,
-        "ep_size": 1,
-        "dp_size": 1,
         "backend_name": "vllm",
         "backend_version": "0.19.0"
     }

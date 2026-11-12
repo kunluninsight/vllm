@@ -60,6 +60,8 @@ def resolve_scheduler_config(vllm_config: "VllmConfig") -> SchedulerConfig:
     else:
         kv_cache_data_type = DataType.from_torch_dtype(cache_dtype) or data_type
 
+    # Per-rank TP/PP/EP are forced to 1 for execution, so read the targets
+    # captured from EngineArgs; DP stays native.
     target = getattr(vllm_config, "_hisim_layout_inputs", {})
     return SchedulerConfig(
         data_type=data_type,
@@ -67,8 +69,9 @@ def resolve_scheduler_config(vllm_config: "VllmConfig") -> SchedulerConfig:
         mem_fraction_static=cache_config.gpu_memory_utilization,
         tp_size=target.get("tp_size", parallel_config.tensor_parallel_size),
         pp_size=target.get("pp_size", parallel_config.pipeline_parallel_size),
-        dp_size=target.get(
-            "dp_size", getattr(parallel_config, "data_parallel_size", 1)
+        dp_size=parallel_config.data_parallel_size,
+        enable_expert_parallel=target.get(
+            "enable_expert_parallel", parallel_config.enable_expert_parallel
         ),
         backend_name="vllm",
         backend_version=vllm.__version__,
