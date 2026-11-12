@@ -18,5 +18,11 @@
 - On upstream vLLM (no `dashservingd` / `v6d` on PATH), skip this test and report it as **skipped**, not failed.
 - If Hugging Face downloads fail, retry with `HF_ENDPOINT=https://hf-mirror.com`.
 
+## Docs
+- `docs/` holds only user-facing documentation: usage guides and simulation feature docs.
+- Put all process documents (e.g. bug investigations, feature design discussions, workflow analyses) under `tmp/`, by default in `tmp/docs/` or in a more relevant `tmp/` subdirectory, and never commit them.
+
 ## Environment
-- At session start, read `tmp/env.local.md` once if it exists; it contains deployment-specific configuration that overrides all defaults.
+- `tmp/env.local.md` (if it exists) contains deployment-specific configuration that overrides all defaults.
+  - Read it only on the first turn of a session or when the user explicitly asks; do not re-read it on later turns, and treat its content as unchanged for the rest of the session.
+  - Never modify it unless the user explicitly asks to update it, even if its content appears outdated.
