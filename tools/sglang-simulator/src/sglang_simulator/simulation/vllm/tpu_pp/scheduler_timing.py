@@ -22,9 +22,9 @@ def install_scheduler_meta_timing(scheduler, config, emit):
     original = scheduler._build_kv_connector_meta
 
     @wraps(original)
-    def build(scheduler_output):
+    def build(connector, scheduler_output):
         started = time.monotonic()
-        result = original(scheduler_output)
+        result = original(connector, scheduler_output)
         native_return = time.monotonic()
         tokens = scheduler_output.total_num_scheduled_tokens
         if tokens <= 0:

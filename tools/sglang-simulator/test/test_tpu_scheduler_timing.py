@@ -17,8 +17,10 @@ def test_budget_replaces_measured_cost_without_double_count(
     )
     monkeypatch.delenv("HISIM_TPU_PP_PREFILL_HANDOFF_MS", raising=False)
     result = object()
+    connector_sentinel = object()
 
-    def native(output):
+    def native(connector, output):
+        assert connector is connector_sentinel
         clock[0] += native_ms / 1000
         return result
 
@@ -32,7 +34,7 @@ def test_budget_replaces_measured_cost_without_double_count(
         num_scheduled_tokens={"a": 2000, "b": 2000},
         scheduled_cached_reqs=NS(req_ids=["a", "b", "not_scheduled"]),
     )
-    assert scheduler._build_kv_connector_meta(output) is result
+    assert scheduler._build_kv_connector_meta(connector_sentinel, output) is result
     assert (clock[0] - 100) * 1000 == pytest.approx(expected_ms)
     assert emit.call_args.kwargs["target_ms"] == pytest.approx(12)
     assert emit.call_args.kwargs["added_ms"] == pytest.approx(max(0, 12 - native_ms))
@@ -49,11 +51,12 @@ def test_empty_and_failed_calls_keep_native_behavior(monkeypatch):
         scheduler, dict(base_ms=2, cached_request_ms=3, query_token_ms=0.001), emit
     )
     assert (
-        scheduler._build_kv_connector_meta(NS(total_num_scheduled_tokens=0)) is result
+        scheduler._build_kv_connector_meta(None, NS(total_num_scheduled_tokens=0))
+        is result
     )
     original.side_effect = RuntimeError("native failure")
     with pytest.raises(RuntimeError, match="native failure"):
-        scheduler._build_kv_connector_meta(NS(total_num_scheduled_tokens=4000))
+        scheduler._build_kv_connector_meta(None, NS(total_num_scheduled_tokens=4000))
     sleep.assert_not_called()
     emit.assert_not_called()
 
