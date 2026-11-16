@@ -5,7 +5,7 @@ from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
 )
-from sglang_simulator.simulation.utils import estimate_kv_cache_pool_capacity
+from sglang_simulator.simulation.utils import profile_device_available_bytes
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -18,141 +18,89 @@ class C_ModelRunnerHook(BaseHook):
     @classmethod
     def hook(cls, target):
 
-        def override_initialize(self, *args, **kwargs):
+        original_init_pools = target._init_pools
+
+        def override_load_model(self):
             class MockModel:
-                def forward(self):
+                def __init__(self):
+                    self.start_layers = 0
+
+                def modules(self) -> list:
+                    return []
+
+                def forward(self, *args, **kwargs):
                     pass
 
             self.model = MockModel()
-
             self.dtype = self.model_config.dtype
-            self.kv_cache_dtype = (
-                self.dtype
-            )  # FIXME: get kv cache dtype from server args
 
-            if self.server_args.max_total_tokens is not None:
-                self.max_total_num_tokens = self.server_args.max_total_tokens
-            else:
-                if ConfigManager.get_model_info() is None:
-                    model = resolve_model_info(self.model_config)
-                    ConfigManager.set_model_info(model)
+            # Parse other args
+            self.sliding_window_size = None
+            if (
+                self.model_config.is_hybrid_swa
+                and self.model_config.sliding_window_size is not None
+            ):
+                # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
+                self.sliding_window_size = self.model_config.sliding_window_size
+            elif self.model_config.attention_chunk_size is not None:
+                self.sliding_window_size = self.model_config.attention_chunk_size
 
-                model = ConfigManager.get_model_info()
-                hw = ConfigManager.get_accelerator_info()
-                config = resolve_scheduler_config(
-                    server_args=self.server_args,
-                )
-
-                assert model is not None and hw is not None and config is not None
-                self.max_total_num_tokens = estimate_kv_cache_pool_capacity(
-                    model, hw, config
-                )
-
-            if hasattr(self, "page_size") and self.page_size > 1:
-                self.max_total_num_tokens = (
-                    self.max_total_num_tokens // self.page_size * self.page_size
-                )
-
-            max_num_reqs = min(
-                max(
-                    int(
-                        self.max_total_num_tokens / self.model_config.context_len * 512
-                    ),
-                    2048,
-                ),
-                4096,
+        def override_profile_available_bytes(self, *args, **kwargs):
+            # return the available hbm capacity after model loading
+            model = resolve_model_info(self.model_config)
+            hw = ConfigManager.get_accelerator_info()
+            scheduler_config = resolve_scheduler_config(
+                server_args=self.server_args,
             )
-            logger.info(
-                f"Model runner initialized with {self.max_total_num_tokens} tokens. Maximum number of requests: {max_num_reqs}"
-            )
+            rest_memory = profile_device_available_bytes(
+                model=model,
+                device=hw,
+                scheduler_config=scheduler_config,
+            ) / (1 << 30)
+            if self.mambaish_config is not None:
+                rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-            model_has_mtp_layers = (
-                self.model_config.num_nextn_predict_layers is not None
-            )
-            model_num_layers = (
-                self.model_config.num_nextn_predict_layers
-                if self.is_draft_worker and model_has_mtp_layers
-                else max(
-                    self.model_config.num_hidden_layers,
-                    self.model_config.num_attention_layers,
-                )
-            )
-            self.start_layer = getattr(self.model, "start_layer", 0)
-            self.end_layer = getattr(self.model, "end_layer", model_num_layers)
-            self.num_effective_layers = self.end_layer - self.start_layer
+            return rest_memory * (1 << 30)
 
-            from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
-            self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len,
-                device=self.device,
-                enable_memory_saver=False,
-            )
+        def wrapped_init_pools(self, *args, **kwargs):
+            kv_cache_attrs = [
+                "qk_nope_head_dim",
+                "qk_rope_head_dim",
+                "index_head_dim",
+                "kv_lora_rank",
+                "head_dim",
+                "v_head_dim",
+                # mamba2
+                "linear_value_head_dim",
+                "linear_key_head_dim",
+                "linear_conv_kernel_dim"
+            ]
 
-            # During simulation, the actual data in kv cache pool is not important since the MHA computation is skipped,
-            # so the head_num and head_dim can be set to 1 to reduce the memory usage.
-            # And the scheduler only matters about whether the token_to_kv_pool can be allocated enough space for the requests,
-            # so the pool's implementation is not important and can be replaced with `MHATokenToKVPool` that only simulates the allocation logic.
-            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            # set all model_config keywords about kv cache pool allocation to 1 to reduce memory usage
+            modified_model_attrs = {}
+            for attr in kv_cache_attrs:
+                if hasattr(self.model_config, attr):
+                    modified_model_attrs[attr] = getattr(self.model_config, attr)
+                    setattr(self.model_config, attr, 1)
 
-            self.token_to_kv_pool = MHATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=1,  # Overwrite head_num and head_dim to 1.
-                head_dim=1,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                enable_alt_stream=False,
-            )
+            ret = original_init_pools(self, *args, **kwargs)
 
-            if self.page_size == 1:
-                from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+            for attr, v in modified_model_attrs.items():
+                setattr(self.model_config, attr, v)
 
-                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                    need_sort=False,
-                )
-            else:
-                from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+                # restore the modified model_config keywords, which will be used in the `HostKVCache.get_size_per_token()`
+                if hasattr(self.token_to_kv_pool, attr):
+                    setattr(self.token_to_kv_pool, attr, v)
+                else:
+                    logger.warning(f"{self.token_to_kv_pool} does not have attribute {attr}, which has been modified while init_pools")
 
-                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                    need_sort=False,
-                )
+            from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+            if isinstance(self.token_to_kv_pool, MLATokenToKVPool):
+                if getattr(self.token_to_kv_pool, "kv_cache_dim") == 2:
+                    setattr(self.token_to_kv_pool, "kv_cache_dim", self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
 
-            self.attn_backend = None
-            self.graph_mem_usage = 0
-            self.weight_load_mem_usage = 10
-
-            self.max_running_requests = min(
-                (
-                    self.max_total_num_tokens // 2
-                    if self.server_args.max_running_requests is None
-                    else self.server_args.max_running_requests
-                    // (
-                        self.server_args.dp_size
-                        if self.server_args.enable_dp_attention
-                        else 1
-                    )
-                ),
-                self.req_to_token_pool.size,
-            )
-
-            self.use_ngram_embedding = False
-
-            return
+            return ret
 
         def wrapped_forward(self, *args, **kwargs):
             batch = args[0]
@@ -174,17 +122,34 @@ class C_ModelRunnerHook(BaseHook):
 
         def wrapped_sample(self, *args, **kwargs):
             logits = args[0]
+            forward_batch = args[1]
+            batch_size = logits.next_token_logits.shape[0]
             ids = torch.ones(
-                size=(logits.next_token_logits.shape[0],),
+                size=(batch_size,),
                 device=self.device,
                 dtype=torch.int64,
             )
+            # Populate dummy logprobs when return_logprob is requested,
+            # otherwise process_batch_result_decode will crash on None.
+            if getattr(forward_batch, "return_logprob", False):
+                logits.next_token_logprobs = torch.zeros(
+                    size=(batch_size,),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
             return ids
 
         def wrapped_compute_logprobs_only(*args, **kwargs):
             return None
 
-        target.initialize = override_initialize
+        def override_init_attention_backend(self, *args, **kwargs):
+            # This might cause a CUDA exception.
+            self.attn_backend = None
+
+        target.load_model = override_load_model
+        target._profile_available_bytes = override_profile_available_bytes
+        target._init_pools = wrapped_init_pools
         target.forward = wrapped_forward
         target.sample = wrapped_sample
         target.compute_logprobs_only = wrapped_compute_logprobs_only
+        target.init_attention_backend = override_init_attention_backend

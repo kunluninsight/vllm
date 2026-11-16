@@ -3,12 +3,13 @@ import importlib
 import json
 import os
 import time
-from collections import defaultdict
 from dataclasses import asdict
+from typing import Any
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
@@ -29,34 +30,244 @@ from sglang_simulator.utils.json import CustomJsonEncoder
 logger = get_logger("sgl_simulator")
 
 
+class C_SglangPrefillAdderHook(BaseHook):
+    HOOK_CLASS_NAME = "PrefillAdder"
+    HOOK_MODULE_NAME = "sglang.srt.managers.schedule_policy"
+
+    @classmethod
+    def hook(cls, target):
+        original_add_one_req = target.add_one_req
+
+        def wrapped_add_one_req(self, *args, **kwargs):
+            req = get_obj_from_args(
+                "sglang.srt.managers.schedule_batch.Req",
+                *args,
+                **kwargs,
+            )
+            req_infos = request_stats_manager.get_req_stats(req.rid)
+            req_infos.before_adder_device_hit_len = len(req.prefix_indices)
+            req_infos.final_host_hit_len = req.host_hit_length
+
+            return original_add_one_req(self, *args, **kwargs)
+
+        target.add_one_req = wrapped_add_one_req
+
+
+class ReqDispatcher:
+    _instance = None
+    _initialized = False
+
+    def __new__(cls, mode):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, mode: SimulationMode):
+        if self.__class__._initialized:
+            return
+
+        self.mode = mode
+        # If the simulation mode is `BLOCKING`, all requests are released immediately.
+        # If the simulation mode is `OFFLINE`, only control requests, such as `flush_cache`
+        # and `server_info`, are released immediately.
+        self.immediate_release_requests = []
+        self.future_queue: list[tuple[float, int, Any]] = (
+            []
+        )  # tuple(created time, salt, request)
+
+        self._can_dispatch = False
+        self.clock_aligned_with_first_req = False
+
+    def disable_dispatch(self):
+        self._can_dispatch = False
+
+    def enable_dispatch(self):
+        self._can_dispatch = True
+
+    def reset(self):
+        self.immediate_release_requests.clear()
+        self.future_queue.clear()
+        self._can_dispatch = False
+        self.clock_aligned_with_first_req = False
+
+    def has_next(self) -> bool:
+        return len(self.future_queue) > 0
+
+    def next_req_from_future_ts(self) -> float:
+        return self.future_queue[0][0]
+
+    def add(self, reqs: list):
+        if self.mode == SimulationMode.BLOCKING:
+            self.immediate_release_requests.extend(reqs)
+        elif self.mode == SimulationMode.OFFLINE:
+            if self._can_dispatch:
+                self.immediate_release_requests.extend(reqs)
+                return
+
+            gen_requests = []
+            time.sleep(0.05)  # waiting requests
+
+            for req in reqs:
+                if req.__class__.__name__ == "TokenizedGenerateReqInput":
+                    gen_requests.append(req)
+                else:
+                    # Such as: /profile_start, /flush_cache, etc.
+                    self.immediate_release_requests.append(req)
+
+            # Add requests to future queue
+            for req in gen_requests:
+                sim_params = None
+                if req.sampling_params.custom_params is not None:
+                    sim_params = req.sampling_params.custom_params.get("simulation")
+                if sim_params is None:
+                    # There are some warm-up requests when starting the server without --skip-server-warmup.
+                    self.immediate_release_requests.append(req)
+                    logger.warning(
+                        "Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request."
+                    )
+                    continue
+                if sim_params.get("queue_start"):
+                    logger.debug(
+                        "Add request to waiting queue with custom queue start timestamp."
+                    )
+
+                self.future_queue.append(
+                    (
+                        sim_params.get("queue_start") or sim_params["created_time"],
+                        time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
+                        req,
+                    )
+                )
+
+            if (not self._can_dispatch) and len(self.future_queue) != 0:
+                _, _, gen_req = self.future_queue[-1]
+                # If the number of requests is not provided, the `_can_dispatch` will be triggered by user input.
+                total_request = gen_req.sampling_params.custom_params["simulation"].get(
+                    "total_request", float("inf")
+                )
+
+                if len(self.future_queue) == total_request:
+                    self._can_dispatch = True
+                    logger.info("All requests received. Starting simulation now.")
+                else:
+                    logger.info(
+                        f"Offline simulation mode enabled. {total_request} requests expected in total. Received {len(self.future_queue)} requests so far."
+                    )
+
+    def dispatch(self) -> list:
+        recv_reqs = []
+
+        recv_reqs.extend(self.immediate_release_requests)
+        self.immediate_release_requests.clear()
+
+        if self._can_dispatch:
+            if not self.clock_aligned_with_first_req and len(self.future_queue) > 0:
+                # Adjust the global clock to the first request's enqueue time,
+                # since requests created in the decoding instance during PD disaggregation
+                # do not start with a zero creation time.
+                heapq.heapify(self.future_queue)
+                StateManager.set_global_clock(self.future_queue[0][0])
+                self.clock_aligned_with_first_req = True
+            # Process the arrived requests only after all requests have been added to the future queue
+            current_timestamp = StateManager.get_global_clock()
+            while len(self.future_queue) > 0:
+                enqueue_time, _, req = self.future_queue[0]
+                if enqueue_time > current_timestamp:
+                    break
+                recv_reqs.append(req)
+                heapq.heappop(self.future_queue)
+
+        now = time.time()
+        for req in recv_reqs:
+            if req.__class__.__name__ in [
+                "BatchTokenizedGenerateReqInput",
+                "TokenizedGenerateReqInput",
+            ]:
+                simulation_args = None
+                if req.sampling_params.custom_params is not None:
+                    simulation_args = req.sampling_params.custom_params.get(
+                        "simulation"
+                    )
+                # The warm-up request might not include any simulation arguments.
+                if simulation_args is None:
+                    continue
+                req_stats = request_stats_manager.get_req_stats(req.rid)
+                req_stats.rid = req.rid
+                req_stats.input_length = len(req.input_ids)
+                req_stats.output_length = req.sampling_params.max_new_tokens
+
+                if self.mode == SimulationMode.BLOCKING:
+                    if "server_created_time" not in simulation_args:
+                        logger.warning(
+                            "The request's creation time is missing, which may cause the TTFT to be inaccurate."
+                        )
+                    req_stats.created_time = simulation_args.get(
+                        "server_created_time", now
+                    )
+                    req_stats.last_event_time = req_stats.created_time
+                    req_stats.queue_start = now
+                elif self.mode == SimulationMode.OFFLINE:
+                    req_stats.created_time = simulation_args["created_time"]
+                    req_stats.last_event_time = req_stats.created_time
+                    # Align with the real queue start timestamp if queue_start is not None. For debugging only.
+                    queue_start = simulation_args.get("queue_start")
+                    if queue_start is not None:
+                        StateManager.set_global_clock(queue_start)
+                    req_stats.queue_start = StateManager.get_global_clock()
+
+        if recv_reqs and StateManager.get_last_real_time_ts() == 0:
+            StateManager.set_last_real_time_ts(time.time())
+            StateManager.set_global_clock(0)
+
+        return recv_reqs
+
+
+class C_SchedulerRequestReceiver(BaseHook):
+    HOOK_CLASS_NAME = "SchedulerRequestReceiver"
+    HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.request_receiver"
+
+    REQ_DISPATCHER: ReqDispatcher = ReqDispatcher(
+        SimulationMode(Envs.simulation_mode())
+    )
+
+    @classmethod
+    def hook(cls, target):
+        original_recv_requests = target.recv_requests
+
+        def wrapped_recv_requests(self, *args, **kwargs):
+            recv_reqs = original_recv_requests(self, *args, **kwargs)
+            C_SchedulerRequestReceiver.REQ_DISPATCHER.add(recv_reqs)
+            return C_SchedulerRequestReceiver.REQ_DISPATCHER.dispatch()
+
+        target.recv_requests = wrapped_recv_requests
+
+
 class C_SchedulerHook(BaseHook):
     HOOK_CLASS_NAME = "Scheduler"
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler"
 
     INFERENCE_PREDICTOR: InferTimePredictor = None
 
-    REQUEST_STATS: dict[str, RequestStats] = defaultdict(RequestStats)
     ITERATION_STATS: list[dict] = []
-    LAST_CPU_TS: float = 0
-    LAST_FLUSH_TS: float = 0
+    TOTAL_PREDICTOR_TIME_COST = 0
     SIMULATION_BATCH: SimulationScheduleBatch = None
-
     OVERLAP_SCHEDULE: bool = False
-
     SIM_MODE = SimulationMode(Envs.simulation_mode())
-    OFFLINE_RECV_ALL_REQUEST: bool = False
-    FUTURE_QUEUE: list[tuple[float, int, RequestStats]] = (
-        []
-    )  # tuple(created time, salt, request)
+    # Shared singleton instance with `C_SchedulerRequestReceiver.REQ_DISPATCHER`.
+    REQ_DISPATCHER = ReqDispatcher(SIM_MODE)
 
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
-        original_recv_requests = target.recv_requests
+        original_recv_requests = getattr(target, "recv_requests", None)
+        original_prefetch_kvcache = target._prefetch_kvcache
         original_get_new_batch_prefill = target.get_new_batch_prefill
+        original_get_new_prebuilt_batch = target.get_new_prebuilt_batch
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
+        original_init_request_dispatcher = target.init_request_dispatcher
+        original_stream_output_generation = target.stream_output_generation
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -74,6 +285,10 @@ class C_SchedulerHook(BaseHook):
             logger.debug(
                 f"Overlap schedule simulation mode: {C_SchedulerHook.OVERLAP_SCHEDULE}."
             )
+            # Use `torch_native` as the attention backend to avoid Triton exceptions during memory operations.
+            setattr(server_args, "attention_backend", "torch_native")
+            setattr(server_args, "prefill_attention_backend", "torch_native")
+            setattr(server_args, "decode_attention_backend", "torch_native")
 
             original_init(self, *args, **kwargs)
 
@@ -103,133 +318,18 @@ class C_SchedulerHook(BaseHook):
                 raise e
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
-            recv_reqs = []
+            recv_reqs = original_recv_requests(self, *args, **kwargs)
+            if self.server_args.disaggregation_mode == "decode" and recv_reqs:
+                pass
+            C_SchedulerHook.REQ_DISPATCHER.add(recv_reqs)
+            return C_SchedulerHook.REQ_DISPATCHER.dispatch()
 
-            if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
-                recv_reqs.extend(original_recv_requests(self, *args, **kwargs))
-            elif C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE:
-                # Initializing
-                if not C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST:
-                    gen_requests = []
-                    extra_requests = []
-                    time.sleep(0.05)  # waiting requests
-
-                    reqs = original_recv_requests(self, *args, **kwargs)
-
-                    for req in reqs:
-                        if req.__class__.__name__ == "TokenizedGenerateReqInput":
-                            gen_requests.append(req)
-                        else:
-                            # Such as: /profile_start, /flush_cache, etc.
-                            extra_requests.append(req)
-
-                    # Add requests to future queue
-                    for req in gen_requests:
-                        sim_params = None
-                        if req.sampling_params.custom_params is not None:
-                            sim_params = req.sampling_params.custom_params.get(
-                                "simulation"
-                            )
-                        if sim_params is None:
-                            # There are some warm-up requests when starting the server without --skip-server-warmup.
-                            extra_requests.append(req)
-                            logger.warning(
-                                "Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request."
-                            )
-                            continue
-                        if sim_params.get("queue_start"):
-                            logger.debug(
-                                "Add request to waiting queue with custom queue start timestamp."
-                            )
-
-                        C_SchedulerHook.FUTURE_QUEUE.append(
-                            (
-                                sim_params.get("queue_start")
-                                or sim_params["created_time"],
-                                time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
-                                req,
-                            )
-                        )
-
-                    if len(C_SchedulerHook.FUTURE_QUEUE) != 0:
-                        _, _, gen_req = C_SchedulerHook.FUTURE_QUEUE[-1]
-                        total_request = gen_req.sampling_params.custom_params[
-                            "simulation"
-                        ]["total_request"]
-
-                        if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
-                            C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
-                            heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
-                            logger.info(
-                                "All requests received. Starting simulation now."
-                            )
-                        else:
-                            logger.info(
-                                f"Offline simulation mode enabled. {total_request} requests expected in total. Received {len(C_SchedulerHook.FUTURE_QUEUE)} requests so far."
-                            )
-
-                    if len(extra_requests) != 0:
-                        # Schedule the extra requests immediately.
-                        return extra_requests
-                else:
-                    # Extra requests include: flush request, abort request, etc.
-                    recv_reqs.extend(original_recv_requests(self, *args, **kwargs))
-
-                # Process the arrived requests only after all requests have been added to the future queue
-                current_timestamp = StateManager.get_global_clock()
-                while (
-                    C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST
-                    and len(C_SchedulerHook.FUTURE_QUEUE) > 0
-                ):
-                    enqueue_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
-                    if enqueue_time > current_timestamp:
-                        break
-                    recv_reqs.append(req)
-                    heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
-
-            now = time.time()
-            for req in recv_reqs:
-                if req.__class__.__name__ in [
-                    "BatchTokenizedGenerateReqInput",
-                    "TokenizedGenerateReqInput",
-                ]:
-                    req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
-                    req_stats.rid = req.rid
-                    req_stats.input_length = len(req.input_ids)
-                    req_stats.output_length = req.sampling_params.max_new_tokens
-                    simulation_args = req.sampling_params.custom_params["simulation"]
-                    if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
-                        if "server_created_time" not in simulation_args:
-                            logger.warning(
-                                "The request's creation time is missing, which may cause the TTFT to be inaccurate."
-                            )
-                        req_stats.created_time = simulation_args.get(
-                            "server_created_time", now
-                        )
-                        req_stats.last_event_time = req_stats.created_time
-                        req_stats.queue_start = now
-                    elif C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE:
-                        req_stats.created_time = simulation_args["created_time"]
-                        req_stats.last_event_time = req_stats.created_time
-                        # Align with the real queue start timestamp if queue_start is not None. For debugging only.
-                        queue_start = simulation_args.get("queue_start")
-                        if queue_start is not None:
-                            StateManager.set_global_clock(queue_start)
-                        req_stats.queue_start = StateManager.get_global_clock()
-
-            if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
-                C_SchedulerHook.LAST_CPU_TS = time.time()
-                StateManager.set_global_clock(0)
-
-            return recv_reqs
-
-        def wrapped_get_new_batch_prefill(self, *args, **kwargs):
-            new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
+        def statistics_new_batch(self, new_batch, is_req_pending: bool):
             now = time.time()
             if new_batch is not None:
                 for req in new_batch.reqs:
-                    req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
-                    req_stats.final_reused_tokens = req.cached_tokens
+                    req_stats = request_stats_manager.get_req_stats(req.rid)
+                    req_stats.final_device_hit_len = req.cached_tokens
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
                             req_stats.queue_end = now
@@ -238,16 +338,20 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request
                         pass
-            elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
-                # Prefetching
+            elif is_req_pending:
+                # When requests are pendding in the waiting queue, the new batch is empty.
+                # Then the `run_batch` may not be called and the global clock is not advanced.
                 StateManager.step_global_clock(0.005)
                 StateManager.set_current_inference_dur(0.005)
             else:
+                # Idle stage, there are some requests pendding in the future queue.
                 if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
-                    len(C_SchedulerHook.FUTURE_QUEUE) != 0
+                    C_SchedulerHook.REQ_DISPATCHER.has_next()
                     and len(self.running_batch.reqs) == 0
                 ):
-                    next_created_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
+                    next_created_time = (
+                        C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
+                    )
                     StateManager.set_global_clock(next_created_time + 1e-6)
             logger.debug(
                 f"Get new batch prefill: global iteration={StateManager.get_iteration()}, "
@@ -255,7 +359,33 @@ class C_SchedulerHook(BaseHook):
                 f"waiting queue={len(self.waiting_queue)}"
             )
 
+        def wrapped_get_new_batch_prefill(self, *args, **kwargs):
+            new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
+            is_req_pendding = len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0
+            statistics_new_batch(self, new_batch, is_req_pending=is_req_pendding)
             return new_batch
+
+        def wrapped_get_new_prebuilt_batch(self, *args, **kwargs):
+            new_batch = original_get_new_prebuilt_batch(self, *args, **kwargs)
+            is_req_pendding = len(self.running_batch.reqs) == 0 and (
+                len(self.waiting_queue)
+                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+            ) > 0
+            statistics_new_batch(self, new_batch, is_req_pending=is_req_pendding)
+            return new_batch
+
+        def wrapped_prefetch_kvcache(self, *args, **kwargs):
+            original_prefetch_kvcache(self, *args, **kwargs)
+
+            req = get_obj_from_args(
+                "sglang.srt.managers.schedule_batch.Req",
+                *args,
+                **kwargs,
+            )
+            req_stats = request_stats_manager.get_req_stats(req.rid)
+            req_stats.recv_device_hit_len = len(req.prefix_indices)
+            req_stats.recv_host_hit_len = req.host_hit_length
 
         def wrapped_run_batch(self, *args, **kwargs):
             ret = original_run_batch(self, *args, **kwargs)
@@ -287,10 +417,15 @@ class C_SchedulerHook(BaseHook):
 
                 if not simulation_batch.is_empty():
                     StateManager.inc_iteration()
+                    pred_start = time.perf_counter()
                     predicted_latency = (
                         C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
                             simulation_batch
                         )
+                    )
+                    # Accumulate predictor execution time for performance analysis.
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
+                        time.perf_counter() - pred_start
                     )
                     predicted_latency = float(predicted_latency)
 
@@ -298,8 +433,8 @@ class C_SchedulerHook(BaseHook):
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
                         time.sleep(abs(predicted_latency))
                         now = time.time()
-                        forward_latency = now - C_SchedulerHook.LAST_CPU_TS
-                        C_SchedulerHook.LAST_CPU_TS = now
+                        forward_latency = now - StateManager.get_last_real_time_ts()
+                        StateManager.set_last_real_time_ts(now)
                     else:
                         forward_latency = predicted_latency
 
@@ -331,20 +466,29 @@ class C_SchedulerHook(BaseHook):
                         )
                     )
                     StateManager.step_global_clock(current_inference_dur)
-                    request_response_time = (
-                        StateManager.get_global_clock() + hicache_l2_backup_dur
-                    )
+                    # D2H (write_through backup) runs async on HiCacheController's
+                    # backup_queue / write_stream; stream_output returns the first
+                    # token without synchronizing on it (verified in real sglang's
+                    # scheduler_output_processor_mixin.py:process_batch_result_prefill).
+                    # In overlap mode, backup also runs concurrent with subsequent
+                    # inference on a separate stream, so it doesn't advance the
+                    # wall clock either.
+                    request_response_time = StateManager.get_global_clock()
                 else:
+                    # Serial mode: H2D + forward block the first token return.
+                    # D2H still happens after forward but the token is already returned.
                     StateManager.step_global_clock(
-                        hicache_l2_load_dur
-                        + current_inference_dur
-                        + hicache_l2_backup_dur
+                        hicache_l2_load_dur + current_inference_dur
                     )
                     request_response_time = StateManager.get_global_clock()
+                    # D2H delays the next iteration's start (no overlap to hide it),
+                    # so advance global_clock but DO NOT include it in this request's
+                    # response_time.
+                    StateManager.step_global_clock(hicache_l2_backup_dur)
                 # Request statistics
                 for req in batch.reqs:
-                    if req.is_chunked == 0:
-                        req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
+                    if len(req.output_ids) != 0:  # not chunked
+                        req_stats = request_stats_manager.get_req_stats(req.rid)
                         req_stats.gen_token_latencies.append(
                             request_response_time
                             - req_stats.last_event_time  # queue duration
@@ -362,12 +506,12 @@ class C_SchedulerHook(BaseHook):
                         "l2_backup_latency": hicache_l2_backup_dur,
                     }
                 )
-            C_SchedulerHook.LAST_CPU_TS = time.time()
+            StateManager.set_last_real_time_ts(time.time())
             return ret
 
-        def wrapped_profile(self, req, *args, **kwargs):
+        def override_profile(req, *args, **kwargs):
             stats: list[RequestStats] = []
-            for item in C_SchedulerHook.REQUEST_STATS.values():
+            for item in request_stats_manager.get_all_req_stats():
                 if item.rid is not None and item.input_length > 0:
                     stats.append(item)
 
@@ -392,7 +536,12 @@ class C_SchedulerHook(BaseHook):
                     item.last_event_time -= min_created_time
 
                 metrics = calc_metrics(metrics_stats)
-                metrics["time_cost"] = time.time() - C_SchedulerHook.LAST_FLUSH_TS
+                metrics["time_cost"] = (
+                    time.time() - StateManager.get_last_flush_time_ts()
+                )
+                metrics["predictor_time_cost"] = (
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST
+                )
 
                 try:
                     with open(f"{output_dir}/metrics.json", "w") as f:
@@ -414,11 +563,11 @@ class C_SchedulerHook(BaseHook):
                 logger.warning("No request statistics available.")
 
             StateManager.reset()
-            C_SchedulerHook.REQUEST_STATS.clear()
+            StateManager.set_last_flush_time_ts(time.time())
+            request_stats_manager.reset()
             C_SchedulerHook.ITERATION_STATS.clear()
-            C_SchedulerHook.LAST_CPU_TS = 0
-            C_SchedulerHook.LAST_FLUSH_TS = time.time()
-            C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
+            C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
+            C_SchedulerHook.REQ_DISPATCHER.reset()
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),
@@ -431,10 +580,63 @@ class C_SchedulerHook(BaseHook):
 
             return ProfileReqOutput(True, json.dumps(result))
 
+        def wrapped_init_request_dispatcher(self, *args, **kwargs):
+            ret = original_init_request_dispatcher(self, *args, **kwargs)
+
+            _request_dispatcher = getattr(self, "_request_dispatcher", None)
+
+            if _request_dispatcher is not None:
+                for ty in _request_dispatcher._mapping.keys():
+                    if ty.__name__ == "ProfileReq":
+                        _request_dispatcher._mapping[ty] = override_profile
+            return ret
+
+        def override_pause_generation(self, *args, **kwargs):
+            C_SchedulerHook.REQ_DISPATCHER.disable_dispatch()
+
+        def override_continue_generation(self, *args, **kwargs):
+            C_SchedulerHook.REQ_DISPATCHER.enable_dispatch()
+
+        def wrapped_stream_output_generation(self, reqs, *args, **kwargs):
+            original_send_output = self.send_to_detokenizer.send_output
+
+            def dummy_send_output(output, recv_obj=None):
+                for rid, finish_reason in zip(output.rids, output.finished_reasons):
+                    # When the request is finished, response the simulation statistics via finish_reason
+                    if finish_reason is not None:
+                        req_stat = request_stats_manager.get_req_stats(rid)
+                        finish_reason["simulation_stat"] = {
+                            "gen_token_latencies": req_stat.gen_token_latencies,
+                            "last_event_time": req_stat.last_event_time,
+                            "queue_start": req_stat.queue_start,
+                            "queue_end": req_stat.queue_end,
+                            "final_device_hit_len": req_stat.final_device_hit_len,
+                            "final_host_hit_len": req_stat.final_host_hit_len,
+                            "final_storage_hit_len": req_stat.final_storage_hit_len,
+                            "input_length": req_stat.input_length,
+                            "output_length": req_stat.output_length,
+                        }
+
+                original_send_output(output, recv_obj)
+
+            try:
+                self.send_to_detokenizer.send_output = dummy_send_output
+                return original_stream_output_generation(self, reqs, *args, **kwargs)
+            finally:
+                self.send_to_detokenizer.send_output = original_send_output
+
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
-        target.recv_requests = wrapped_recv_requests
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
+        target.get_new_prebuilt_batch = wrapped_get_new_prebuilt_batch
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
-        target.profile = wrapped_profile
+        target._prefetch_kvcache = wrapped_prefetch_kvcache
+        target.init_request_dispatcher = wrapped_init_request_dispatcher
+        target.pause_generation = override_pause_generation
+        target.continue_generation = override_continue_generation
+        target.stream_output_generation = wrapped_stream_output_generation
+
+        if original_recv_requests:
+            # version <= 0.5.12.post1
+            target.recv_requests = wrapped_recv_requests

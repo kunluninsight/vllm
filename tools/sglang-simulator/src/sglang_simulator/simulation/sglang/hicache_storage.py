@@ -2,6 +2,7 @@ import os
 from typing import Any, List, Optional
 
 from sglang_simulator.hook import BaseHook
+from sglang_simulator.simulation.manager.env import Envs
 from sglang_simulator.utils.logger import get_logger
 
 logger = get_logger("hisim")
@@ -24,7 +25,7 @@ class MockHiCacheStorage:
     def __init__(self, *args, **kwargs):
 
         self.storage: set = set()
-        self.storage_file_path: str = "/tmp/sglang_simulator/hicache_storage_keys.txt"
+        self.storage_file_path: str = Envs.hicache_storage_keys_path()
         os.makedirs(os.path.dirname(self.storage_file_path), exist_ok=True)
 
         if os.path.exists(self.storage_file_path):
@@ -35,6 +36,9 @@ class MockHiCacheStorage:
                     line = f.readline()
 
     def register_mem_pool_host(self, mem_pool_host):
+        pass
+
+    def register_mem_host_pool_v2(self, *args, **kwargs):
         pass
 
     def set(
@@ -60,10 +64,22 @@ class MockHiCacheStorage:
         target_sizes: Optional[Any] = None,
     ) -> bool:
 
-        for key, value in zip(keys, values):
-            if not self.set(key, value):
+        for key in keys:
+            if not self.set(key):
                 return False
         return True
+
+    def batch_set_v2(
+        self,
+        transfers: List,
+        extra_info: Optional[Any] = None,
+    ):
+
+        results = {}
+        for transfer in transfers:
+            self.batch_set(transfer.keys)
+            results[transfer.name] = [True] * len(transfer.keys)
+        return results
 
     def exists(self, key: str) -> bool:
         return key in self.storage
@@ -73,6 +89,21 @@ class MockHiCacheStorage:
             if not self.exists(keys[i]):
                 return i
         return len(keys)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List] = None,
+        extra_info: Optional[Any] = None,
+    ):
+
+        from sglang.srt.mem_cache.hicache_storage import PoolTransferResult, PoolName
+
+        kv_pages = self.batch_exists(keys, extra_info)
+
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+        return PoolTransferResult(final_pages, hit_count)
 
     def clear(self) -> bool:
         self.storage.clear()

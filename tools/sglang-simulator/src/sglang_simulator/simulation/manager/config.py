@@ -103,6 +103,8 @@ class ConfigManager:
             "tp_size",
             "dp_size",
             "ep_size",
+            "pp_size",
+            "pcp_size",
             "backend_name",
             "backend_version",
         ]:
@@ -166,6 +168,7 @@ class ConfigManager:
             database_mode = predictor_config.get("database_mode", "SILICON")
             prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
             decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
+            prefill_min_latency = predictor_config.get("prefill_min_latency", 0)
             workload_distribution = predictor_config.get(
                 "workload_distribution", "balanced"
             )
@@ -179,8 +182,82 @@ class ConfigManager:
                 database_mode=database_mode,
                 prefill_scale_factor=prefill_scale_factor,
                 decode_scale_factor=decode_scale_factor,
+                prefill_min_latency=prefill_min_latency,
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
             )
+        elif predictor_config.get("name") == "tpu_pp_stage":
+            from sglang_simulator.time_predictor.tpu_pp_stage import (
+                TpuPPStageTimePredictor,
+            )
+
+            return TpuPPStageTimePredictor(
+                model, hw, sched_config,
+                stage_model_paths=predictor_config["stage_model_paths"],
+                pcp_size=predictor_config["pcp_size"],
+                interleave_size=predictor_config["interleave_size"],
+                num_tokens_paddings=predictor_config["num_tokens_paddings"],
+                communication_s=predictor_config["communication_s"],
+                host_prep=predictor_config.get("host_prep"),
+                dp_target_bucket=predictor_config.get("dp_target_bucket"),
+                max_num_tokens=predictor_config.get("max_num_tokens"),
+                async_handoff=predictor_config.get("async_handoff", True),
+            )
+        elif predictor_config.get("name") == "linear":
+            from sglang_simulator.time_predictor.linear import LinearTimePredictor
+
+            return LinearTimePredictor(
+                model, hw, sched_config,
+                base_ms=predictor_config.get("base_ms", 0.0),
+                per_token_ms=predictor_config.get("per_token_ms", 0.0),
+            )
+        elif predictor_config.get("name") == "ml":
+            from sglang_simulator.time_predictor.ml import MLTimePredictor
+
+            return MLTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                database_path=predictor_config.get("database_path"),
+                latency_scale=predictor_config.get("latency_scale", 1.0),
+                full_span=predictor_config.get("full_span", False),
+                logprobs_cost_us_per_token=predictor_config.get(
+                    "logprobs_cost_us_per_token", 0.0
+                ),
+                sample_tokens_base_ms=predictor_config.get(
+                    "sample_tokens_base_ms", 0.0
+                ),
+                # Form A (legacy hinge): pass lo/hi/breakpoint only.
+                sample_tokens_lo_us_per_token=predictor_config.get(
+                    "sample_tokens_lo_us_per_token", 0.0
+                ),
+                sample_tokens_hi_us_per_token=predictor_config.get(
+                    "sample_tokens_hi_us_per_token", 0.0
+                ),
+                sample_tokens_breakpoint_tokens=predictor_config.get(
+                    "sample_tokens_breakpoint_tokens", 0
+                ),
+                # Form B (mechanistic): pass a/b only. Mutually exclusive
+                # with the hinge keys; MLTimePredictor rejects both together.
+                sample_tokens_a_ms_per_1k_ext=predictor_config.get(
+                    "sample_tokens_a_ms_per_1k_ext", 0.0
+                ),
+                sample_tokens_b_ms_per_1g_ext_past=predictor_config.get(
+                    "sample_tokens_b_ms_per_1g_ext_past", 0.0
+                ),
+                # Form C (two-branch plateau, F-B): pass plateau/threshold
+                # to select it; base/a/b above then describe the line only.
+                # Mutually exclusive with the hinge keys, NOT with a/b --
+                # plateau_ms != 0 is what selects this form.
+                sample_tokens_plateau_ms=predictor_config.get(
+                    "sample_tokens_plateau_ms", 0.0
+                ),
+                sample_tokens_threshold_tokens=predictor_config.get(
+                    "sample_tokens_threshold_tokens", 0
+                ),
+            )
         else:
-            raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")
+            raise ValueError(
+                f"Unknown predictor name: {predictor_config.get('name')}. "
+                "Supported: aiconfigurator, linear, ml"
+            )

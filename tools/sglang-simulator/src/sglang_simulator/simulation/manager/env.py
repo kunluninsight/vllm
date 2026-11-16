@@ -13,14 +13,14 @@ class Envs:
             SGLANG_SIMULATOR_CONFIG_PATH
         ):
             raise RuntimeError(
-                f"The mock configuration path is not set or does not exist({SGLANG_SIMULATOR_CONFIG_PATH}). Please set it using the system variable SGLANG_SIMULATOR_CONFIG_PATH"
+                f"The configuration path is not set or does not exist({SGLANG_SIMULATOR_CONFIG_PATH}). Please set it using the system variable SGLANG_SIMULATOR_CONFIG_PATH"
             )
         return SGLANG_SIMULATOR_CONFIG_PATH
 
     @classmethod
     def output_dir(cls) -> str:
         SGLANG_SIMULATOR_OUTPUT_DIR = os.getenv(
-            "SGLANG_SIMULATOR_OUTPUT_DIR", "/tmp/sgl_simulator/output/"
+            "SGLANG_SIMULATOR_OUTPUT_DIR", "/tmp/sglang_simulator/output/"
         )
         SGLANG_SIMULATOR_OUTPUT_DIR = os.path.realpath(SGLANG_SIMULATOR_OUTPUT_DIR)
         if os.path.exists(SGLANG_SIMULATOR_OUTPUT_DIR) and os.path.isfile(
@@ -36,6 +36,14 @@ class Envs:
         return SGLANG_SIMULATOR_OUTPUT_DIR
 
     @classmethod
+    def hicache_storage_keys_path(cls) -> str:
+        SGLANG_SIMULATOR_HICACHE_STORAGE_KEYS_PATH = os.getenv(
+            "SGLANG_SIMULATOR_HICACHE_STORAGE_KEYS_PATH",
+            "/tmp/sglang_simulator/hicache_storage_keys.txt",
+        )
+        return SGLANG_SIMULATOR_HICACHE_STORAGE_KEYS_PATH
+
+    @classmethod
     def simulation_mode(cls) -> str:
         SGLANG_SIMULATOR_OUTPUT_MODE = os.getenv(
             "SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE"
@@ -47,3 +55,14 @@ class Envs:
     def num_warmup(cls) -> int:
         # The number of warmup requests.
         return int(os.getenv("SGLANG_SIMULATOR_NUM_WARMUP", "0"))
+
+    @classmethod
+    def record_stats(cls) -> bool:
+        # Controls request and iteration stats collection in BLOCKING mode;
+        # disabled by default. OFFLINE ignores it because metrics depend on stats.
+        return os.environ.get("SGLANG_SIMULATOR_RECORD_STATS", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )

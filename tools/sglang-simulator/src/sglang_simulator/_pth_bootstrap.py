@@ -1,3 +1,9 @@
+import os
+
+# The same wheel serves either real collection or CPU simulation, never both.
+if (os.environ.get("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "on")
+        and os.environ.get("SGLANG_SIMULATOR_ENABLE", "").lower() in ("1", "true", "yes", "on")):
+    raise SystemExit("HiSim collector and simulator cannot run in the same interpreter")
 
 import os
 from sglang_simulator.hook import install_class_hooks, install_module_hooks
@@ -69,3 +75,25 @@ elif _enabled and _mode == "legacy":
             C_KvsV6dSwapHook,
         ]
     )
+
+
+import json
+import os
+import sys
+
+if os.environ.get("SGLANG_SIMULATOR_ENABLE", "").lower() in ("1", "true", "yes", "on"):
+    print("[HISIM_BOOTSTRAP] " + json.dumps({
+        "pid": os.getpid(), "ppid": os.getppid(), "stage": "pth_entry",
+        "executable": sys.executable, "bootstrap_origin": __file__,
+        "isolated": sys.flags.isolated, "no_site": sys.flags.no_site,
+        "ignore_environment": sys.flags.ignore_environment,
+        "vllm_present": "vllm" in sys.modules,
+    }), file=sys.stderr, flush=True)
+    from sglang_simulator.simulation.vllm.startup import init_hook as _vllm_init_hook
+    from sglang_simulator.simulation.sglang.startup import init_hook as _sglang_init_hook
+
+    from sglang_simulator.simulation.vllm.v6d.v6d_capacity import install_v6d_runtime_hooks
+
+    _vllm_init_hook()
+    _sglang_init_hook()
+    install_v6d_runtime_hooks()

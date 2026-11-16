@@ -1,0 +1,1082 @@
+"""
+vLLM engine-core pipeline hooks - the class hooks that drive one
+simulated engine step:
+
+1. C_VLLMEngineCoreHook (EngineCore init/add_request/step/profile):
+   created_time-based request dispatch (ReqDispatcher future_queue),
+   BLOCKING-mode request stats, profile stats export, predictor init.
+   EngineCore.add_request is the single seam both engine paths funnel
+   through (InprocClient and EngineCoreProc) and it sits BEFORE
+   kvconn.on_add_req and Scheduler.add_request, so a simulation request is
+   parked fully inert: no connector admission, no v6d lookup, no KV-block
+   allocation until its created_time is reached and it is dispatched back
+   through the native add_request path.
+2. C_VLLMSchedulerHook (Scheduler unfinished-count accessors only):
+   counts parked future-queue requests so the busy loop keeps stepping —
+   the one thing with no EngineCore-level seam.
+3. C_VLLMExecutorHook (UniProcExecutor.execute_model): accounts the
+   simulated GPU span (time prediction, sleep / virtual-clock advance,
+   iteration stats, per-token latencies) and per-request queue/hit stats
+   at the engine's real execution seam (model_executor.execute_model,
+   vllm/v1/engine/core.py).
+
+The hooks share the predictor / iteration-stats / sim-mode state carried
+on C_VLLMEngineCoreHook, which is why they live in one module.
+"""
+
+import heapq
+import json
+import os
+import sys
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict
+from functools import wraps
+
+from sglang_simulator.hook import BaseHook
+from sglang_simulator.hook.class_hook_entry import emit_hook_event, report_class_hooks
+from sglang_simulator.simulation.manager import ConfigManager
+from sglang_simulator.simulation.manager import StateManager
+from sglang_simulator.simulation.manager.env import Envs
+from sglang_simulator.simulation.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.types import SimulationMode
+from sglang_simulator.simulation.vllm.utils import (
+    resolve_model_info,
+    resolve_scheduler_config,
+)
+from sglang_simulator.time_predictor import InferTimePredictor
+from sglang_simulator.time_predictor import ScheduleBatch
+from sglang_simulator.time_predictor import ScheduleRequest
+from sglang_simulator.utils import get_logger
+
+logger = get_logger()
+
+# Max decode steps (output length) from environment variable
+# None means no override (use original sampling_params.max_tokens)
+_MAX_DECODE_STEPS = int(v) if (v := os.environ.get("SGLANG_SIMULATOR_MAX_DECODE_STEPS")) is not None else None
+
+# BLOCKING stats collection is opt-in for latency-sensitive serving.
+# Read once so the schedule hot path pays no environment lookup.
+_RECORD_STATS = Envs.record_stats()
+
+
+def _stats_recording_enabled() -> bool:
+    # OFFLINE metrics such as TTFT depend on gen_token_latencies, so stats
+    # collection must remain enabled there regardless of the environment flag.
+    return (
+        C_VLLMEngineCoreHook.SIM_MODE != SimulationMode.BLOCKING or _RECORD_STATS
+    )
+
+
+def _new_request_stats(request, created_time, queue_start, last_event_time):
+    """Initialize one RequestStats entry when stats collection is enabled."""
+    if not _stats_recording_enabled():
+        return None
+
+    input_length = getattr(request, "num_prompt_tokens", None)
+    if input_length is None:
+        input_length = len(getattr(request, "prompt_token_ids", None) or [])
+    st = request_stats_manager.get_req_stats(request.request_id)
+    st.created_time = created_time
+    st.queue_start = queue_start
+    st.queue_end = -1
+    st.gen_token_latencies = []
+    st.last_event_time = last_event_time
+    st.input_length = input_length
+    st.output_length = 0
+    return st
+
+
+class ReqDispatcher:
+    """Singleton holding the OFFLINE created_time replay state.
+
+    Requests are parked at the EngineCore.add_request seam and released by
+    dispatch() once global_clock >= created_time.  While parked they are
+    completely inert: no connector admission, no v6d lookup, no KV-block
+    allocation.
+    """
+
+    _instance = None
+    _initialized = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if self.__class__._initialized:
+            return
+        # tuple(created_time, salt, engine_core, request, request_wave);
+        # the salt makes entries comparable-free on identical created_time
+        self.future_queue: list[tuple[float, int, object, object, int]] = []
+        self.seq_counter = 0
+        self.total_expected = float("inf")
+        self.all_received = False
+        # Per-request created_time lookup (req_id -> created_time)
+        self.req_created_time: dict[str, float] = {}
+        # Captured once at hook install (single engine per process)
+        self.original_core_add_request = None
+        self.__class__._initialized = True
+
+    def reset(self):
+        self.future_queue.clear()
+        self.seq_counter = 0
+        self.total_expected = float("inf")
+        self.all_received = False
+        self.req_created_time.clear()
+
+    def __len__(self) -> int:
+        return len(self.future_queue)
+
+    def has_next(self) -> bool:
+        return len(self.future_queue) > 0
+
+    def next_req_created_time(self) -> float:
+        return self.future_queue[0][0]
+
+    def add(self, engine_core, request, request_wave: int, created_time: float):
+        """Park a request fully inert until its created_time."""
+        heapq.heappush(
+            self.future_queue,
+            (created_time, self.seq_counter, engine_core, request, request_wave),
+        )
+        self.req_created_time[request.request_id] = created_time
+        self.seq_counter += 1
+
+        # Check if all requests have been received
+        if self.seq_counter >= self.total_expected:
+            self.all_received = True
+            logger.info(
+                "All %d requests received. Starting simulation.",
+                self.total_expected,
+            )
+
+    def dispatch(self, engine_core):
+        """Release parked requests whose created_time <= global_clock back
+        through the native EngineCore.add_request path (connector admission,
+        scheduler enqueue) — KV-cache work starts exactly here, never earlier."""
+        current_time = StateManager.get_global_clock()
+        while self.future_queue and self.future_queue[0][0] <= current_time:
+            _, _, core, request, request_wave = heapq.heappop(self.future_queue)
+            ct = self.req_created_time.get(request.request_id, current_time)
+            # Record queue_start = time when the request is dispatched
+            _new_request_stats(
+                request,
+                created_time=ct,
+                queue_start=current_time,
+                last_event_time=ct,  # starts at created_time
+            )
+            self.original_core_add_request(core, request, request_wave)
+
+
+def _pcp_budget_granule(cache_block_size, pcp_size):
+    """CPU 缓存已折叠为 PCP 逻辑块时，避免再次乘 PCP。"""
+    from sglang_simulator.simulation.vllm.tpu_kv_geometry import is_tpu_target
+
+    try:
+        raw = ConfigManager._get_raw_config()
+    except (OSError, TypeError):
+        # 旧路径的独立调用可能只注入 SchedulerConfig，没有配置文件。
+        raw = {}
+    physical = raw.get("scheduler", {}).get("physical_block_size")
+    if is_tpu_target(raw) and physical and cache_block_size == physical * pcp_size:
+        return cache_block_size
+    return cache_block_size * pcp_size
+
+
+class C_VLLMSchedulerHook(BaseHook):
+    """Patch ONLY the scheduler's unfinished-count accessors.
+
+    The engine busy loop reads them directly off the Scheduler instance
+    (vllm/v1/engine/core.py: scheduler.has_unfinished_requests), so there
+    is no EngineCore-level seam for them: parked future-queue requests
+    must be counted here or the loop would go idle and never dispatch.
+    Everything else the sim needs lives on the EngineCore / executor
+    seams — do not grow this hook back.
+    """
+
+    HOOK_CLASS_NAME = "Scheduler"
+    HOOK_MODULE_NAME = "vllm.v1.core.sched.scheduler"
+
+    @classmethod
+    def hook(cls, target):
+        original_get_num_unfinished = target.get_num_unfinished_requests
+        target.get_num_unfinished_requests = lambda self: (
+            original_get_num_unfinished(self) + len(ReqDispatcher())
+        )
+        original_has_unfinished = getattr(target, "has_unfinished_requests", None)
+        if original_has_unfinished is not None:
+            target.has_unfinished_requests = lambda self: (
+                original_has_unfinished(self) or len(ReqDispatcher()) > 0
+            )
+
+        original_split = getattr(target, "_mamba_block_aligned_split", None)
+        if original_split is not None:
+            def wrapped_split(self, request, num_new_tokens, *args, **kwargs):
+                scheduler_config = ConfigManager.get_scheduler_config()
+                pcp_size = getattr(scheduler_config, "pcp_size", 1)
+                if pcp_size > 1:
+                    block_size = self.cache_config.block_size
+                    budget = self.scheduler_config.max_num_batched_tokens
+                    # Static PCP granule used by the target PP deployment:
+                    # floor(budget / pcp / block) * pcp * block.
+                    granule = _pcp_budget_granule(block_size, pcp_size)
+                    pcp_budget = (budget // granule) * granule
+                    if pcp_budget > 0:
+                        num_new_tokens = min(num_new_tokens, pcp_budget)
+                count = original_split(
+                    self, request, num_new_tokens, *args, **kwargs
+                )
+                mtp_prefill_only = os.environ.get(
+                    "TPU_MTP_PREFILL_ONLY", ""
+                ).lower() in ("1", "true", "yes", "on")
+                if mtp_prefill_only and self.cache_config.enable_prefix_caching:
+                    unit = self.hash_block_size
+                    disable_drop = os.environ.get(
+                        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", ""
+                    ).lower() in ("1", "true", "yes", "on")
+                    drop_units = 0 if disable_drop else 1
+                    boundary = max(
+                        0,
+                        ((request.num_prompt_tokens - 1) // unit - drop_units) * unit,
+                    )
+                    local = kwargs.get(
+                        "num_new_local_computed_tokens",
+                        args[0] if len(args) > 0 else 0,
+                    )
+                    external = kwargs.get(
+                        "num_external_computed_tokens",
+                        args[1] if len(args) > 1 else 0,
+                    )
+                    start = request.num_computed_tokens + local + external
+                    if start < boundary < start + count:
+                        count = boundary - start
+                return count
+
+            target._mamba_block_aligned_split = wrapped_split
+
+
+def _iter_connector_metadata(metadata):
+    """Yield connector metadata through MultiConnector's nested containers."""
+    if metadata is None:
+        return
+    yield metadata
+    children = getattr(metadata, "metadata", None)
+    if isinstance(children, dict):
+        children = children.values()
+    if isinstance(children, (tuple, list)) or children is not None and hasattr(children, "__iter__"):
+        for child in children or ():
+            yield from _iter_connector_metadata(child)
+
+
+def _tpu_external_hit_tokens(scheduler_output, req_id, total_hit, block_size) -> int | None:
+    """Recover external hits from TPU v6d reqs_to_load, if present.
+
+    TPU Request/NewRequestData do not expose num_external_computed_tokens.
+    A hit is the common prefix across all relevant groups, hence min rather
+    than sum. None means no TPU metadata was found, not a confirmed local hit.
+    """
+    metadata = getattr(scheduler_output, "kv_connector_metadata", None)
+    for item in _iter_connector_metadata(metadata):
+        reqs_to_load = getattr(item, "reqs_to_load", None)
+        if not isinstance(reqs_to_load, dict) or req_id not in reqs_to_load:
+            continue
+        groups = reqs_to_load[req_id]
+        if not isinstance(groups, dict):
+            continue
+        counts = []
+        for keys, _block_ids in groups.values():
+            counts.append(len(keys))
+        if counts:
+            return min(min(counts) * block_size, max(total_hit, 0))
+    return None
+
+
+def _ext_computed_tokens(req_id, scheduler_output=None, total_hit=0, block_size=384) -> int:
+    admitted = request_stats_manager.external_prefix_tokens.get(req_id)
+    if admitted is not None:
+        # Native TPU allocation is authoritative even if its asynchronous
+        # load metadata was already consumed on an earlier idle engine step.
+        return min(max(admitted, 0), max(total_hit, 0))
+    if scheduler_output is not None:
+        external = _tpu_external_hit_tokens(
+            scheduler_output, req_id, total_hit, block_size
+        )
+        if external is not None:
+            return external
+    try:
+        from vllm.v1.hybrid_connector.engine_proxy import _sched
+        req = _sched().requests.get(req_id)
+        return max(getattr(req, "num_external_computed_tokens", 0) or 0, 0)
+    except Exception:
+        return 0
+
+
+def _finalize_step_stats(scheduler_output, event_time: float) -> None:
+    """Publish one step's stats when its model-output future is complete."""
+    if not _stats_recording_enabled():
+        return
+    if getattr(scheduler_output, "_sim_stats_finalized", False):
+        return
+    iteration_stat = getattr(scheduler_output, "_sim_iteration_stat", None)
+    if iteration_stat is None:
+        return
+    scheduler_output._sim_stats_finalized = True
+    C_VLLMEngineCoreHook.ITERATION_STATS.append(iteration_stat)
+
+    token_emitted = getattr(scheduler_output, "_sim_token_emitted", {})
+    for req_id in (getattr(scheduler_output, "num_scheduled_tokens", None) or {}):
+        if not token_emitted.get(req_id, True):
+            continue
+        st = request_stats_manager.stats.get(req_id)
+        if st is not None:
+            st.gen_token_latencies.append(event_time - st.last_event_time)
+            st.last_event_time = event_time
+
+
+def _register_tpu_connector_names():
+    """Register connector names without activating the full TPU platform."""
+    from vllm.distributed.kv_transfer.kv_connector.factory import (
+        KVConnectorFactory,
+    )
+
+    registrations = (
+        (
+            "TPURaidenConnector",
+            "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+        ),
+        (
+            "TPUMultiConnector",
+            "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
+        ),
+        ("TPUV6dObjectConnector", "kvs_connector.v6d_object_connector"),
+    )
+    for name, module_path in registrations:
+        try:
+            KVConnectorFactory.register_connector(name, module_path, name)
+        except Exception as exc:
+            if "already" not in str(exc).lower():
+                raise
+
+
+class C_VLLMLLMEngineHook(BaseHook):
+    """在前端进程初始化前注册名称，供跨进程 KV 统计反序列化使用。"""
+
+    HOOK_CLASS_NAME = "LLMEngine"
+    HOOK_MODULE_NAME = "vllm.v1.engine.llm_engine"
+
+    @classmethod
+    def hook(cls, target):
+        if target.__dict__.get("_sim_frontend_connector_registration", False):
+            return
+        original_init = target.__init__
+
+        @wraps(original_init)
+        def wrapped_init(self, *args, **kwargs):
+            # 注册表是进程本地状态，不能依赖 EngineCore 子进程的注册。
+            # 延迟到构造入口，避免 hook 装配时提前导入 vLLM/真实 TPU 后端。
+            _register_tpu_connector_names()
+            logger.info(
+                "[vLLM Hijack] LLMEngine frontend connector registry ready (pid=%d)",
+                os.getpid(),
+            )
+            original_init(self, *args, **kwargs)
+
+        target.__init__ = wrapped_init
+        target._sim_frontend_connector_registration = True
+
+
+class C_VLLMEngineCoreHook(BaseHook):
+    """Hook EngineCore for created_time-based request dispatch.
+
+    EngineCore.add_request is the single seam both engine paths funnel
+    through (InprocClient.add_request and the EngineCoreProc busy loop) and
+    in dashllm vLLM it runs kvconn.on_add_req BEFORE Scheduler.add_request.
+    Parking simulation requests here — before either — keeps them fully
+    inert until created_time: no connector admission, no v6d lookup, no
+    KV-block allocation.  Dispatch happens in EngineCore.step, back through
+    the native add_request path, so all KV-cache work starts exactly at the
+    request's created_time and in created_time order.
+
+    Note: prefix block hashing still happens earlier in the engine's input
+    thread (preprocess_add_request); it is stateless CPU prep that touches
+    no cache state, and intercepting the IO thread would be far more
+    invasive for no semantic gain.
+    """
+
+    HOOK_CLASS_NAME = "EngineCore"
+    HOOK_MODULE_NAME = "vllm.v1.engine.core"
+
+    INFERENCE_PREDICTOR: InferTimePredictor = None
+    # 预测器为 tpu_pp_stage 时由 wrapped_init 置位，执行器 hook 据此跳过整步预测
+    TPU_PP_ACTIVE: bool = False
+    SIM_MODE: SimulationMode = SimulationMode(Envs.simulation_mode())
+
+    # Per-request stats live in the shared request_stats_manager
+    # (simulation/req_stats_manager.py), same as the SGLang backend.
+    # C_VLLMExecutorHook attaches one record per forward step; OFFLINE publishes
+    # it immediately, while BLOCKING publishes after the model-output future
+    # completes. Keep the schema aligned with the SGLang hook.
+    ITERATION_STATS: list[dict] = []
+
+    @classmethod
+    def hook(cls, target):
+        original_init = target.__init__
+        original_add_request = target.add_request
+        original_step = target.step
+        original_shutdown = target.shutdown
+        original_wait_model_output = getattr(
+            target, "_wait_model_output_future", None
+        )
+        dispatcher = ReqDispatcher()
+        dispatcher.original_core_add_request = original_add_request
+
+        def wrapped_init(self, vllm_config, *args, **kwargs):
+            """Reset shared replay state, init the AIConfigurator predictor,
+            and instance-patch the Scheduler created by EngineCore."""
+            parallel = vllm_config.parallel_config
+            platform = getattr(sys.modules.get("vllm.platforms"), "current_platform", None)
+            requested_executor = kwargs.get("executor_class", args[0] if args else None)
+            emit_hook_event(
+                "ENGINE_CONFIG", stage="engine_core",
+                platform=type(platform).__module__ + "." + type(platform).__qualname__,
+                backend=parallel.distributed_executor_backend, worker_cls=parallel.worker_cls,
+                executor_requested=(requested_executor.__module__ + "." + requested_executor.__qualname__)
+                if isinstance(requested_executor, type) else None,
+            )
+            report_class_hooks("engine_core_before_init")
+            ReqDispatcher().reset()
+            request_stats_manager.reset()
+            cls.ITERATION_STATS.clear()
+
+            # TpuPlatform normally performs this registration. CPU mode keeps
+            # the platform inactive, so register only the connector names
+            # before EngineCore constructs its Scheduler and connectors.
+            _register_tpu_connector_names()
+            original_init(self, vllm_config, *args, **kwargs)
+            emit_hook_event(
+                "EXECUTOR_READY", executor_module=type(self.model_executor).__module__,
+                executor_class=type(self.model_executor).__qualname__,
+            )
+            from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+                install_tpu_v6d_completion_guard,
+            )
+            install_tpu_v6d_completion_guard(self.scheduler)
+            from sglang_simulator.simulation.vllm.lifecycle import install_lifecycle
+            install_lifecycle(self)
+
+            try:
+                model_config = vllm_config.model_config
+                model = resolve_model_info(model_config)
+                ConfigManager.set_model_info(model)
+
+                hw = ConfigManager.get_accelerator_info()
+
+                sched_config = resolve_scheduler_config(vllm_config)
+                ConfigManager.set_scheduler_config(sched_config)
+
+                cls.INFERENCE_PREDICTOR = ConfigManager.get_inference_time_predictor(
+                    model, hw, sched_config
+                )
+                logger.info("AIConfigurator predictor initialized for vLLM.")
+
+                tpu_pp = getattr(cls.INFERENCE_PREDICTOR, "tpu_pp_stage", False)
+                cls.TPU_PP_ACTIVE = tpu_pp
+                if tpu_pp:
+                    _install_tpu_pp(self, cls.INFERENCE_PREDICTOR, sched_config)
+                elif sched_config.pp_size > 1:
+                    from sglang_simulator.simulation.vllm.pp_pipeline import (
+                        SimulatedPipelineStepper,
+                    )
+
+                    raw_scheduler = ConfigManager._get_raw_config().get("scheduler", {})
+                    occupancy_mode = raw_scheduler.get("pp_occupancy_mode", "span_share")
+                    self._sim_pipeline_stepper = SimulatedPipelineStepper(
+                        self, sched_config.pp_size, occupancy_mode
+                    )
+                    # vLLM 0.29 uses step_fn for both serial and batch-queue paths.
+                    self.step_fn = self._sim_pipeline_stepper.step
+                    logger.info(
+                        "[PP Hijack] logical pipeline enabled: stages=%d, pcp=%d, occupancy=%s",
+                        sched_config.pp_size,
+                        sched_config.pcp_size,
+                        occupancy_mode,
+                    )
+            except Exception as e:
+                logger.error("Failed to initialize inference time predictor: %s", e)
+                raise
+            report_class_hooks("engine_ready")
+
+        def wrapped_add_request(self, request, request_wave=0, *args, **kwargs):
+            """Park simulation requests in the shared future queue; forward
+            everything else to the native path immediately."""
+            # Force output length from environment variable (only if set)
+            if _MAX_DECODE_STEPS is not None:
+                if request.sampling_params is not None:
+                    request.sampling_params.max_tokens = _MAX_DECODE_STEPS
+                    request.sampling_params.ignore_eos = True
+                request.max_tokens = _MAX_DECODE_STEPS
+
+            recorder = getattr(self, "_hisim_lifecycle", None)
+            observer = getattr(self, "_hisim_lifecycle_observer", None)
+            if recorder is not None and observer is not None:
+                from sglang_simulator.simulation.vllm.lifecycle import request_key
+                observer.observe(lambda: recorder.emit(
+                    "request.engine_add", request_id_sha256=request_key(request.request_id),
+                    input_length=request.num_prompt_tokens, max_output_tokens=request.max_tokens,
+                    source="EngineCore.add_request", time_kind="host_entry_observed"))
+            created_time = None
+            sp = request.sampling_params
+            if sp is not None and sp.extra_args:
+                sim = sp.extra_args.get("simulation")
+                if sim:
+                    created_time = sim.get("created_time")
+                    total = sim.get("total_request")
+                    if total is not None:
+                        dispatcher.total_expected = total
+
+            if created_time is None or cls_sim_mode() == SimulationMode.BLOCKING:
+                if cls_sim_mode() == SimulationMode.BLOCKING:
+                    # BLOCKING mode: process immediately, record stats with
+                    # real time.  Registered here at the engine entry so
+                    # connector-eaten requests are covered too.
+                    now = time.time()
+                    _new_request_stats(
+                        request,
+                        created_time=created_time if created_time is not None else now,
+                        queue_start=now,
+                        last_event_time=now,
+                    )
+                # Non-simulation request (or BLOCKING mode): native path now
+                original_add_request(self, request, request_wave, *args, **kwargs)
+                return
+
+            # OFFLINE simulation: park fully inert until created_time
+            dispatcher.add(self, request, request_wave, created_time)
+
+        def wrapped_step(self, *args, **kwargs):
+            """Dispatch due future-queue requests before each engine step."""
+            offline = cls_sim_mode() == SimulationMode.OFFLINE
+            if offline and dispatcher.all_received:
+                dispatcher.dispatch(self)
+
+            result = original_step(self, *args, **kwargs)
+            if offline and not result[1]:
+                # The count hook includes parked arrivals; they are not active work.
+                is_req_pending = (
+                    self.scheduler.get_num_unfinished_requests() > len(dispatcher)
+                    or _connector_has_pending(self.scheduler)
+                )
+                if is_req_pending:
+                    # Match SGLang's idle tick. The connector observes the clock
+                    # on its next native step and owns all transfer readiness.
+                    StateManager.step_global_clock(0.005)
+                    StateManager.set_current_inference_dur(0.005)
+                elif dispatcher.all_received and dispatcher.has_next():
+                    StateManager.set_global_clock(max(
+                        StateManager.get_global_clock(), dispatcher.next_req_created_time()))
+            return result
+
+        def wrapped_wait_model_output(
+            self, model_output_future, step_sout, *args, **kwargs
+        ):
+            observer = getattr(self, "_hisim_lifecycle_observer", None)
+            started = time.monotonic_ns() if observer is not None else None
+            native_ok = False
+            try:
+                result = original_wait_model_output(
+                    self, model_output_future, step_sout, *args, **kwargs
+                )
+                native_ok = True
+            finally:
+                if observer is not None:
+                    ended = time.monotonic_ns()
+                    observer.observe(lambda: observer.record_call(
+                        "request.engine_output_wait", started, ended,
+                        step_sout.num_scheduled_tokens, native_ok,
+                        "EngineCore._wait_model_output_future", getattr(step_sout, "_hisim_lifecycle_step_id", None)))
+            if cls.SIM_MODE == SimulationMode.BLOCKING:
+                # The future returned only after _SimAsyncOutput.get_output()
+                # has consumed the simulated GPU span. Use that real completion
+                # time instead of maintaining a projected GPU clock.
+                _finalize_step_stats(step_sout, time.time())
+            return result
+
+        def export_lifecycle(self, wait=False, timeout=5):
+            recorder = getattr(self, "_hisim_lifecycle", None)
+            if recorder is None:
+                return {"enabled": False}
+            flushed = recorder.flush(timeout) if wait else None
+            return dict(recorder.status(), enabled=True, flushed=flushed)
+
+        def wrapped_shutdown(self, *args, **kwargs):
+            try:
+                return original_shutdown(self, *args, **kwargs)
+            finally:
+                recorder = getattr(self, "_hisim_lifecycle", None)
+                if recorder is not None:
+                    recorder.close()
+
+        target.__init__ = wrapped_init
+        target.add_request = wrapped_add_request
+        target.step = wrapped_step
+        target.shutdown = wrapped_shutdown
+        target.export_lifecycle = export_lifecycle
+        if original_wait_model_output is not None:
+            target._wait_model_output_future = wrapped_wait_model_output
+
+        # EngineCore.profile doubles as the benchmark round separator: dump
+        # request / iteration stats to SGLANG_SIMULATOR_OUTPUT_DIR and reset
+        # simulator-local accounting. Cache reset remains user-controlled via
+        # the native API. The hook framework applies only the first hook
+        # matching a class, so the profile patch is merged here instead of
+        # living in its own hook class on EngineCore.
+        def wrapped_profile(self, is_start: bool = True, profile_prefix=None, *args, **kwargs):
+            req_stats = request_stats_manager.get_all_req_stats()
+            output_dir = Envs.output_dir()
+            with open(os.path.join(output_dir, "request.jsonl"), "w") as f:
+                for item in req_stats:
+                    f.write(json.dumps(asdict(item), default=str) + "\n")
+            with open(os.path.join(output_dir, "iteration.jsonl"), "w") as f:
+                for item in cls.ITERATION_STATS:
+                    f.write(json.dumps(item, default=str) + "\n")
+
+            logger.info(
+                "[ProfileHook] Exported %d requests, %d iterations to %s",
+                len(req_stats),
+                len(cls.ITERATION_STATS),
+                output_dir,
+            )
+
+            executor = getattr(self, "model_executor", None)
+            stepper = getattr(self, "_sim_pipeline_stepper", None)
+            work_in_flight = bool(self.batch_queue) or (
+                stepper is not None and bool(stepper.in_flight)
+            )
+            if getattr(executor, "step_records", None) is not None:
+                with open(os.path.join(output_dir, "tpu_pp_steps.jsonl"), "w") as f:
+                    for item in executor.step_records.values():
+                        f.write(json.dumps(item, default=str) + "\n")
+                with open(os.path.join(output_dir, "tpu_pp_stage_events.jsonl"), "w") as f:
+                    for item in list(executor.stage_events):
+                        f.write(json.dumps(item, default=str) + "\n")
+                if not work_in_flight:
+                    executor.reset_stats()
+
+            # 在途 step 的回调仍引用当前统计，快照导出不能清掉它们。
+            if not work_in_flight:
+                request_stats_manager.reset()
+                cls.ITERATION_STATS.clear()
+                StateManager.reset()
+                ReqDispatcher().reset()
+                if stepper is not None:
+                    stepper.reset()
+
+        target.profile = wrapped_profile
+
+
+def _install_tpu_pp(core, predictor, sched_config) -> None:
+    """按 vllm_torchtpu patch_engine_core_for_lazy_push 安装原生 LazyPushStepper，
+    执行器换成由 stage worker 计时的 VirtualPPExecutor。"""
+    from sglang_simulator.simulation.vllm.tpu_pp.stage_runtime import (
+        VirtualPPExecutor, create_stepper,
+    )
+
+    if C_VLLMEngineCoreHook.SIM_MODE != SimulationMode.BLOCKING:
+        raise ValueError("tpu_pp_stage requires BLOCKING simulation mode")
+    if sched_config.pp_size <= 2:
+        raise ValueError("native lazy push requires pp_size > 2")
+    if core.async_scheduling:
+        raise ValueError("native lazy push is off with async scheduling")
+    executor = VirtualPPExecutor(
+        core.model_executor, predictor, sched_config.pp_size,
+        on_step_done=_finalize_step_stats,
+        lifecycle=getattr(core, "_hisim_lifecycle", None))
+    core.model_executor = executor
+    stepper = create_stepper(core, executor)
+    core.batch_queue = stepper.in_flight
+    core.step_fn = stepper.step
+    core._sim_tpu_pp_stepper = stepper
+    emit_hook_event(
+        "ENGINE_READY", executor_module=type(core.model_executor).__module__,
+        executor_class=type(core.model_executor).__qualname__,
+        inner_module=type(executor.inner).__module__, inner_class=type(executor.inner).__qualname__,
+        virtual_pp=isinstance(core.model_executor, VirtualPPExecutor),
+        native_stepper=isinstance(core._sim_tpu_pp_stepper, executor.native.LazyPushStepper),
+        step_fn_bound=core.step_fn.__self__ is core._sim_tpu_pp_stepper,
+        batch_queue_bound=core.batch_queue is stepper.in_flight,
+        stages=sched_config.pp_size, pcp=sched_config.pcp_size,
+    )
+    logger.info("[TPU PP] native lazy push installed: stages=%d pcp=%d",
+                sched_config.pp_size, sched_config.pcp_size)
+
+
+def cls_sim_mode() -> SimulationMode:
+    return C_VLLMEngineCoreHook.SIM_MODE
+
+
+def _connector_has_pending(scheduler) -> bool:
+    """Check native work interfaces, including loads and trailing stores."""
+    get_conn = getattr(scheduler, "get_kv_connector", None)
+    connector = get_conn() if get_conn is not None else None
+    if connector is None:
+        return False
+    has_pending_push = getattr(connector, "has_pending_push_work", None)
+    return bool(
+        connector.has_requests()
+        or getattr(connector, "pending_requests", None)
+        or (has_pending_push() if has_pending_push is not None else False)
+    )
+
+
+class C_VLLMExecutorHook(BaseHook):
+    """Hook UniProcExecutor.execute_model to consume the simulated GPU span.
+
+    EngineCore.step() runs the model at
+    ``self.model_executor.execute_model(scheduler_output, non_block=True)``.
+    The prediction remains at this executor seam. In BLOCKING mode its span is
+    attached to SchedulerOutput and consumed by the worker's asynchronous
+    sample output, keeping the EngineCore loop free to drive the connector. In
+    OFFLINE mode the same prediction advances the virtual clock directly.
+
+    ExecutorWithExternalLauncher does not override execute_model, so it
+    inherits the hooked method.  The module regex also covers forks that
+    keep uniproc_executor outside the ``.v1`` namespace.
+
+    All inputs come from the SchedulerOutput itself — no reference to the
+    Scheduler instance is needed.
+    """
+
+    HOOK_CLASS_NAME = "UniProcExecutor"
+    HOOK_MODULE_NAME = r"vllm(\.v1)?\.executor\.uniproc_executor"
+    REGEX = True
+
+    _COLD_START_DONE = False
+    # Sim-owned single-worker pool that consumes the modelled GPU span off the
+    # EngineCore thread, so execute_model can return a still-pending future.
+    # max_workers=1 serialises steps, matching a single GPU stream.
+    _GPU_SPAN_EXECUTOR = None
+
+    @classmethod
+    def _gpu_span_pool(cls):
+        if cls._GPU_SPAN_EXECUTOR is None:
+            cls._GPU_SPAN_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sim-gpu-span")
+        return cls._GPU_SPAN_EXECUTOR
+
+    @classmethod
+    def hook(cls, target):
+        original_execute_model = target.execute_model
+
+        # req_id -> (prompt_tokens, has_logprobs).  Cached (decode) requests
+        # carry neither on SchedulerOutput, so they are remembered from the
+        # request's first (new-req) scheduling and dropped once the request
+        # shows up in finished_req_ids.
+        req_info: dict[str, tuple] = {}
+
+        def wrapped_execute_model(self, scheduler_output, *args, **kwargs):
+            num_scheduled_tokens = getattr(
+                scheduler_output, "num_scheduled_tokens", None)
+            if not num_scheduled_tokens:
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+
+            # --- Per-request queue/hit stats (schedule seam, moved here):
+            # queue_end at schedule-time clock (before this step is
+            # accounted), hit fields per newly scheduled request ---
+            queue_end_time = (
+                time.time()
+                if C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING
+                else StateManager.get_global_clock()
+            )
+            # --- One pass over newly scheduled requests: hit-rate log,
+            # queue/hit stats, executor registry ---
+            #   final_device_hit_len = num_computed_tokens (local + external)
+            #   ext_kv_hit_len       = num_external_computed_tokens (cross-node)
+            #   local_kv_hit_len     = difference (local radix)
+            new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None) or ()
+            for new_req_data in new_reqs:
+                req_id = new_req_data.req_id
+                st = request_stats_manager.stats.get(req_id)
+                prompt_ids = getattr(new_req_data, "prompt_token_ids", None)
+                sp = getattr(new_req_data, "sampling_params", None)
+
+                # Queue/hit stats, recorded once at the first schedule
+                if st is not None and st.queue_end == -1:
+                    st.queue_end = queue_end_time
+                    st.input_length = (
+                        len(prompt_ids) if prompt_ids is not None else 0
+                    )
+                    st.output_length = getattr(sp, "max_tokens", 0) or 0
+                    cached = max(
+                        getattr(new_req_data, "num_computed_tokens", 0) or 0, 0
+                    )
+                    ext = _ext_computed_tokens(
+                        req_id,
+                        scheduler_output=scheduler_output,
+                        total_hit=cached,
+                        block_size=getattr(
+                            getattr(self, "vllm_config", None),
+                            "cache_config",
+                            None,
+                        ).block_size
+                        if getattr(self, "vllm_config", None) is not None
+                        else 384,
+                    )
+                    st.final_device_hit_len = cached
+                    st.ext_kv_hit_len = ext
+                    st.local_kv_hit_len = cached - ext
+                    # Legacy schema (vllm_worker / metric layer): host = external
+                    st.final_host_hit_len = ext
+                    # Hit values are fixed at admission and never change
+                    # afterwards — log once here instead of at finish time
+                    logger.info(
+                        "[HitRate] rid=%s input_len=%d local_hit=%d ext_hit=%d",
+                        st.rid,
+                        st.input_length,
+                        st.local_kv_hit_len,
+                        st.ext_kv_hit_len,
+                    )
+
+                # Executor registry: (prompt_tokens, has_logprobs) remembered
+                # from the first sighting; dropped on finish below.
+                req_info[req_id] = (
+                    len(prompt_ids) if prompt_ids is not None else None,
+                    getattr(sp, "logprobs", 0) or 0,
+                )
+            for fin_id in (getattr(scheduler_output, "finished_req_ids", None)
+                           or ()):
+                req_info.pop(fin_id, None)
+
+            # --- num_computed_tokens BEFORE this step (= past_kv_length) ---
+            # SchedulerOutput is filled before _update_after_schedule()
+            # advances the live requests, so these values are pre-step.
+            num_computed = {r.req_id: r.num_computed_tokens for r in new_reqs}
+            cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+            if cached is not None:
+                num_computed.update(
+                    zip(cached.req_ids, cached.num_computed_tokens))
+
+            # --- Build ScheduleBatch + per-request token-emission flags ---
+            # token_emitted is False for intermediate chunked-prefill forwards
+            # (a token is emitted only once the forward covers the full
+            # prompt).  Annotated onto scheduler_output so the sim worker can
+            # build its mock ModelRunnerOutput without an executor reference —
+            # the SchedulerOutput already travels executor -> worker natively.
+            pp_context = getattr(scheduler_output, "_sim_pp_context", {})
+            simulation_batch = ScheduleBatch(
+                reqs=[],
+                pos_in_burst=pp_context.get("pos_in_burst", 0),
+                in_flight=pp_context.get("in_flight", 0),
+                num_waiting=pp_context.get("num_waiting", 0),
+                num_running=pp_context.get("num_running", 0),
+                num_skipped=pp_context.get("num_skipped", 0),
+            )
+            token_emitted: dict[str, bool] = {}
+            logprobs_tokens = 0
+            logprobs_req_count = 0
+            logprobs_n = 0
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                if req_id not in num_computed:
+                    continue
+                past_kv_length = num_computed[req_id]
+                prompt_tokens, req_logprobs_n = req_info.get(req_id, (None, 0))
+                token_emitted[req_id] = (
+                    prompt_tokens is None
+                    or past_kv_length + num_tokens >= prompt_tokens
+                )
+                if req_logprobs_n:
+                    logprobs_req_count += 1
+                    logprobs_tokens += num_tokens
+                    logprobs_n = max(logprobs_n, req_logprobs_n)
+                simulation_batch.reqs.append(
+                    ScheduleRequest(
+                        extend_length=num_tokens,
+                        past_kv_length=max(0, past_kv_length),
+                    )
+                )
+            simulation_batch.logprobs_req_count = logprobs_req_count
+            simulation_batch.logprobs_tokens = logprobs_tokens
+            simulation_batch.logprobs_n = logprobs_n
+            scheduler_output._sim_batch = simulation_batch
+            scheduler_output._sim_token_emitted = token_emitted
+
+            if simulation_batch.is_empty():
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+
+            if C_VLLMEngineCoreHook.TPU_PP_ACTIVE:
+                # 时延由 VirtualPPExecutor 的 stage worker 产生；这里只同步生成
+                # mock 输出，完成统计在末 stage 采样回复到达时发布
+                StateManager.inc_iteration()
+                scheduler_output._sim_iteration_stat = {
+                    "requests": simulation_batch.request_info(),
+                    "total_tokens": sum(num_scheduled_tokens.values()),
+                    "tpu_pp_step_id": getattr(
+                        scheduler_output, "_sim_tpu_pp_step_id", None),
+                }
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+
+            # --- Predict and account this step's GPU span ---
+            # Prediction deliberately happens before original_execute_model so
+            # BLOCKING can annotate scheduler_output before it reaches the
+            # worker.  The prediction depends only on scheduler output state,
+            # never on the model result, so this preserves the old semantics.
+            StateManager.inc_iteration()
+            predictor = C_VLLMEngineCoreHook.INFERENCE_PREDICTOR
+            if predictor is not None:
+                predicted_latency = float(
+                    predictor.predict_infer_time(simulation_batch)
+                )
+            else:
+                predicted_latency = 0.001  # fallback: 1ms per step
+
+            # logprobs compensation (both modes): when the baseline was
+            # collected without logprobs but the target deployment enables
+            # them, the extra GPU work (topk / D2H / tolists) is
+            # proportional to this step's scheduled tokens of logprobs
+            # requests. Sim has no real GPU, so it must be added
+            # explicitly. Only active with logprobs_cost_us_per_token > 0.
+            full_span = bool(getattr(predictor, "full_span", False))
+            lp_cost = getattr(predictor, "logprobs_cost_s_per_token", 0.0)
+            logprobs_latency = 0.0 if full_span else lp_cost * logprobs_tokens
+
+            # sample_tokens (RPC-2) compensation, kept as a SEPARATE term
+            # from predicted_latency: the predictor's label covers only
+            # RPC-1 (execute_model), while the real engine additionally
+            # spends the RPC-2 span (sampler + speculative draft propose +
+            # bookkeeping D2H + output construction) on GPU every step.
+            # Deliberately not folded into predicted_latency so that the
+            # iter_latency semantics of the trained label stay intact and
+            # both components remain separately auditable in
+            # iteration.jsonl. Driven by the same ScheduleBatch the iter
+            # predictor sees: the mechanistic model consumes sum_extend
+            # and sum(ext_i * past_i) from the per-request aggregation,
+            # matching the GPU-side calibration features exactly.
+            total_tokens = sum(num_scheduled_tokens.values())
+            sample_tokens_latency = 0.0
+            if not full_span and predictor is not None and hasattr(
+                predictor, "predict_sample_tokens_time"
+            ):
+                sample_tokens_latency = float(
+                    predictor.predict_sample_tokens_time(simulation_batch)
+                )
+
+            # Full GPU span actually occupied by this step, matching the
+            # GPU-side ``full_step_latency`` = iter + sample_tokens.
+            full_step_latency = (
+                predicted_latency + sample_tokens_latency + logprobs_latency
+            )
+
+            is_blocking = (
+                C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING
+            )
+            simulated_gpu_span = abs(full_step_latency)
+
+            # Completion accounting travels on the native SchedulerOutput and is
+            # published once the modelled span actually elapses (BLOCKING) or the
+            # virtual clock advances (OFFLINE).
+            scheduler_output._sim_iteration_stat = {
+                "requests": simulation_batch.request_info(),
+                # RPC-1 only, matching the predictor's training label.
+                "forward_latency": predicted_latency,
+                "sample_tokens_latency": sample_tokens_latency,
+                "logprobs_latency": logprobs_latency,
+                "full_step_latency": full_step_latency,
+                "total_tokens": total_tokens,
+                "l2_load_latency": 0.0,
+                "l2_backup_latency": 0.0,
+            }
+            if pp_context:
+                scheduler_output._sim_iteration_stat.update({
+                    "pos_in_burst": simulation_batch.pos_in_burst,
+                    "in_flight": simulation_batch.in_flight,
+                    "num_waiting": simulation_batch.num_waiting,
+                    "num_running": simulation_batch.num_running,
+                    "num_skipped": simulation_batch.num_skipped,
+                })
+                # The logical PP stepper owns sleep/virtual-clock advancement
+                # and completion. Return the mock output immediately here.
+                scheduler_output._sim_full_step_latency = simulated_gpu_span
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+
+            if not is_blocking:
+                # OFFLINE: the virtual clock accumulates the full GPU span.
+                # Known diff vs real, deliberately NOT compensated: the
+                # engine residual (~2.5ms/step = RPC transfers +
+                # EngineCore bookkeeping, outside the X1 label) is
+                # unmodellable wall-clock time; back-filling it from real
+                # measurements would smuggle in an unjustified
+                # calibration. OFFLINE duration is expected to run
+                # ~2.5ms/step shorter than real; treat it as a known diff
+                # item when interpreting results, not a bug.
+                result = original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+                StateManager.set_current_inference_dur(full_step_latency)
+                StateManager.step_global_clock(full_step_latency)
+                _finalize_step_stats(
+                    scheduler_output, StateManager.get_global_clock())
+                return result
+
+            # One-time engine cold start folded into the first modelled span.
+            if not cls._COLD_START_DONE:
+                cls._COLD_START_DONE = True
+                cold_start = float(os.environ.get(
+                    "SGLANG_SIMULATOR_COLD_START_S", "0") or 0)
+                if cold_start > 0:
+                    logger.info(
+                        "[sim-coldstart] one-time cold-start "
+                        "overhead %.3f s on first non-empty iter",
+                        cold_start)
+                    simulated_gpu_span += cold_start
+
+            async_scheduling = bool(getattr(
+                getattr(self, "scheduler_config", None),
+                "async_scheduling", False))
+
+            if async_scheduling:
+                # Batch-queue path: EngineCore waits on the sample_tokens
+                # future, so defer the span there via the worker's
+                # AsyncModelRunnerOutput on vLLM's WorkerAsyncOutput thread.
+                scheduler_output._sim_full_step_latency = simulated_gpu_span
+                return original_execute_model(
+                    self, scheduler_output, *args, **kwargs)
+
+            # Non-async path (e.g. P/D-disagg P side, where vLLM forces async
+            # scheduling off): step() waits on execute_model's own future.
+            # Build the mock output synchronously (worker does NOT sleep since
+            # _sim_full_step_latency is unset), then return a still-pending
+            # future whose result is filled after the span elapses on a
+            # background thread.  With _enable_bypass on, vLLM's native
+            # _wait_model_output_future bypass loop then pumps ADD/ABORT input
+            # and drives kvconn.step() during the wait -- reproducing the
+            # real-GPU load/admission overlap with no hand-rolled time slicing.
+            result = original_execute_model(
+                self, scheduler_output, *args, **kwargs)
+            model_output = result.result() if isinstance(result, Future) else result
+
+            deferred: Future = Future()
+            _span = simulated_gpu_span
+            _sout = scheduler_output
+
+            def _consume_gpu_span():
+                try:
+                    time.sleep(_span)
+                    # Real completion timestamp; GPU steps serialise on this
+                    # single-worker pool so stat writes never race the engine
+                    # thread (which only reaches the next step after this
+                    # future resolves).
+                    _finalize_step_stats(_sout, time.time())
+                    deferred.set_result(model_output)
+                except BaseException as exc:  # pragma: no cover
+                    deferred.set_exception(exc)
+
+            cls._gpu_span_pool().submit(_consume_gpu_span)
+            return deferred
+
+        target.execute_model = wrapped_execute_model
+        logger.info("[vLLM Hijack] UniProcExecutor hook installed "
+                    "(GPU prediction at execute_model; BLOCKING span deferred)")

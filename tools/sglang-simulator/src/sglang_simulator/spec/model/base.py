@@ -27,5 +27,10 @@ class ModelInfo:
 
     torch_dtype: Optional[str] = None
 
+    # deepseek v4 model config
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    indexer_head_dim: Optional[int] = None
+
     def is_mla(self) -> bool:
         return self.attention_arch == "MLA"

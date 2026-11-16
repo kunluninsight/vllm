@@ -1,3 +1,5 @@
+from typing import Union
+
 import numpy as np
 from sglang_simulator.simulation.types import RequestStats, SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
@@ -24,9 +26,8 @@ def calc_kv_cache_per_layer_elems(
         return num_kv_heads * model_info.head_dim * 2
 
 
-def estimate_kv_cache_pool_capacity(
-    model: ModelInfo, device: AcceleratorInfo, scheduler_config: SchedulerConfig
-) -> int:
+def profile_device_available_bytes(model: ModelInfo, device: AcceleratorInfo, scheduler_config: SchedulerConfig) -> int:
+
     perf_model = get_perf_model(scheduler_config, model)
     weights = 0
     for op in perf_model.context_ops:
@@ -38,6 +39,15 @@ def estimate_kv_cache_pool_capacity(
         scheduler_config.mem_fraction_static * device.hbm_capacity_gb
         - framework_reserved_mem_gb
     ) * (1 << 30) - weights
+    return int(rest_memory)
+
+
+def estimate_kv_cache_pool_capacity(
+    model: ModelInfo, device: AcceleratorInfo, scheduler_config: SchedulerConfig
+) -> int:
+
+    rest_memory = profile_device_available_bytes(model, device, scheduler_config)
+
     kv_cache_space_per_token = (
         calc_kv_cache_cell_elems(
             model, scheduler_config.tp_size, scheduler_config.pp_size
@@ -47,7 +57,22 @@ def estimate_kv_cache_pool_capacity(
     return int(rest_memory / kv_cache_space_per_token)
 
 
-def calc_metrics(requests: list[RequestStats]) -> dict:
+def calc_metrics(requests: list[Union[RequestStats, dict]]) -> dict:
+    requests = requests.copy()
+    for idx, req in enumerate(requests):
+        if isinstance(req, dict):
+            requests[idx] = RequestStats(
+                gen_token_latencies=req["gen_token_latencies"],
+                queue_start=req["queue_start"],
+                queue_end=req["queue_end"],
+                last_event_time=req["last_event_time"],
+                input_length=req["input_length"],
+                output_length=req["output_length"],
+                final_device_hit_len=req["final_device_hit_len"],
+                final_host_hit_len=req["final_host_hit_len"],
+                final_storage_hit_len=req["final_storage_hit_len"]
+            )
+
     ttfts = []
     tpots = []
     itls = []
@@ -57,13 +82,18 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
     total_output = 0
     completed = 0
     total_reused_tokens = 0
-    total_disk_hit_tokens = 0
+    total_device_hit_tokens = 0
+    total_host_hit_tokens = 0
+    total_storage_hit_tokens = 0
     queue_durs = []
     for req in requests:
         if not req.is_complete():
             continue
         completed += 1
-        ttfts.append(req.gen_token_latencies[0])
+        if req.gen_token_latencies:
+            # Requests finished without any recorded decode step (e.g.
+            # connector-side completion) contribute no TTFT sample.
+            ttfts.append(req.gen_token_latencies[0])
         queue_durs.append(req.queue_end - req.queue_start)
         if len(req.gen_token_latencies) > 1:
             # output length > 1
@@ -73,8 +103,10 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         total_dur_s = max(total_dur_s, req.last_event_time)
         total_input += req.input_length
         total_output += req.output_length
-        total_reused_tokens += req.final_reused_tokens
-        total_disk_hit_tokens += req.prefetch_complete_tokens
+        total_reused_tokens += req.final_device_hit_len
+        total_device_hit_tokens += req.final_device_hit_len - req.final_host_hit_len
+        total_host_hit_tokens += req.final_host_hit_len - req.final_storage_hit_len
+        total_storage_hit_tokens += req.final_storage_hit_len
     return {
         "num_requests": len(requests),
         "completed": completed,
@@ -88,8 +120,14 @@ def calc_metrics(requests: list[RequestStats]) -> dict:
         "prefix_cache_reused_ratio": (
             0 if total_input == 0 else total_reused_tokens / total_input
         ),
-        "disk_prefetch_ratio": (
-            0 if total_input == 0 else total_disk_hit_tokens / total_input
+        "kv_cache_storage_hit_ratio": (
+            0 if total_input == 0 else total_storage_hit_tokens / total_input
+        ),
+        "kv_cache_host_hit_ratio": (
+            0 if total_input == 0 else total_host_hit_tokens / total_input
+        ),
+        "kv_cache_device_hit_ratio": (
+            0 if total_input == 0 else total_device_hit_tokens / total_input
         ),
         "mean_ttft_ms": np.mean(ttfts or 0) * 1000,
         "median_ttft_ms": np.median(ttfts or 0) * 1000,

@@ -22,6 +22,9 @@ class SchedulerConfig:
     # framework backend
     backend_name: str = "sglang"
     backend_version: Optional[str] = None
+    # Logical topology used by the predictor. Physical execution may still
+    # be collapsed to one CPU worker.
+    pcp_size: int = 1
 
     @property
     def attn_tp_size(self) -> int:
@@ -45,14 +48,28 @@ class SimulationMode(Enum):
     OFFLINE = "OFFLINE"
 
 
-@dataclass
+@dataclass(slots=True)
 class RequestStats:
     rid: str = ""
     last_event_time: float = 0.0
     input_length: int = 1
     output_length: int = 1
-    final_reused_tokens: int = 0
-    prefetch_complete_tokens: int = 0
+
+    # Prefix cache stats
+    recv_device_hit_len: int = 0
+    # Device hit length before `get_new_batch_prefill`.
+    # It may decrease if queued requests trigger KV eviction.
+    before_adder_device_hit_len: int = 0
+    final_device_hit_len: int = 0
+    recv_host_hit_len: int = 0  # Host hit length before prefetch
+    final_host_hit_len: int = 0  # Host hit length after prefetch
+    recv_storage_hit_len: int = 0  # Storage hit length at prefetch enqueue
+    final_storage_hit_len: int = 0  # Storage hit length at prefetch end
+    # vLLM v6d cross-node split of final_device_hit_len (0 on sglang backend):
+    # local radix reuse vs external (remote v6d) computed tokens.
+    local_kv_hit_len: int = 0
+    ext_kv_hit_len: int = 0
+
     queue_start: float = -1
     queue_end: float = -1
     created_time: float = -1

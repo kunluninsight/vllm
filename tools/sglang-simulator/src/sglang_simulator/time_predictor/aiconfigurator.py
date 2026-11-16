@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import numpy as np
@@ -29,14 +30,14 @@ from sglang_simulator.utils import get_logger
 
 # Map the common data types to AIConfigurator data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
-    DataType.FP16: GEMMQuantMode.float16,
-    DataType.BF16: GEMMQuantMode.float16,
+    DataType.FP16: GEMMQuantMode.bfloat16,
+    DataType.BF16: GEMMQuantMode.bfloat16,
     DataType.FP8: GEMMQuantMode.fp8_block,
     DataType.INT8: GEMMQuantMode.int8_wo,
     DataType.FP4: GEMMQuantMode.nvfp4,
     DataType.INT4: GEMMQuantMode.int4_wo,
-    DataType.FP16_TENSOR: GEMMQuantMode.float16,
-    DataType.BF16_TENSOR: GEMMQuantMode.float16,
+    DataType.FP16_TENSOR: GEMMQuantMode.bfloat16,
+    DataType.BF16_TENSOR: GEMMQuantMode.bfloat16,
     DataType.FP8_TENSOR: GEMMQuantMode.fp8,
     DataType.INT8_TENSOR: GEMMQuantMode.int8_wo,
     DataType.FP4_TENSOR: GEMMQuantMode.nvfp4,
@@ -44,21 +45,21 @@ MAP_DTYPE_TO_GEMMQuantMode = {
 }
 
 MAP_DTYPE_TO_KVCacheQuantMode = {
-    DataType.FP16: KVCacheQuantMode.float16,
-    DataType.BF16: KVCacheQuantMode.float16,
+    DataType.FP16: KVCacheQuantMode.bfloat16,
+    DataType.BF16: KVCacheQuantMode.bfloat16,
     DataType.FP8: KVCacheQuantMode.fp8,
     DataType.INT8: KVCacheQuantMode.int8,
 }
 
 MAP_DTYPE_TO_FMHAQuantMode = {
-    DataType.FP16: FMHAQuantMode.float16,
-    DataType.BF16: FMHAQuantMode.float16,
+    DataType.FP16: FMHAQuantMode.bfloat16,
+    DataType.BF16: FMHAQuantMode.bfloat16,
     DataType.FP8: FMHAQuantMode.fp8,
 }
 
 MAP_DTYPE_TO_MoEQuantMode = {
-    DataType.FP16: MoEQuantMode.float16,
-    DataType.BF16: MoEQuantMode.float16,
+    DataType.FP16: MoEQuantMode.bfloat16,
+    DataType.BF16: MoEQuantMode.bfloat16,
     DataType.FP8: MoEQuantMode.fp8_block,
     DataType.INT8: MoEQuantMode.fp8,
     DataType.FP4: MoEQuantMode.nvfp4,
@@ -69,6 +70,7 @@ MAP_DTYPE_TO_CommQunatMode = {
     DataType.FP16: CommQuantMode.half,
     DataType.BF16: CommQuantMode.half,
     DataType.FP8: CommQuantMode.fp8,
+    DataType.FP4: CommQuantMode.fp8,  # FIXME
     DataType.INT8: CommQuantMode.int8,
 }
 
@@ -88,16 +90,16 @@ def get_perf_model(
         moe_ep_size=sched_config.moe_ep_size,
         attention_dp_size=sched_config.attn_dp_size,
         gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
-            sched_config.data_type, GEMMQuantMode.float16
+            sched_config.data_type, GEMMQuantMode.bfloat16
         ),
         moe_quant_mode=MAP_DTYPE_TO_MoEQuantMode.get(
-            sched_config.data_type, MoEQuantMode.float16
+            sched_config.data_type, MoEQuantMode.bfloat16
         ),
         kvcache_quant_mode=MAP_DTYPE_TO_KVCacheQuantMode.get(
-            sched_config.kv_cache_data_type, KVCacheQuantMode.float16
+            sched_config.kv_cache_data_type, KVCacheQuantMode.bfloat16
         ),
         fmha_quant_mode=MAP_DTYPE_TO_FMHAQuantMode.get(
-            sched_config.kv_cache_data_type, FMHAQuantMode.float16
+            sched_config.kv_cache_data_type, FMHAQuantMode.bfloat16
         ),
         comm_quant_mode=MAP_DTYPE_TO_CommQunatMode.get(
             sched_config.data_type, CommQuantMode.half
@@ -122,6 +124,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         database_mode: DatabaseMode | str = DatabaseMode.SILICON,
         prefill_scale_factor: float = 1,
         decode_scale_factor: float = 1,
+        prefill_min_latency: float = 0,
         workload_distribution: str = "balanced",
         enable_oom_check: bool = False,
     ):
@@ -129,6 +132,18 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
 
         self.prefill_scale_factor = prefill_scale_factor
         self.decode_scale_factor = decode_scale_factor
+        self.prefill_min_latency = prefill_min_latency
+        self.fixed_step_latency_s = self._get_fixed_step_latency_s()
+        self.enable_oom_check = enable_oom_check
+        self._is_oom = False
+
+        if self.fixed_step_latency_s is not None:
+            logger.info(
+                "AIConfigurator predictor bypassed: fixed step latency = %.6f s",
+                self.fixed_step_latency_s,
+            )
+            self._session = None
+            return
 
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
@@ -147,19 +162,19 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
 
         database.set_default_database_mode(database_mode)
 
-        # --- Replace the original function to support more flexible request input. --- #
+        # # --- Replace the original function to support more flexible request input. --- #
 
-        db_nearest_1d_point_helper = database._nearest_1d_point_helper
+        # db_nearest_1d_point_helper = database._nearest_1d_point_helper
 
-        def wrapped_nearest_1d_point_helper(
-            x: int, values: list[int], inner_only: bool = False
-        ):
-            # Disable the inner_only by default
-            return db_nearest_1d_point_helper(x, values, inner_only)
+        # def wrapped_nearest_1d_point_helper(
+        #     x: int, values: list[int], inner_only: bool = False
+        # ):
+        #     # Disable the inner_only by default
+        #     return db_nearest_1d_point_helper(x, values, inner_only)
 
-        database._nearest_1d_point_helper = wrapped_nearest_1d_point_helper
+        # database._nearest_1d_point_helper = wrapped_nearest_1d_point_helper
 
-        # --- End --- #
+        # # --- End --- #
 
         self._session = InferenceSession(
             model=get_perf_model(config, model, workload_distribution),
@@ -168,7 +183,28 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         )
 
         self.enable_oom_check = enable_oom_check
-        self._is_oom = False
+
+    def _get_fixed_step_latency_s(self) -> Optional[float]:
+        value = os.environ.get("SGLANG_SIMULATOR_FIXED_STEP_LATENCY_MS")
+        if value is None or value == "":
+            return None
+        try:
+            latency_ms = float(value)
+        except ValueError:
+            logger.warning(
+                "Invalid SGLANG_SIMULATOR_FIXED_STEP_LATENCY_MS=%r, "
+                "falling back to AIConfigurator predictor.",
+                value,
+            )
+            return None
+        if latency_ms < 0:
+            logger.warning(
+                "Invalid SGLANG_SIMULATOR_FIXED_STEP_LATENCY_MS=%r: "
+                "latency must be non-negative, falling back to AIConfigurator predictor.",
+                value,
+            )
+            return None
+        return latency_ms / 1e3
 
     def _get_database_mode(self, mode: str) -> DatabaseMode:
         return {
@@ -207,12 +243,13 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
                 latency_dict = summary.get_generation_latency_dict()
             else:
                 # faster path
-                _, _, latency_dict, _ = self._session._backend._run_static_breakdown(
+                results = self._session._backend._run_static_breakdown(
                     self._session._model,
                     self._session._database,
                     runtime_config,
                     mode="static_gen",
                 )
+                latency_dict = results[2]
         else:
             # Prefill: output sequence length (osl) = 1, input sequence length (isl) = mean(past_kv + input), prefix = mean(past_kv)
             mean_past = np.mean([req.past_kv_length for req in batch.reqs])
@@ -244,15 +281,19 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
                 latency_dict = summary.get_context_latency_dict()
             else:
                 # faster path
-                latency_dict, _, _, _ = self._session._backend._run_static_breakdown(
+                results = self._session._backend._run_static_breakdown(
                     self._session._model,
                     self._session._database,
                     runtime_config,
                     mode="static_ctx",
                 )
+                latency_dict = results[0]
         return latency_dict
 
     def predict_infer_time(self, batch: ScheduleBatch) -> float:
+        if self.fixed_step_latency_s is not None:
+            return self.fixed_step_latency_s
+
         latency_dict = self.predict_infer_latency_dict(batch)
         infer_time = sum(latency_dict.values())
 
@@ -263,4 +304,12 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             infer_time *= self.decode_scale_factor
         else:
             infer_time *= self.prefill_scale_factor
+
+        if not batch.is_decode():
+            infer_time = (
+                max(infer_time, self.prefill_min_latency)
+                if infer_time > 0
+                else infer_time
+            )
+
         return infer_time / 1e3

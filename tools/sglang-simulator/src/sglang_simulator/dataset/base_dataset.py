@@ -5,13 +5,15 @@ from sglang_simulator.dataset.dataset_args import DatasetArgs
 from transformers import PreTrainedTokenizerBase
 
 
-@dataclass
+@dataclass(slots=True)
 class GenericRequest:
     prompt: Optional[str] = None
     token_ids: Optional[list[int]] = None
     input_length: int = -1
     output_length: int = -1
     custom_params: dict = field(default_factory=dict)
+    # Extra args used as API request parameters when sending the request
+    extra_args: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.prompt is None and self.token_ids is None:

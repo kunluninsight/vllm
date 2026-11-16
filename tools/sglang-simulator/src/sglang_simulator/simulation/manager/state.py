@@ -5,6 +5,8 @@ class StateManager:
     _current_inference_dur: float = 0
     _hicache_l2_load_dur: float = 0
     _hicache_l2_backup_dur: float = 0
+    _last_real_time_ts: float = 0
+    _last_flush_time_ts: float = 0
 
     @classmethod
     def reset(cls):
@@ -14,6 +16,7 @@ class StateManager:
         cls._current_inference_dur = 0
         cls._hicache_l2_backup_dur = 0
         cls._hicache_l2_load_dur = 0
+        cls._last_real_time_ts = 0
 
     @classmethod
     def inc_iteration(cls) -> None:
@@ -67,3 +70,19 @@ class StateManager:
     @classmethod
     def get_current_inference_dur(cls) -> float:
         return cls._current_inference_dur
+
+    @classmethod
+    def set_last_real_time_ts(cls, ts):
+        cls._last_real_time_ts = ts
+
+    @classmethod
+    def get_last_real_time_ts(cls):
+        return cls._last_real_time_ts
+
+    @classmethod
+    def set_last_flush_time_ts(cls, ts: float):
+        cls._last_flush_time_ts = ts
+
+    @classmethod
+    def get_last_flush_time_ts(cls) -> float:
+        return cls._last_flush_time_ts

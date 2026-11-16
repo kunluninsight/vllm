@@ -1,9 +1,10 @@
 from queue import Empty
 from typing import Optional
+from queue import Queue
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
-from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
+from sglang_simulator.simulation.req_stats_manager import request_stats_manager
 
 
 class C_HiCacheController(BaseHook):
@@ -27,6 +28,15 @@ class C_HiCacheController(BaseHook):
 
     @classmethod
     def hook(cls, target):
+
+        original_terminate_prefetch = target.terminate_prefetch
+        original_storage_hit_query = target._storage_hit_query
+        original_init = target.__init__
+
+        def wrapped_init(self, *args, **kwargs):
+            self.sim_prefetch_buffer = Queue()
+            return original_init(self, *args, **kwargs)
+
         def override_backup_thread_func(self, *args, **kwargs):
             # Async thread: perform no action
             # The action will be performed by `handle_backup_operation`
@@ -54,6 +64,7 @@ class C_HiCacheController(BaseHook):
                 except Empty:
                     return
 
+
         def handle_prefetch_operation(self):
             if not self.enable_storage:
                 return
@@ -68,41 +79,19 @@ class C_HiCacheController(BaseHook):
             # TODO: Overlap schedule
             remain_dur = StateManager.get_current_inference_dur()
 
-            chunked_prefetch_operation = getattr(
-                self, "chunked_prefetch_operation", None
-            )
-            if chunked_prefetch_operation is not None:
-                operation = chunked_prefetch_operation["operation"]
-                storage_hit_count = chunked_prefetch_operation["storage_hit_count"]
-                completed_tokens, prefetch_dur = (
-                    C_HiCacheController.calc_prefetch_pages(
-                        (storage_hit_count - operation.completed_tokens),
-                        C_HiCacheController.KV_CACHE_BYTES,
-                        remain_dur,
-                        C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
-                    )
-                )
-                if completed_tokens < storage_hit_count - operation.completed_tokens:
-                    operation.completed_tokens += completed_tokens
-                    remain_dur = 0
-                else:
-                    operation.completed_tokens = int(storage_hit_count)
-                    operation.mark_terminate()
-                    remain_dur -= prefetch_dur
-                    setattr(self, "chunked_prefetch_operation", None)
-                    # Release host memory after current operation is finished
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
-                # update request states
-                req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
-                req_stats.prefetch_complete_tokens = operation.completed_tokens
-
-            while remain_dur > 0:
+            # Process all operations in the prefetch_queue: place those meeting
+            # the prefetch criteria into the sim_prefetch_buffer, and release the
+            # remaining operations along with any excess memory they have allocated.
+            while not self.prefetch_queue.empty():
                 try:
                     operation = self.prefetch_queue.get(block=False)
                     if operation is None:
-                        return
+                        break
+
+                    # Ignore terminated operation
+                    if operation._terminated_flag:
+                        self.append_host_mem_release(operation.host_indices)
+                        continue
 
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
                     # not to prefetch if not enough benefits
@@ -113,14 +102,74 @@ class C_HiCacheController(BaseHook):
                         operation.mark_terminate()
                         self.append_host_mem_release(operation.host_indices)
                         continue
+                    else:
+                        operation.hash_value = hash_value[
+                            : (storage_hit_count // self.page_size)
+                        ]
+                        storage_hit_count = (
+                            storage_hit_count // self.page_size * self.page_size
+                        )
+                        # free the pre-allocated memory for pages that are not hit
+                        self.append_host_mem_release(
+                            operation.host_indices[storage_hit_count:]
+                        )
+                        operation.host_indices = operation.host_indices[:storage_hit_count]
+                        self.sim_prefetch_buffer.put(operation)
+                except Empty:
+                    break
 
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    storage_hit_count = (
-                        storage_hit_count // self.page_size * self.page_size
+            # handle operation which not yet fully prefetched
+            chunked_prefetch_operation = getattr(
+                self, "chunked_prefetch_operation", None
+            )
+            if chunked_prefetch_operation is not None:
+                operation = chunked_prefetch_operation["operation"]
+                if operation._terminated_flag:
+                    setattr(self, "chunked_prefetch_operation", None)
+                    self.append_host_mem_release(
+                        operation.host_indices[int(operation.completed_tokens) :]
                     )
+                else:
+                    storage_hit_count = chunked_prefetch_operation["storage_hit_count"]
+                    completed_tokens, prefetch_dur = (
+                        C_HiCacheController.calc_prefetch_pages(
+                            (storage_hit_count - operation.completed_tokens),
+                            C_HiCacheController.KV_CACHE_BYTES,
+                            remain_dur,
+                            C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
+                        )
+                    )
+                    if (
+                        completed_tokens
+                        < storage_hit_count - operation.completed_tokens
+                    ):
+                        operation.completed_tokens += completed_tokens
+                        remain_dur = 0
+                    else:
+                        operation.completed_tokens = int(storage_hit_count)
+                        operation.mark_terminate()
+                        remain_dur -= prefetch_dur
+                        setattr(self, "chunked_prefetch_operation", None)
+                        # Release host memory after current operation is finished
+                        self.append_host_mem_release(
+                            operation.host_indices[storage_hit_count:]
+                        )
 
+            # handle operation in sim_prefetch_buffer
+            while remain_dur > 0:
+                try:
+                    operation = self.sim_prefetch_buffer.get(block=False)
+                    if operation is None:
+                        return
+
+                    # Ignore terminated operation
+                    if operation._terminated_flag:
+                        self.append_host_mem_release(
+                            operation.host_indices[int(operation.completed_tokens) :]
+                        )
+                        continue
+
+                    storage_hit_count = len(operation.host_indices)
                     completed_tokens, prefetch_dur = (
                         C_HiCacheController.calc_prefetch_pages(
                             storage_hit_count,
@@ -148,13 +197,6 @@ class C_HiCacheController(BaseHook):
                         # TODO: Track the prefetch operation according to the global clock
                         operation.mark_terminate()
                         remain_dur -= prefetch_dur
-                    # update request states
-                    req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
-                    req_stats.prefetch_complete_tokens = operation.completed_tokens
-                    # Release host memory after current operation is finished
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
 
                 except Empty:
                     return
@@ -169,8 +211,27 @@ class C_HiCacheController(BaseHook):
             ]
             return self.storage_backend.batch_set(hash_values, data, extra_info)
 
+        def wrapped_terminate_prefetch(self, operator):
+            result = original_terminate_prefetch(self, operator)
+            # This value may be a float if prefetch progress is interrupted by HiRadixCache.check_prefetch_progress.
+            result = (int(result[0]), result[1])
+            # operation.completed_tokens, operation.hash_value = result
+            req_stats = request_stats_manager.get_req_stats(operator.request_id)
+            req_stats.final_storage_hit_len = result[0]
+            return result
+
+        def wrapped_storage_hit_query(self, operator):
+            result = original_storage_hit_query(self, operator)
+            # hash_value, storage_query_count = result
+            req_stats = request_stats_manager.get_req_stats(operator.request_id)
+            req_stats.recv_storage_hit_len = result[1]
+            return result
+
+        target.__init__ = wrapped_init
         target.prefetch_thread_func = override_prefetch_thread_func
         target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
         target.handle_prefetch_operation = handle_prefetch_operation
         target._generic_page_set = override_generic_page_set
+        target.terminate_prefetch = wrapped_terminate_prefetch
+        target.storage_hit_query = wrapped_storage_hit_query

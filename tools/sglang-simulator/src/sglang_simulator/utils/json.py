@@ -1,5 +1,4 @@
 import json
-from array import array
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 
@@ -18,9 +17,6 @@ class CustomJsonEncoder(json.JSONEncoder):
         if isinstance(obj, (np.int32, np.int64, np.float32, np.float64)):
             return int(obj) if isinstance(obj, (np.int32, np.int64)) else float(obj)
         if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        # Array
-        if isinstance(obj, array):
             return obj.tolist()
         # Other
         return super().default(obj)
