@@ -20,3 +20,31 @@ configuration, local V6D isolation, and online deployments are not changed here.
 
 Validation reuses the R2 CPU integration test and targeted request/native boundary
 checks. CPU validation does not establish TPU timing accuracy or DRAM hit accuracy.
+
+
+## Live source comparison
+
+The colleague's revision 22 container and the personal simulator each contained
+102 Python source files. Direct text comparison found only the personal changes
+in `simulation/vllm/tpu_pp/stage_runtime.py`. Relative to the original R2 artifact,
+both deployments also patch `simulation/vllm/engine_args.py` to preserve native
+`create_engine_config` for DashLLM's PCP source inspection/backport, and patch
+stage_runtime to preserve connector-state queue entries, seed the native stepper,
+and apply the configured Prefill handoff delay. These existing live fixes are now
+part of the source tree rather than installer-time text edits.
+
+Combining the two distributions exposed a recorder-selection bug: directory
+presence incorrectly selected the real collector even in simulator mode. Recorder
+selection now follows SIM_COLLECTOR_ENABLE, preserving the simulator frontend ID
+and first-output events when the collector package is also installed.
+
+Do not point the old runtime bootstrap at the integrated wheel unchanged: the old
+bootstrap applies the same source patches and validates their old preimages. A
+future deployment should install this wheel directly and remove those duplicate
+patch blocks. This change does not deploy or claim a new timing improvement.
+
+Validation: 85 tests and 73 subtests passed using the existing vLLM 98dff2a source
+and CPU container. The integration case completed 26 requests and checked prefix
+reuse, abort, profiler drain/reset, request lifecycle export, and all four ranks'
+barrier timestamps. Existing connector-state queue and timing environment values
+were enabled (78.861 ms initial measured, 8.185 ms Prefill handoff).

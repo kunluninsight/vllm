@@ -14,6 +14,7 @@ ModelRunnerOutput 与 KV connector 簿记仍由内层 UniProcExecutor 同步产�
 
 import dataclasses
 import hashlib
+import math
 import multiprocessing as mp
 import os
 import threading
@@ -118,7 +119,9 @@ def _make_wave_class(base):
                 self.transport_burst, self.transport_index = self.bursts, 0
             key = (self.bursts, self.transport_index)
             self.transport_index += 1
+            drain_start_at = time.monotonic()
             Descriptor(ready_at=self.device_ready).wait()
+            enter_at = time.monotonic()
             self.barrier.wait(timeout=_BARRIER_TIMEOUT_S)
             self.last_barrier_release = time.monotonic()
             incoming_pipe, outgoing_pipe = self.payloads
@@ -128,6 +131,14 @@ def _make_wave_class(base):
                 raise AssertionError(
                     f"launch mismatch: expected {key}, received {incoming_key}")
             ready = time.monotonic() + self.communication_s
+            self.event(
+                "handoff_barrier", burst=key[0], transport_index=key[1],
+                drain_start_at=drain_start_at, device_ready_at=self.device_ready,
+                enter_at=enter_at, exit_at=self.last_barrier_release,
+                outgoing_step_id=carried[0].step_id if carried else None,
+                incoming_step_id=incoming[0].step_id if incoming else None,
+            )
+
             return tuple(dataclasses.replace(d, ready_at=ready) for d in incoming)
 
     return CpuWave
@@ -140,6 +151,9 @@ def worker_main(rank, cfg, control, reply, barrier, payloads, events):
     emit_hook_event("STAGE_READY", stage=rank, stages=cfg.stages, status="ready",
                     model_loaded=isinstance(model, StageModel))
     reply.send((0, True, {"ready": rank, "pid": os.getpid()}))
+    # Personal test4 calibration: residual from forward entry to the native drain/output boundary.
+    # Rows are global PCP padding, columns are P0..P3; all values in milliseconds.
+    warm_offsets_ms = {2048: (5, 3, 2, -1), 4096: (4, 5, 3, 4), 8192: (1, 3, 6, 0)}
     pending = None
     try:
         while True:
@@ -170,6 +184,9 @@ def worker_main(rank, cfg, control, reply, barrier, payloads, events):
                     if rank == cfg.stages - 1:
                         features = {**features, **payload.tail}
                     duration = model.predict(features)
+                    offsets = warm_offsets_ms.get(features["global_padded_tokens"])
+                    if offsets is not None:
+                        duration = max(0.0, duration + offsets[rank] / 1000)
                     if not 0 <= duration < 60:
                         raise ValueError(f"invalid stage prediction {duration}")
                     # 起点已包含本次模型查询，不再额外叠加预测器 CPU 耗时
@@ -245,6 +262,7 @@ class VirtualPPExecutor:
 
     def __init__(self, inner, predictor, stages: int, on_step_done=None, lifecycle=None):
         self.inner = inner
+        self.emulate_connector_queue = os.environ.get("HISIM_TPU_PP_EMULATE_CONNECTOR_QUEUE") == "1"
         self.lifecycle = lifecycle
         self._on_step_done = on_step_done
         self._req_info: dict[str, tuple] = {}
@@ -353,6 +371,11 @@ class VirtualPPExecutor:
     def _stage_rpc(self, method, arg, all_ranks: bool, value):
         self._next_call += 1
         call_id = self._next_call
+        if method in ("pp_push", "pp_settle"):
+            self._emit_lifecycle("pp.control_rpc", method=method, call_id=call_id,
+                                 pp_step_id=self._next_step, dispatched_at=time.monotonic())
+        if self.emulate_connector_queue and method in ("execute_model", "sample_tokens"):
+            all_ranks = True
         ranks = range(self.stages) if all_ranks else (self.output_rank,)
         for rank, conn in enumerate(self._commands):
             conn.send((call_id, method, arg, rank in ranks))
@@ -447,6 +470,11 @@ class VirtualPPExecutor:
         self.step_records[step_id] = dict(
             step_id=step_id, dispatched_at=dispatched,
             num_reqs=len(spans), num_tokens=tokens,
+            completes_prefill=any(
+                span.prompt_tokens is not None
+                and span.past_kv_length < span.prompt_tokens
+                <= span.past_kv_length + span.extend_length
+                for span in spans),
             spans=[(s.extend_length, s.past_kv_length) for s in spans])
         if self.lifecycle is not None:
             self.step_records[step_id].update(
@@ -551,7 +579,79 @@ class VirtualPPExecutor:
 
 
 def create_stepper(core, executor):
-    native_stepper = executor.native.LazyPushStepper
+    def calibrated_seconds(name):
+        value = float(os.environ.get(name, "0"))
+        if not math.isfinite(value) or not 0 <= value <= 2000:
+            raise ValueError(f"{name} must be a finite value in [0, 2000] ms")
+        return value / 1000.0
+
+    class ObservedStepper(executor.native.LazyPushStepper):
+        def __init__(self, engine_core):
+            super().__init__(engine_core)
+            seed = calibrated_seconds("HISIM_TPU_PP_INITIAL_MEASURED_MS")
+            self.prefill_handoff_s = calibrated_seconds("HISIM_TPU_PP_PREFILL_HANDOFF_MS")
+            if self.modelled is None:
+                self.measured = seed
+            if executor.emulate_connector_queue:
+                native = executor.native.namespace
+                carries_state = native["_carries_state"]
+
+                def carries_connector_state(output):
+                    if carries_state(output):
+                        return True
+                    # The live scheduler attaches connector metadata to empty steps.
+                    # The CPU executor has no remote KV state, but must retain these
+                    # steps in the native reply queue while an active burst drains.
+                    active = self.wave.open and self._real_in_flight() > 0
+                    if active:
+                        executor._emit_lifecycle(
+                            "pp.connector_state_rpc", in_flight=len(self.in_flight),
+                            real_in_flight=self._real_in_flight())
+                    return active
+
+                native["_carries_state"] = carries_connector_state
+            executor._emit_lifecycle("pp.lazy_initial_state", measured_s=self.measured,
+                                     has_native_model=self.modelled is not None,
+                                     prefill_handoff_s=self.prefill_handoff_s)
+
+        def _finished(self, step):
+            if not super()._finished(step):
+                return False
+            if (not self.prefill_handoff_s or step.slot is None
+                    or not step.future.done() or step.future.cancelled()
+                    or step.future.exception() is not None):
+                return True
+            step_id = getattr(step.scheduler_output, "_sim_tpu_pp_step_id", None)
+            record = executor.step_records.get(step_id, {})
+            ready = record.get("sample_ready_at")
+            if ready is None or not record.get("completes_prefill"):
+                return True
+            now = time.monotonic()
+            if now < ready + self.prefill_handoff_s:
+                return False
+            executor._emit_lifecycle("pp.prefill_handoff", pp_step_id=step_id,
+                                     step_id=record.get("lifecycle_step_id"),
+                                     sample_ready_at=ready, scheduler_eligible_at=now,
+                                     target_delay_s=self.prefill_handoff_s)
+            return True
+
+        def _push(self):
+            executor._emit_lifecycle("pp.lazy_push", pp_step_id=executor._next_step,
+                                     measured_s=self.measured,
+                                     slot_expected_s=[slot.expected for slot in self.slots])
+            return super()._push()
+
+        def _sampled(self, slot):
+            before = self.measured
+            valid = slot.started_last is not None and slot.started_drain != self.drains
+            result = super()._sampled(slot)
+            executor._emit_lifecycle("pp.lazy_sample_feedback", dispatched_at=slot.dispatched,
+                                     last_stage_started_at=slot.started_last,
+                                     observed_at=time.monotonic(), valid=valid,
+                                     measured_before_s=before, measured_after_s=self.measured)
+            return result
+
+    native_stepper = ObservedStepper
     if hasattr(core, "capture_iteration_details"):
         return native_stepper(core)
 

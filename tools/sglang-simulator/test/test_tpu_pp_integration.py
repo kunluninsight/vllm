@@ -46,8 +46,8 @@ def test_real_engine_core_pp_lifecycle(tmp_path):
     assert all(event["ppid"] == engine_ready["pid"] for event in stages)
     configs = [event for tag, event in events if tag == "HISIM_ENGINE_CONFIG"]
     assert {event["stage"] for event in configs} >= {
-        "engine_args_input", "engine_args", "create_engine_config", "engine_core"}
-    created = next(event for event in configs if event["stage"] == "create_engine_config")
+        "engine_args_input", "engine_args", "engine_core"}
+    created = next(event for event in configs if event["stage"] == "engine_core")
     assert (worker_ready[0]["delegated_worker_module"] + "." +
             worker_ready[0]["delegated_worker_class"]) == created["worker_cls"]
     reports = [event for tag, event in events if tag == "HISIM_HOOK_REPORT"
@@ -204,6 +204,9 @@ def _exercise(root):
         computes = [e for e in exported["tpu_pp_stage_events.jsonl"] if e["kind"] == "compute"]
         assert len(computes) == 4 * len(records)
         assert not [e for e in exported["tpu_pp_stage_events.jsonl"] if e["kind"] == "worker_error"]
+        barriers = [e for e in exported["tpu_pp_stage_events.jsonl"] if e["kind"] == "handoff_barrier"]
+        assert {e["stage"] for e in barriers} == {0, 1, 2, 3}
+        assert all(e["drain_start_at"] <= e["enter_at"] <= e["exit_at"] for e in barriers)
         lifecycle_checks = {}
         if lifecycle_status["enabled"]:
             from sglang_simulator.simulation.vllm.lifecycle import request_key

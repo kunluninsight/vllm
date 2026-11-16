@@ -39,3 +39,21 @@ def test_conflicting_modes_stop_before_hook_installation(monkeypatch):
     monkeypatch.setenv("SGLANG_SIMULATOR_ENABLE", "1")
     with pytest.raises(SystemExit, match="cannot run in the same interpreter"):
         runpy.run_path(str(BOOTSTRAP))
+
+
+def test_sim_frontend_recorder_with_collector_also_installed(tmp_path, monkeypatch):
+    import os
+    import subprocess
+
+    env = dict(os.environ, SIM_COLLECTOR_ENABLE="0", SGLANG_SIMULATOR_ENABLE="0",
+               HISIM_LIFECYCLE_ENABLE="1", SGLANG_SIMULATOR_LIFECYCLE_DIR=str(tmp_path))
+    result = subprocess.run([sys.executable, "-c", """
+from pathlib import Path
+from sglang_simulator import request_boundaries as b
+assert (Path(b.__file__).parent / 'collector').is_dir()
+b._emit('test.frontend', marker=1)
+assert b._SIM_RECORDER is not None and b._SIM_RECORDER.flush()
+assert b._TRACE is None
+b._close_sim()
+"""], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr

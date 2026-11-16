@@ -14,7 +14,8 @@ from pathlib import Path
 from sglang_simulator.hook import BaseHook
 
 
-_COLLECTOR_SIDE = (Path(__file__).parent / "collector").is_dir()
+# Both implementations ship together; select by activation, not directory presence.
+_COLLECTOR_SIDE = os.getenv("SIM_COLLECTOR_ENABLE", "").lower() in ("1", "true", "yes", "on")
 _SIM_RECORDER = None
 _SIM_INITIALIZED = False
 _SIM_LOCK = threading.Lock()

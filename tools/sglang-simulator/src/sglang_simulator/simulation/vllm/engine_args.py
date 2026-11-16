@@ -8,8 +8,6 @@ The actual parallelism is captured in the simulator's scheduler config
 """
 
 import os
-import sys
-from functools import wraps
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.class_hook_entry import emit_hook_event
@@ -27,7 +25,6 @@ class C_VLLMEngineArgsHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_post_init = target.__post_init__
-        original_create_engine_config = target.create_engine_config
 
         def wrapped_post_init(self):
             emit_hook_event(
@@ -109,18 +106,5 @@ class C_VLLMEngineArgsHook(BaseHook):
                 self.pipeline_parallel_size,
             )
 
-        @wraps(original_create_engine_config)
-        def wrapped_create_engine_config(self, *args, **kwargs):
-            config = original_create_engine_config(self, *args, **kwargs)
-            parallel = config.parallel_config
-            platform = getattr(sys.modules.get("vllm.platforms"), "current_platform", None)
-            emit_hook_event(
-                "ENGINE_CONFIG", stage="create_engine_config",
-                platform=type(platform).__module__ + "." + type(platform).__qualname__,
-                backend=parallel.distributed_executor_backend, worker_cls=parallel.worker_cls,
-                tp=parallel.tensor_parallel_size, pp=parallel.pipeline_parallel_size,
-            )
-            return config
-
+        # DashLLM must inspect the native method for its PCP compatibility backport.
         target.__post_init__ = wrapped_post_init
-        target.create_engine_config = wrapped_create_engine_config
