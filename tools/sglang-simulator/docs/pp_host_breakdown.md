@@ -85,3 +85,9 @@ Test4 2026-11-17 h24 C64: 96 measured rounds had minimum rank barrier duration
 3.367/3.442 ms. A 1.3 ms extra barrier budget is a phase-based candidate, not
 a fitted request TTFT offset. These are representative-rank local-clock
 intervals, not pure network latency. Validate on new traffic before acceptance.
+
+## Scheduler CPU phase observation
+
+The 2026-11-17 C64 comparison observed 17.34 ms real versus 5.78 ms simulated native schedule calls. Existing cache lookup/allocation/external-match spans cover only 2.19 ms of a 17.05 ms real sample; these differences are not themselves added latency targets.
+
+`scheduler.native_phase` records `_build_kv_connector_meta`, nested connector `build_connector_meta`, `_make_cached_request_data`, and `_update_after_schedule` using local monotonic clocks. Only batches with a known positive scheduled-token count produce timing events. Empty polls retain their native path. Nested spans are inclusive and must be unioned, not summed. This observation does not introduce model waits or change scheduling, cache, or transfer behavior.

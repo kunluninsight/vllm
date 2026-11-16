@@ -13,6 +13,10 @@ from functools import wraps
 _INSTALLATIONS = "_hisim_cache_boundary_installations"
 _UNKNOWN = "unknown"
 _CPU_CONTAINERS = (tuple, list, set, frozenset)
+_BATCH_PHASE_METHODS = frozenset({
+    "_build_kv_connector_meta", "build_connector_meta",
+    "_make_cached_request_data", "_update_after_schedule",
+})
 _COUNT_ARGS = (
     "num_new_tokens", "num_new_computed_tokens", "num_lookahead_tokens",
     "num_external_computed_tokens", "num_encoder_tokens", "num_computed_tokens",
@@ -110,6 +114,17 @@ def _signals(owner, output):
     return records
 
 
+def _batch_phase_tokens(method, args, kwargs):
+    if method == "_make_cached_request_data":
+        counts = _argument(args, kwargs, 2, "num_scheduled_tokens")
+        if type(counts) is dict and all(type(v) is int for v in counts.values()):
+            return sum(counts.values())
+        return None
+    index = 1 if method == "_build_kv_connector_meta" else 0
+    output = _argument(args, kwargs, index, "scheduler_output")
+    return _integer(_attr(output, "total_num_scheduled_tokens"))
+
+
 def _before(owner, method, signature, args, kwargs):
     if method == "_update_from_kv_xfer_finished":
         output = _argument(args, kwargs, 0, "kv_connector_output")
@@ -182,6 +197,12 @@ def _emit_signals(owner, emit, source, records, start, end, ok, error_type):
 def _after(owner, emit, method, source, before, result, start, end, ok,
            error_type):
     before = before or {}
+    if method in _BATCH_PHASE_METHODS:
+        row = _row(source, None, None, start, end, ok, error_type)
+        row.update(phase=method, batch_shared=True,
+                   total_num_scheduled_tokens=before["total_num_scheduled_tokens"])
+        emit("scheduler.native_phase", **row)
+        return
     if method == "_update_from_kv_xfer_finished":
         _emit_signals(owner, emit, source, before.get("signals", ()),
                       start, end, ok, error_type)
@@ -249,8 +270,16 @@ def _after(owner, emit, method, source, before, result, start, end, ok,
 def _wrap(owner, original, method, source, signature, emit, observe):
     @wraps(original)
     def wrapped(*args, **kwargs):
-        before = _observe(observe, lambda: _before(
-            owner, method, signature, args, kwargs))
+        if method in _BATCH_PHASE_METHODS:
+            tokens = _observe(observe, lambda: _batch_phase_tokens(method, args, kwargs))
+            # Empty connector polls are frequent while a PP burst is in flight.
+            # Do not add timing/event work to that hot path.
+            if tokens is None or tokens <= 0:
+                return original(*args, **kwargs)
+            before = {"total_num_scheduled_tokens": tokens}
+        else:
+            before = _observe(observe, lambda: _before(
+                owner, method, signature, args, kwargs))
         start = _observe(observe, time.monotonic_ns)
         try:
             result = original(*args, **kwargs)
@@ -332,15 +361,21 @@ def install_connector(connector, emit, observe):
         _observe(observe, lambda: _install_v6d_query(scheduler, emit, observe))
     return _install(connector, "connector", (
         "get_num_new_matched_tokens", "update_state_after_alloc", "get_finished",
+        "build_connector_meta",
     ), emit, observe)
 
 
 def install_scheduler_transitions(scheduler, emit, observe):
     """Distinguish failed-recv recovery/promotion from mere transfer signals."""
-    return _install(scheduler, "scheduler_transitions", (
+    report = _install(scheduler, "scheduler_transitions", (
         "_try_promote_blocked_waiting_request", "_preempt_request",
         "_update_from_kv_xfer_finished",
     ), emit, observe)
+    _install(scheduler, "scheduler_phases", (
+        "_build_kv_connector_meta", "_make_cached_request_data",
+        "_update_after_schedule",
+    ), emit, observe)
+    return report
 
 
 def _install_v6d_query(scheduler, emit, observe):
