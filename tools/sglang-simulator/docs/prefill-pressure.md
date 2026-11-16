@@ -32,3 +32,7 @@ deadline/drain behavior. Synthetic query timeline yielded 10 ms start wait,
 20 ms execution, 50 ms scheduler-consumption wait and 20 ms uncovered, preserving
 zero hits. Live integration remains a separate gate; prepared scripts are not
 experiment results.
+
+### CPU transport admission follow-up (2026-11-16)
+
+The 803804c live 16-request check still executed N tokens instead of the real producer's N-1: native on_new_request only truncates when Stage-3 transport is enabled. The local CPU connector now derives the truncation requirement from native Mamba/window cache specs and calls the native idempotent truncation helper after admission. It keeps frontend token accounting independent and does not enable a Decode peer or Stage-3 transfer. Seven regression cases cover CPU transport, existing native truncation, one-token prompts, full-attention prompts, remote-parameter rejection and non-local consumers. Live token-extent validation remains required.

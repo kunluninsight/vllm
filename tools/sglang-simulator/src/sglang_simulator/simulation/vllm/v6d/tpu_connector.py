@@ -86,6 +86,16 @@ class C_TPURaidenConnectorHook(BaseHook):
             original_init(self, vllm_config, role, kv_cache_config)
             self._sim_local_raiden = local
             self._sim_raiden_num_groups = len(groups)
+            if local:
+                from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+                    MambaSpec,
+                    _stage3_group_window_tokens,
+                )
+                self._sim_raiden_truncates_prompt = any(
+                    isinstance(group.kv_cache_spec, MambaSpec)
+                    or _stage3_group_window_tokens(group.kv_cache_spec)
+                    for group in groups
+                )
             if local and self.connector_scheduler is not None:
                 logger.info(
                     "[Raiden CPU] local-only producer enabled: kv_groups=%d; "
@@ -115,7 +125,11 @@ class C_TPURaidenConnectorHook(BaseHook):
             # In-process simulation shares this list with frontend accounting.
             if request.prompt_token_ids is not None:
                 request.prompt_token_ids = list(request.prompt_token_ids)
-            return original_admit(self, request)
+            result = original_admit(self, request)
+            if self._sim_raiden_truncates_prompt:
+                # CPU transport skips Stage-3 setup; preserve its native Prefill extent.
+                self.connector_scheduler._maybe_truncate_prompt_for_handoff(request)
+            return result
 
         def matched(self, request, num_computed_tokens):
             if not self._sim_local_raiden:
