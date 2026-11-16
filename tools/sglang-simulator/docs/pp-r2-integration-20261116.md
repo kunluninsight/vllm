@@ -48,3 +48,7 @@ and CPU container. The integration case completed 26 requests and checked prefix
 reuse, abort, profiler drain/reset, request lifecycle export, and all four ranks'
 barrier timestamps. Existing connector-state queue and timing environment values
 were enabled (78.861 ms initial measured, 8.185 ms Prefill handoff).
+
+## V6D query observation
+
+The personal Aone branch adds per-request/generation coroutine creation, background start/end and scheduler result-consumption events. Creation is immediately before native runtime.submit, not a wire timestamp. The query execution span includes native cross-group lookup/fetch; it is not automatically KVCM service time. Native errors and cancellation propagate unchanged. Shared instance observers recurse through MultiConnector children on real and simulated schedulers. Validation: 18 focused tests passed, including delayed execution/consumption and failed observer cases. No latency model changes in this commit.

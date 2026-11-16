@@ -325,6 +325,11 @@ def install_cache_manager(manager, emit, observe):
 
 def install_connector(connector, emit, observe):
     """Observe only naturally invoked connector methods, never poll proactively."""
+    for child in _attr(connector, "_connectors") or ():
+        _observe(observe, lambda child=child: install_connector(child, emit, observe))
+    scheduler = _attr(connector, "scheduler")
+    if callable(_attr(scheduler, "_async_match")):
+        _observe(observe, lambda: _install_v6d_query(scheduler, emit, observe))
     return _install(connector, "connector", (
         "get_num_new_matched_tokens", "update_state_after_alloc", "get_finished",
     ), emit, observe)
@@ -336,3 +341,73 @@ def install_scheduler_transitions(scheduler, emit, observe):
         "_try_promote_blocked_waiting_request", "_preempt_request",
         "_update_from_kv_xfer_finished",
     ), emit, observe)
+
+
+def _install_v6d_query(scheduler, emit, observe):
+    """Keep coroutine creation, background execution and native consumption apart."""
+    if getattr(scheduler, "_hisim_query_observed", False):
+        return
+    original = scheduler._async_match
+    consume = scheduler._commit_async_match
+
+    def record(event, request_id, generation, **fields):
+        _observe(observe, lambda: emit(
+            event, request_id_sha256=_request_hash(request_id),
+            generation=generation, source="V6dObjectConnectorScheduler",
+            time_kind="host_native_call", device_completion_confirmed=False,
+            **fields))
+
+    @wraps(original)
+    def submitted(*args, **kwargs):
+        # Native code creates this coroutine immediately before runtime.submit.
+        created = time.monotonic_ns()
+        rid = _argument(args, kwargs, 0, "request_id")
+        generation = _argument(args, kwargs, 1, "generation")
+        native = original(*args, **kwargs)
+        record("request.v6d_query_created", rid, generation,
+               created_mono_ns=created)
+
+        async def execute():
+            started = time.monotonic_ns()
+            record("request.v6d_query_start", rid, generation,
+                   created_mono_ns=created, start_mono_ns=started)
+            result, ok, error_type = None, False, None
+            try:
+                result = await native
+                ok = True
+                return result
+            except BaseException as error:
+                error_type = type(error).__name__
+                raise
+            finally:
+                ended = time.monotonic_ns()
+                record("request.v6d_query_end", rid, generation,
+                       created_mono_ns=created, start_mono_ns=started,
+                       end_mono_ns=ended, native_ok=ok,
+                       native_error_type=error_type,
+                       hit_tokens=_integer(_attr(result, "hit_length")),
+                       fetch_failed=_boolean(_attr(result, "fetch_failed")))
+        return execute()
+
+    @wraps(consume)
+    def consumed(request, state, result, *args, **kwargs):
+        started = time.monotonic_ns()
+        ok = False
+        try:
+            value = consume(request, state, result, *args, **kwargs)
+            ok = True
+            return value
+        finally:
+            ended = time.monotonic_ns()
+            record("request.v6d_query_consume", _attr(request, "request_id"),
+                   _attr(result, "generation"), start_mono_ns=started,
+                   end_mono_ns=ended, native_ok=ok,
+                   hit_tokens=_integer(_attr(result, "hit_length")))
+
+    scheduler._async_match = submitted
+    scheduler._commit_async_match = consumed
+    scheduler._hisim_query_observed = True
+    _install(scheduler, "v6d_scheduler", ("get_num_new_matched_tokens",), emit, observe)
+    _observe(observe, lambda: emit("request.v6d_query_capabilities",
+        source="V6dObjectConnectorScheduler", installed=True,
+        creation_is_before_runtime_submit=True))
