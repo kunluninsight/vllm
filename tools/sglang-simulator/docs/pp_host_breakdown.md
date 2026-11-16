@@ -68,3 +68,20 @@ spends time but cannot solve compute-versus-device-queue attribution inside
 the same native synchronization. Matched runtime completion/queue callbacks
 would be needed for that distinction; no full hardware trace is required by
 this contract.
+
+
+## PP barrier host completion
+
+`predictor.barrier_overhead_s` (default 0) models the extra blocking WORLD
+completion cost after the four logical workers rendezvous. It is applied in
+parallel on every rank before payload exchange and before the next host input
+preparation. It is separate from `communication_s`, which delays payload
+readiness and may overlap host preparation. Barrier failure still aborts the
+launch. Handoff events retain `native_return_at` and `modeled_overhead_s` so
+measured Python synchronization and modeled extra cost remain distinguishable.
+
+Test4 2026-11-17 h24 C64: 96 measured rounds had minimum rank barrier duration
+1.389 ms versus 0.051 ms in simulation; other protocol residuals were
+3.367/3.442 ms. A 1.3 ms extra barrier budget is a phase-based candidate, not
+a fitted request TTFT offset. These are representative-rank local-clock
+intervals, not pure network latency. Validate on new traffic before acceptance.

@@ -198,6 +198,7 @@ class ConfigManager:
                 interleave_size=predictor_config["interleave_size"],
                 num_tokens_paddings=predictor_config["num_tokens_paddings"],
                 communication_s=predictor_config["communication_s"],
+                barrier_overhead_s=predictor_config.get("barrier_overhead_s", 0.0),
                 host_prep=predictor_config.get("host_prep"),
                 dp_target_bucket=predictor_config.get("dp_target_bucket"),
                 max_num_tokens=predictor_config.get("max_num_tokens"),

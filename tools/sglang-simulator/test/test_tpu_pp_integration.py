@@ -93,7 +93,7 @@ def _exercise(root):
         "predictor": {"name": "tpu_pp_stage", "stage_model_paths": paths,
                       "pcp_size": 8, "interleave_size": 128,
                       "num_tokens_paddings": [256, 512, 1024],
-                      "communication_s": 0.0008, "async_handoff": True,
+                      "communication_s": 0.0008, "barrier_overhead_s": 0.0013, "async_handoff": True,
                       "host_prep": json.loads(Path(prep_path).read_text()) if prep_path else None},
     }
     config_path = root / "config_pp4.json"
@@ -298,6 +298,10 @@ def _exercise(root):
                                 "scheduler_output_updates": len(updates),
                                 "cache_components": sorted(r["component"] for r in cache_capabilities),
                                 "dropped": status["dropped"]}
+        barriers = [e for e in executor.stage_events if e["kind"] == "handoff_barrier"]
+        assert barriers and {e["stage"] for e in barriers} == set(range(4))
+        assert all(e["modeled_overhead_s"] == 0.0013 for e in barriers)
+        assert all(e["exit_at"] - e["native_return_at"] >= 0.0013 - 1e-7 for e in barriers)
         from sglang_simulator.simulation.vllm.tpu_pp import stage_runtime
         result = {"elapsed_s": time.monotonic() - started, "rounds": rounds,
                   "stage_runtime_path": stage_runtime.__file__, "completed_requests": 26,

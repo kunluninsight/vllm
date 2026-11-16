@@ -75,6 +75,7 @@ class WorkerConfig:
     async_handoff: bool
     execute_model_timeout_s: float
     record_events: bool = True
+    barrier_overhead_s: float = 0.0
 
 
 def _make_wave_class(base):
@@ -101,6 +102,7 @@ def _make_wave_class(base):
             self.device_ready = 0.0
             self.barrier, self.payloads, self.events = barrier, payloads, events
             self.communication_s = cfg.communication_s
+            self.barrier_overhead_s = cfg.barrier_overhead_s
             self.record_events = cfg.record_events
             self.transport_burst, self.transport_index = 0, 0
             self.last_barrier_release = None
@@ -123,6 +125,9 @@ def _make_wave_class(base):
             Descriptor(ready_at=self.device_ready).wait()
             enter_at = time.monotonic()
             self.barrier.wait(timeout=_BARRIER_TIMEOUT_S)
+            barrier_native_return_at = time.monotonic()
+            # WORLD completion blocks host progress; tensor readiness may overlap host preparation.
+            Descriptor(ready_at=barrier_native_return_at + self.barrier_overhead_s).wait()
             self.last_barrier_release = time.monotonic()
             incoming_pipe, outgoing_pipe = self.payloads
             outgoing_pipe.send((key, carried))
@@ -135,6 +140,8 @@ def _make_wave_class(base):
                 "handoff_barrier", burst=key[0], transport_index=key[1],
                 drain_start_at=drain_start_at, device_ready_at=self.device_ready,
                 enter_at=enter_at, exit_at=self.last_barrier_release,
+                native_return_at=barrier_native_return_at,
+                modeled_overhead_s=self.barrier_overhead_s,
                 outgoing_step_id=carried[0].step_id if carried else None,
                 incoming_step_id=incoming[0].step_id if incoming else None,
             )
@@ -289,7 +296,8 @@ class VirtualPPExecutor:
         ctx = mp.get_context("spawn")
         cfg = WorkerConfig(self.stages, self.predictor.stage_model_paths,
                            self.predictor.communication_s,
-                           self.predictor.async_handoff, timeout)
+                           self.predictor.async_handoff, timeout,
+                           barrier_overhead_s=self.predictor.barrier_overhead_s)
         edges = [ctx.Pipe(duplex=False) for _ in range(self.stages)]
         self._barrier = ctx.Barrier(self.stages)
         self._events = ctx.Queue()

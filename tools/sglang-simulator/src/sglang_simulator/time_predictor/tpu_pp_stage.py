@@ -23,7 +23,8 @@ class TpuPPStageTimePredictor(InferTimePredictor):
                  host_prep: dict | None = None,
                  dp_target_bucket: int | None = None,
                  max_num_tokens: int | None = None,
-                 async_handoff: bool = True):
+                 async_handoff: bool = True,
+                 barrier_overhead_s: float = 0.0):
         super().__init__(model, hw, config)
         if len(stage_model_paths) != config.pp_size:
             raise ValueError(
@@ -33,6 +34,9 @@ class TpuPPStageTimePredictor(InferTimePredictor):
                 f"predictor pcp_size={pcp_size} != deployment pcp_size={config.pcp_size}")
         if not math.isfinite(communication_s) or communication_s < 0:
             raise ValueError(f"invalid communication_s={communication_s}")
+        if not math.isfinite(barrier_overhead_s) or barrier_overhead_s < 0:
+            raise ValueError(f"invalid barrier_overhead_s={barrier_overhead_s}")
+        self.barrier_overhead_s = float(barrier_overhead_s)
         self.stage_model_paths = list(stage_model_paths)
         self.layout = PcpLayout(pcp_size, interleave_size,
                                 tuple(num_tokens_paddings), dp_target_bucket,
