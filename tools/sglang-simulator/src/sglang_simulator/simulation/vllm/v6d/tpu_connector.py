@@ -22,6 +22,29 @@ def _metadata_with(args, kwargs, field):
     return None
 
 
+class C_MultiKVConnectorPromMetricsHook(BaseHook):
+    """Preserve native metric values when CPU execution skips IPC serialization."""
+
+    HOOK_MODULE_NAME = "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector"
+    HOOK_CLASS_NAME = "MultiKVConnectorPromMetrics"
+
+    @classmethod
+    def hook(cls, target):
+        from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+
+        original = target.observe
+
+        def observe(self, transfer_stats_data, engine_idx=0):
+            # Native IPC turns each stats dataclass into {"data": ...}.
+            serialized = {
+                name: {"data": stats.data} if isinstance(stats, KVConnectorStats) else stats
+                for name, stats in transfer_stats_data.items()
+            }
+            return original(self, serialized, engine_idx)
+
+        target.observe = observe
+
+
 class C_TPUV6dConnectorAdmissionHook(BaseHook):
     """Observe the native accepted external prefix before async metadata expires.
 

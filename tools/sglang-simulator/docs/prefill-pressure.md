@@ -35,4 +35,15 @@ experiment results.
 
 ### CPU transport admission follow-up (2026-11-16)
 
-The 803804c live 16-request check still executed N tokens instead of the real producer's N-1: native on_new_request only truncates when Stage-3 transport is enabled. The local CPU connector now derives the truncation requirement from native Mamba/window cache specs and calls the native idempotent truncation helper after admission. It keeps frontend token accounting independent and does not enable a Decode peer or Stage-3 transfer. Seven regression cases cover CPU transport, existing native truncation, one-token prompts, full-attention prompts, remote-parameter rejection and non-local consumers. Live token-extent validation remains required.
+The 803804c live 16-request check still executed N tokens instead of the real producer's N-1: native on_new_request only truncates when Stage-3 transport is enabled. The local CPU connector now derives the truncation requirement from native Mamba/window cache specs and calls the native idempotent truncation helper after admission. It keeps frontend token accounting independent and does not enable a Decode peer or Stage-3 transfer. Seven regression cases cover CPU transport, existing native truncation, one-token prompts, full-attention prompts, remote-parameter rejection and non-local consumers. The explicit local Raiden live check passed on 16/16 requests: both sides executed N-1 tokens.
+
+
+### In-process connector metrics follow-up (2026-11-16)
+
+The first routed local-V6D smoke reached native lookup but failed in r58
+MultiKVConnectorPromMetrics.observe: CPU in-process outputs retain typed
+V6dConnectorStats children, whereas the Prometheus consumer expects the
+serialized {"data": ...} form. The simulation hook normalizes only that consumer
+boundary, preserving native metric values, engine labels, logging aggregation,
+connector validation and scheduling. Typed, serialized and mixed/nested stats
+are covered by regression tests; live V6D request completion still needs testing.

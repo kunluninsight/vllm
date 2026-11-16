@@ -33,6 +33,7 @@ def register_v6d_hooks(hooks: list) -> None:
         C_V6dObjectConnectorWorkerHook,
     )
     from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+        C_MultiKVConnectorPromMetricsHook,
         C_TPUV6dConnectorAdmissionHook,
         C_TPURaidenConnectorHook,
         C_TPURaidenConnectorWorkerHook,
@@ -49,6 +50,7 @@ def register_v6d_hooks(hooks: list) -> None:
         C_HybridControlPlaneHook,
         C_V6dObjectConnectorWorkerHook,
         C_TPUV6dObjectConnectorWorkerHook,
+        C_MultiKVConnectorPromMetricsHook,
         C_TPUV6dConnectorAdmissionHook,
         C_TPURaidenConnectorHook,
         C_TPURaidenConnectorWorkerHook,
