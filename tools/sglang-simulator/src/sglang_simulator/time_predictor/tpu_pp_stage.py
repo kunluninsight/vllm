@@ -24,7 +24,8 @@ class TpuPPStageTimePredictor(InferTimePredictor):
                  dp_target_bucket: int | None = None,
                  max_num_tokens: int | None = None,
                  async_handoff: bool = True,
-                 barrier_overhead_s: float = 0.0):
+                 barrier_overhead_s: float = 0.0,
+                 scheduler_meta: dict | None = None):
         super().__init__(model, hw, config)
         if len(stage_model_paths) != config.pp_size:
             raise ValueError(
@@ -43,6 +44,7 @@ class TpuPPStageTimePredictor(InferTimePredictor):
                                 max_num_tokens)
         self.communication_s = float(communication_s)
         self.host_prep = host_prep
+        self.scheduler_meta = scheduler_meta
         self.async_handoff = bool(async_handoff)
         # 主进程只做一次加载校验，worker 进程各自加载本 stage 模型
         last = config.pp_size - 1

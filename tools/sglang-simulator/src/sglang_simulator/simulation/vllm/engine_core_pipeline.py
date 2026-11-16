@@ -693,6 +693,11 @@ def _install_tpu_pp(core, predictor, sched_config) -> None:
         core.model_executor, predictor, sched_config.pp_size,
         on_step_done=_finalize_step_stats,
         lifecycle=getattr(core, "_hisim_lifecycle", None))
+    from sglang_simulator.simulation.vllm.tpu_pp.scheduler_timing import (
+        install_scheduler_meta_timing,
+    )
+    install_scheduler_meta_timing(core.scheduler, predictor.scheduler_meta,
+                                  executor._emit_lifecycle)
     core.model_executor = executor
     stepper = create_stepper(core, executor)
     core.batch_queue = stepper.in_flight

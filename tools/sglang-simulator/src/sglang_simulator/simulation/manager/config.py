@@ -200,6 +200,7 @@ class ConfigManager:
                 communication_s=predictor_config["communication_s"],
                 barrier_overhead_s=predictor_config.get("barrier_overhead_s", 0.0),
                 host_prep=predictor_config.get("host_prep"),
+                scheduler_meta=predictor_config.get("scheduler_meta"),
                 dp_target_bucket=predictor_config.get("dp_target_bucket"),
                 max_num_tokens=predictor_config.get("max_num_tokens"),
                 async_handoff=predictor_config.get("async_handoff", True),
