@@ -93,3 +93,26 @@ def test_native_failure_and_observer_failure_are_preserved():
     output.fail = False
     assert scheduler._build_kv_connector_meta(connector, output) is connector.result
     assert connector.calls == [output]
+
+
+@pytest.mark.parametrize("training,tick", [(False, False), (True, False), (True, True)])
+def test_phase_events_survive_real_stage_focus(tmp_path, monkeypatch, training, tick):
+    from sglang_simulator.collector.vllm_hook import stage_collection, trace_v2
+
+    monkeypatch.setenv("SIM_TRACE_FOCUS", "pp_stage")
+    monkeypatch.setattr(stage_collection, "TRAINING", training)
+    monkeypatch.setattr(stage_collection, "TICK", tick)
+    recorder = trace_v2.Recorder(tmp_path)
+    try:
+        scheduler, connector, _ = setup(
+            lambda event, **data: recorder.emit(event, data=data))
+        before = recorder.accepted
+        output = SimpleNamespace(total_num_scheduled_tokens=512)
+        assert scheduler._build_kv_connector_meta(connector, output) is connector.result
+        # Exercise the real emitter, including its tick-mode retention filter.
+        assert recorder.accepted == before + 2
+        recorder.identity = (0, 0, 0, 0, 0, 0, 0)
+        assert not recorder.emit("scheduler.native_phase", data={})
+    finally:
+        recorder.close()
+    assert recorder.written == before + 2 and recorder.failure is None

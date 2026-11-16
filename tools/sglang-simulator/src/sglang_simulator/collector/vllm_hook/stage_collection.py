@@ -18,6 +18,7 @@ TRAINING_WORKER_KINDS = frozenset({
 CONTROLLER_LIFECYCLE_KINDS = frozenset({
     'request.output_observed', 'request.free', 'request.remote_kv_signal_observed',
     'request.step_membership', 'request.identity_alias', 'scheduler.output_update',
+    'scheduler.native_phase',
 })
 TRAINING_CONTROLLER_KINDS = CONTROLLER_LIFECYCLE_KINDS | frozenset({
     'step.inputs', 'request.add', 'request.scheduled', 'pipeline.result_ready',
