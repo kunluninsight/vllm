@@ -52,3 +52,20 @@ were enabled (78.861 ms initial measured, 8.185 ms Prefill handoff).
 ## V6D query observation
 
 The personal Aone branch adds per-request/generation coroutine creation, background start/end and scheduler result-consumption events. Creation is immediately before native runtime.submit, not a wire timestamp. The query execution span includes native cross-group lookup/fetch; it is not automatically KVCM service time. Native errors and cancellation propagate unchanged. Shared instance observers recurse through MultiConnector children on real and simulated schedulers. Validation: 18 focused tests passed, including delayed execution/consumption and failed observer cases. No latency model changes in this commit.
+
+## Prefill input extent (2026-11-16)
+
+Live r58 Raiden stage-3 producer admission removes the final prompt token before
+prefix lookup (`on_new_request` -> `_maybe_truncate_prompt_for_handoff`). Decode
+recomputes that token. The local CPU producer previously skipped admission and
+therefore scheduled N tokens against the real Prefill N-1. The eight paired
+requests at 16:12 all show this difference; member identity alone did not imply
+matching chunk shapes.
+
+Retain native producer admission after the existing remote-parameter rejection.
+Copy the request's prompt list first because the in-process simulator can share
+it with frontend accounting. This only matches Prefill work; it adds no Decode
+or transfer simulation. Five focused checks cover native truncation/nontruncation,
+a one-token prompt, repeated admission, unchanged frontend input, rejected remote
+parameters, and the nonlocal path. This candidate is not part of the 18:50 baseline
+(wheel 69dd301); deploy only after that comparison window finishes.

@@ -111,7 +111,11 @@ class C_TPURaidenConnectorHook(BaseHook):
                     "Local Raiden simulation does not support remote PD handoff; "
                     "disable DashLLM remote decode routing and omit remote transfer params"
                 )
-            # 没有 D 端重算最后一个 token，不能执行原生 stage3 的 prompt 截断。
+            # Match the real producer's Prefill extent even without a Decode peer.
+            # In-process simulation shares this list with frontend accounting.
+            if request.prompt_token_ids is not None:
+                request.prompt_token_ids = list(request.prompt_token_ids)
+            return original_admit(self, request)
 
         def matched(self, request, num_computed_tokens):
             if not self._sim_local_raiden:
