@@ -47,3 +47,25 @@ serialized {"data": ...} form. The simulation hook normalizes only that consumer
 boundary, preserving native metric values, engine labels, logging aggregation,
 connector validation and scheduling. Typed, serialized and mixed/nested stats
 are covered by regression tests; live V6D request completion still needs testing.
+
+### Open-loop request-rate runs (2026-11-17)
+
+Use `--request-rate 18 19 20` instead of `--concurrency` to schedule arrivals
+at absolute offsets `i / rate`. These are example rates, not accepted latency
+bands. The same sender, request distribution and isolated case namespaces are
+retained. A case runs for `--duration` admission seconds, drains, then observes
+`--gap` before the next case. Full prompts are generated uniquely; they are not
+a replay of production prompt contents. Model parameters must stay fixed.
+
+`--max-inflight` (default 1024) is a stop guard, not a throttle: hitting it stops
+new arrivals and drains existing requests. Likewise `--max-send-lag` (default
+0.25 seconds) stops a client that cannot keep its schedule. Reports retain
+scheduled/actual sends, actual send times, send lag and stop reason. A guarded
+or incomplete run cannot be reported as achieving the configured arrival rate.
+The request cap and timeouts remain finite. Before starting a new experimental
+case, verify both real and mirror engines drained; HTTP completion alone does
+not prove the asynchronous mirror has drained.
+
+Four tests cover slow-response arrival independence, in-flight stop semantics,
+auth failure, and preservation of closed-loop/cap behavior. This change does
+not alter serving or simulation timing models.
