@@ -1,6 +1,20 @@
 # test4 共用 Chat 切换与验收（2026-11-17）
 
-## 当前状态
+## 当前状态（21:00 北京时间）
+
+共享Chat和打流机迁移已完成，固定并发1/16/32三组全部结束，监控已导出。真实14318条全部成功、仿真14095条接纳并配对，缺223条；C16/C32不能作为严格精度验收。完整结果与监控时间窗见[固定并发实验](tpu-prefill-shared-concurrency-20261117.md)。本轮未改引擎/预测器。
+
+新打流机service01838b24归属共享Chat应用。迁移小批最初有3/16被错误路由到打流机；19:52修正为instance维度、Chat权重1/loadgen权重0、关闭路由fallback，随后64条全部成功配对，引擎TTFT608.2/619.4ms（+1.83%），输入与计算token全部一致。错误请求f5af3f37-16e9-9baf-8d92-7f129cf55a30的平台trace可复核，未到Chat或Prefill。
+
+旧test4打流机于19:55删除；旧Chat首次删除残留error记录，之后通过控制台再次删除，列表确认只剩Prefill、Decode、Redis。Decode仍有真实调用而保留。旧仿真Chat仍在仿真应用内，权重0；该应用fallback仍开启，尚未发现发生降级，不能把零权重当作绝不会被路由到。
+
+数据迁移：旧`/home/admin/hisim_pp_loadgen`归档37903338bytes、659成员，已迁到新节点，37另存`work/loadgen-migration-1117/old-loadgen.tar.gz`。授权Key ID4649685经一次性RSA-OAEP加密迁移，仅在进程环境使用；临时私钥与密文已清除。临时保管进程约21:43到期；复制配置ratio=1、无过滤、21:30到期。后续重跑前必须重新核对有效期，不把这些临时值当作永久配置。
+
+Chrome扩展已恢复，当前按独立标签页操作；用户可操作其他标签页。真实首包、仿真首包、Input TPS/prefix三张监控页保留19:57–20:39窗口。
+
+[Redis/V6D核对](tpu-prefill-cache-topology-20261117.md)：两侧tracker/KVCM关闭，本地V6D保留；当前未验收DRAM命中加载与跨实例缓存。C16/C32共74条命中差异均对应先前同family请求漏复制，先恢复一致请求历史再评价缓存模型。
+
+## 17:59–19:10 切流与速率实验记录
 
 已于北京时间17:59完成切流。新共享Chat 4/4 Running；真实/仿真分别直接路由到原TPU Prefill和原CPU1。16条和256条两次小批全部成功、全部逐请求配对，输入token及实际计算token全部一致。
 
@@ -25,7 +39,9 @@
 
 11099对输入长度全部一致，11096对实际调度计算token一致。剩余3对需连同缺失请求引起的缓存历史变化检查。当前精简trace不含完整KV查询阶段，`query-waits.csv`中零查询字段不代表线上没有查询，不能据此把401ms归因于KV查询或排除它。预测器本轮未改，不用不完整组重新拟合。
 
-唯一仿真缺失请求的入口证据：`shared-rate-main-1117-r18p5/missing-route-all.json`；覆盖、配对、逐批数据：同目录`analysis/`；平台样本：`network-shared-rate-main-1117-r18p5/platform-spans.csv`。读取侧429已恢复，正式打流PID已结束，当前没有后续压力组在后台发送。下一步需要复制触发/投递端日志解释无复制分支的这1条，再恢复逐组完整性门控压测。
+唯一仿真缺失请求的入口证据：`shared-rate-main-1117-r18p5/missing-route-all.json`；覆盖、配对、逐批数据：同目录`analysis/`；平台样本：`network-shared-rate-main-1117-r18p5/platform-spans.csv`。读取侧429已恢复。
+
+19:10续跑：用户明确接受将孤立1条缺失暂作偶发记录，要求继续三组验证。复用完整18.5组，补跑19.2/20.5各600秒、排空后间隔300秒。PID814668，输出`mry-shared-rate-tail-1117`，19.2组开始19:10:56.027；不重复发送此前请求，seed11171910。第一组到第二组间隔较长，不声称三组连续。仅分析/采集门控取消`--require-complete`，服务配置和模型不变。缺失仍报告为已知覆盖限制；若再次持续漏复制则重新调查。
 
 ## 当前拓扑
 
@@ -39,11 +55,11 @@
 | 共享Chat部署 | qwen3.8-max-hisim-pp-mry-test4-shared-chat-gateway，service 2e7b7a08，4实例 |
 | POC模型 | pre-qwen3.8-max-hisim-pp-mry-test4-shared-chat |
 | 真实应用 | qwen38-debug/bb1035d8：xiaohao-qwen3.8-max-L20G7-PP-test-4，v-a4cd4623 |
-| 真实Prefill | -4b20，service 6842e3d9，应用权重1；旧Chat -5aa8权重0 |
+| 真实Prefill | -4b20，service 6842e3d9，应用权重1；旧Chat -5aa8已删除 |
 | 仿真应用 | test/464482ce：qwen3.8-max-hisim-pp-mry-test4，v-e7e082b6 |
 | 仿真Prefill | -cpu1，service f3ded9ec，应用权重1；旧-chat权重0 |
 
-镜像比例1，当前到期时间2026-11-17 20:00。原两个Chat部署保留但不接实验流量。新模型已邀请既有授权Key ID4649685；密钥不写入文档或文件。
+镜像比例1，当前到期时间2026-11-17 21:30。旧真实Chat已删除，旧仿真Chat权重0保留。新模型已邀请既有授权Key ID4649685；密钥不写入文档或文件。
 
 ## 线上配置基准与改动
 
@@ -89,4 +105,8 @@
 
 真实事件只有mono_ns，必须使用process.json的wall_anchor_ns/mono_anchor_ns换算窗口。首次采集筛选错误产生的real0配对不是请求丢失，已修正后获得完整16/256配对。组间精简采集保留身份、接纳、批次成员、dispatch/ready/consume与输出事件；已用16条完整trace验证全部配对/token/时延字段完全一致。详细query轮询数据仍在源trace，必要时针对异常请求补取。
 
-回退：真实应用恢复`-5aa8=1,-4b20=0`，仿真应用恢复`-chat=100,-cpu1=0`，打流目标恢复原`pp042/target.json`。不需要重载TPU模型。正式压测只对本次已提交的有限进程操作，不影响同事test3或线上部署。
+当前不能仅切权重回到旧真实Chat：该部署已删除。如确需回退，应使用保存的部署快照重建旧Chat并验证后再切流；旧打流目录归档保留在37。所有回退先核当前实际对象，不使用历史PID或已删除部署。
+
+19:33转向：用户要求降低压力并迁移打流机。20.5RPS组PID814668于19:33:49停止且进程已退出，保留部分结果并标记中止。19.2完整组11520真实成功、11518配对；引擎TTFT 11036.6/8180.0ms（仿真−25.88%），首次dispatch前10252.2/7384.8ms，末轮dispatch→ready715.8/725.7ms。两条未配对仍单列，不能声称全部对齐。分析中的query零值来自engine-only缺少查询事件，不能解读为查询没有耗时。
+
+迁移：test工作区新增运行时`qwen38-prefill-loadgen:mry-1117-v1`和`qwen3.8-max-hisim-pp-mry-test4-shared-chat-loadgen`，service01838b24，实例`ds-01838b24-1-65d785b6c9-bhdtm`；已1/1 Running。路由gateway=1/loadgen=0。复制关系同源同目标延至21:30。该时刻旧Chat/旧loadgen尚未删除；迁移和删除后来均已完成，见顶部当前状态。Decode 059611a0通过请求46e11319-7f45-927a-be0b-75ad3c20738a证实仍调用，保留。随后已完成固定并发1/16/32，见最新实验报告。
