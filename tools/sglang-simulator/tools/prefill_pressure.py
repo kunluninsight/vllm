@@ -182,6 +182,6 @@ if __name__ == "__main__":
     assert 1 <= a.max_inflight <= 2048 and 0 < a.max_send_lag <= 1
     assert a.request_rate is None or (all(math.isfinite(r) and 0 < r <= 100 for r in a.request_rate) and len(set(a.request_rate)) == len(a.request_rate))
     assert 0 < a.timeout <= 300
-    assert all(0 < c <= 64 for c in a.concurrency) and len(set(a.concurrency)) == len(a.concurrency)
+    assert all(0 < c <= 2048 for c in a.concurrency) and len(set(a.concurrency)) == len(a.concurrency)
     assert 0 < a.duration <= 600 and 0 <= a.gap <= 300 and 0 < a.max_requests <= 20000
     raise SystemExit(asyncio.run(run(a)))
