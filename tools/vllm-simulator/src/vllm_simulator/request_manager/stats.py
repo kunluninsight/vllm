@@ -4,12 +4,14 @@
 
 
 class RequestStats:
-    def __init__(self):
+    def __init__(self, mode):
+        self.mode = mode
         self.records = {}
 
     def add(self, item):
         meta = item.metadata
         self.records[item.request.request_id] = {
+            "mode": self.mode,
             "created_time": meta.created_time,
             "admitted_at": None,
             "first_scheduled_at": None,

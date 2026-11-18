@@ -46,9 +46,10 @@ class RequestManager:
         self.dp = dp
         self.scheduler = scheduler
         self.notify_aborted = notify_aborted
-        self.blocking = SimulatorConfig.from_config(config).mode == "BLOCKING"
+        mode = SimulatorConfig.from_config(config).mode
+        self.blocking = mode == "BLOCKING"
         self.dispatcher = create_dispatcher(config)
-        self.stats = RequestStats()
+        self.stats = RequestStats(mode)
         self.active = set()
         self.received_count = 0
         self.expected_count = None

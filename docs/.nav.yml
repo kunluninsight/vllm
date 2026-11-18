@@ -53,7 +53,6 @@ nav:
       - benchmarking/README.md
       - benchmarking/cli.md
       - benchmarking/sweeps.md
-      - benchmarking/simulator.md
       - benchmarking/dashboard.md
   - API Reference:
     - api/README.md
