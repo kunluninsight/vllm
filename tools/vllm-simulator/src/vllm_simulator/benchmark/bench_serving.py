@@ -78,6 +78,7 @@ async def simulation_benchmark(native_benchmark, frontend=None, **options):
     clock = BenchmarkClock()
     native_arrivals = serve.get_request
     arrival_time = ContextVar("arrival_time", default=None)
+    failed_session = None
 
     async def arrivals(samples, *traffic):
         # Only the native arrival generator sees a virtual sleep. Restore asyncio
@@ -93,6 +94,7 @@ async def simulation_benchmark(native_benchmark, frontend=None, **options):
             yield item
 
     async def request(request_func_input, session, pbar=None):
+        nonlocal failed_session
         req = request_func_input
         arrival = arrival_time.get()
         try:
@@ -161,9 +163,8 @@ async def simulation_benchmark(native_benchmark, frontend=None, **options):
                 latency=latency,
             )
         except BaseException:
-            # A disconnect releases peers waiting for the rest of the workload.
             if arrival is not None:
-                await session.close()
+                failed_session = session
             raise
         finally:
             if pbar is not None:
@@ -174,7 +175,13 @@ async def simulation_benchmark(native_benchmark, frontend=None, **options):
         patch.object(serve, "get_request", arrivals),
         patch.dict(serve.ASYNC_REQUEST_FUNCS, {backend: request}),
     ):
-        return await native_benchmark(**options)
+        try:
+            return await native_benchmark(**options)
+        finally:
+            # Let gather report the original error before disconnecting peers
+            # that are still waiting for the round's arrival barrier.
+            if failed_session is not None:
+                await failed_session.close()
 
 
 def main():

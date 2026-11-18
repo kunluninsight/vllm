@@ -11,7 +11,7 @@ Example predictor settings under `additional_config.simulator`:
     "predictor": {
         "name": "replay",
         "database_path": "/path/to/replay_table.json",
-        "miss_strategy": "knn",       # "zero" (legacy) or "knn" (interpolated)
+        "miss_strategy": "knn_work",  # "zero", "knn", or "knn_work"
         "miss_knn_k": 3,              # KNN k for "knn" strategy
         "miss_fallback_seconds": 0.0  # used only when strategy=="zero"
     }
@@ -25,6 +25,8 @@ import json
 import math
 import os
 from logging import getLogger
+
+import numpy as np
 
 from vllm_simulator.time_predictor.base import PerRankTimePredictor, ScheduleBatch
 
@@ -50,6 +52,14 @@ def _shape_feat(extends, pasts):
     return (len(extends), sum(extends), sum(pasts))
 
 
+def _attention_feat(extends, pasts):
+    # Causal attention visits a different number of keys for each query token.
+    attention_work = sum(
+        extend * (past + (extend + 1) / 2) for extend, past in zip(extends, pasts)
+    )
+    return len(extends), sum(extends), attention_work
+
+
 class ReplayTimePredictor(PerRankTimePredictor):
     """Look up measured GPU latency by batch composition.
 
@@ -64,6 +74,11 @@ class ReplayTimePredictor(PerRankTimePredictor):
         the closest (batch_size, sum_extend, sum_past) shape (per-dim z-scored
         Euclidean distance). Use when miss rate matters or you want a logically
         complete oracle. Typical k=3.
+
+      - "knn_work": KNN with causal attention work as the third feature and
+        separate indexes for decode-only batches and batches with prefill.
+        Decode misses use the median sampling time by batch size, interpolated
+        between observed sizes.
 
     For workloads where sim batch composition diverges from real (e.g., bursty
     max-tps), the miss rate can be high; prefer "knn" there.
@@ -182,9 +197,10 @@ class ReplayTimePredictor(PerRankTimePredictor):
                 "Loaded %d legacy replay entries without sample_tokens latency",
                 legacy_entries,
             )
-        if miss_strategy not in ("zero", "knn"):
+        if miss_strategy not in ("zero", "knn", "knn_work"):
             raise ValueError(
-                f"miss_strategy must be 'zero' or 'knn', got {miss_strategy!r}"
+                "miss_strategy must be 'zero', 'knn' or 'knn_work', "
+                f"got {miss_strategy!r}"
             )
         self._miss_strategy = miss_strategy
         self._miss_fallback = float(miss_fallback_seconds)
@@ -194,17 +210,17 @@ class ReplayTimePredictor(PerRankTimePredictor):
         if self._miss_knn_k < 1:
             raise ValueError("miss_knn_k must be at least 1")
 
-        if self._miss_strategy == "knn":
+        if self._miss_strategy != "zero":
             self._prep_knn_index()
             logger.info(
                 "ReplayTimePredictor loaded %d unique compositions from %s "
-                "(miss_strategy=knn, k=%d)",
+                "(miss_strategy=%s, k=%d)",
                 len(self._table),
                 database_path,
+                self._miss_strategy,
                 self._miss_knn_k,
             )
         else:
-            self._knn_feats = None
             logger.info(
                 "ReplayTimePredictor loaded %d unique compositions from %s "
                 "(miss_strategy=zero, fallback=%.4fs)",
@@ -214,53 +230,59 @@ class ReplayTimePredictor(PerRankTimePredictor):
             )
 
     def _prep_knn_index(self):
-        """Build per-feature mean/std + cached (feat, lat) arrays for KNN fallback.
-
-        Uses plain Python (no numpy / sklearn dependency from the predictor side)
-        — table size is ~1K-3K so this is fine. Distance is z-scored Euclidean
-        across (batch_size, sum_extend, sum_past).
-        """
-        feats = []
-        lats = []
+        """Standardize features once per index."""
+        uses_work = self._miss_strategy == "knn_work"
+        self._knn_feature = _attention_feat if uses_work else _shape_feat
+        groups = {}
+        decode_samples = {}
         for key, latencies in self._table.items():
             extends_pasts = _decode_key(key)
             extends = [e for e, _ in extends_pasts]
             pasts = [p for _, p in extends_pasts]
-            feats.append(_shape_feat(extends, pasts))
-            lats.append(latencies)
-        n = len(feats)
-        # per-dim mean/std for z-scoring
-        means = [sum(f[d] for f in feats) / n for d in range(3)]
-        var = [sum((f[d] - means[d]) ** 2 for f in feats) / n for d in range(3)]
-        stds = [math.sqrt(v) if v > 1e-12 else 1.0 for v in var]
-        self._knn_feats = feats
-        self._knn_lats = lats
-        self._knn_mean = means
-        self._knn_std = stds
-
-    def _knn_predict(self, query_feat):
-        """K nearest neighbors over z-scored 3-D shape feature, simple mean."""
-        qz = tuple(
-            (query_feat[d] - self._knn_mean[d]) / self._knn_std[d] for d in range(3)
-        )
-        # compute squared distance to every table entry; pick smallest k
-        # n ≤ ~3K so O(n) per query is fine; sim only calls on misses
-        dists = []
-        for i, f in enumerate(self._knn_feats):
-            fz = (
-                (f[0] - self._knn_mean[0]) / self._knn_std[0],
-                (f[1] - self._knn_mean[1]) / self._knn_std[1],
-                (f[2] - self._knn_mean[2]) / self._knn_std[2],
+            group = uses_work and any(e > 1 for e in extends)
+            features, timings = groups.setdefault(group, ([], []))
+            features.append(self._knn_feature(extends, pasts))
+            timings.append(latencies)
+            if uses_work and extends and not group:
+                decode_samples.setdefault(len(extends), []).append(latencies[1])
+        self._decode_sample_sizes = sorted(decode_samples)
+        self._decode_sample_medians = [
+            float(np.median(decode_samples[size])) for size in self._decode_sample_sizes
+        ]
+        self._knn_indexes = {}
+        for group, (features, timings) in groups.items():
+            features = np.asarray(features, dtype=float)
+            mean = features.mean(axis=0)
+            var = features.var(axis=0)
+            scale = np.sqrt(np.where(var > 1e-12, var, 1.0))
+            self._knn_indexes[group] = (
+                (features - mean) / scale,
+                np.asarray(timings),
+                mean,
+                scale,
             )
-            d2 = (fz[0] - qz[0]) ** 2 + (fz[1] - qz[1]) ** 2 + (fz[2] - qz[2]) ** 2
-            dists.append((d2, i))
-        dists.sort(key=lambda t: t[0])
-        k = min(self._miss_knn_k, len(dists))
-        neighbors = [self._knn_lats[i] for _, i in dists[:k]]
-        return tuple(
-            sum(latencies[component] for latencies in neighbors) / k
-            for component in range(2)
-        )
+
+    def _knn_predict(self, extends, pasts):
+        group = self._miss_strategy == "knn_work" and any(e > 1 for e in extends)
+        if group not in self._knn_indexes:
+            group = not group
+        features, timings, mean, scale = self._knn_indexes[group]
+        query = (self._knn_feature(extends, pasts) - mean) / scale
+        delta = features - query
+        distances = np.einsum("ij,ij->i", delta, delta)
+        k = min(self._miss_knn_k, len(distances))
+        boundary = np.partition(distances, k - 1)[k - 1]
+        closer = np.flatnonzero(distances < boundary)
+        tied = np.flatnonzero(distances == boundary)[: k - len(closer)]
+        forward, sample = timings[np.concatenate((closer, tied))].mean(axis=0)
+        if self._decode_sample_sizes and not any(e > 1 for e in extends):
+            # Sampling depends on the token batch, while forward attention
+            # depends on the KV lengths. Pool transient timing spikes across
+            # shapes with the same sampling work.
+            sample = np.interp(
+                len(extends), self._decode_sample_sizes, self._decode_sample_medians
+            )
+        return float(forward), float(sample)
 
     def predict_step_time(self, batch: ScheduleBatch) -> tuple[float, float]:
         if batch.is_empty():
@@ -270,8 +292,8 @@ class ReplayTimePredictor(PerRankTimePredictor):
         key = _encode_key([req.extend_length, req.past_kv_length] for req in batch.reqs)
         latencies = self._table.get(key)
         if latencies is None:
-            if self._miss_strategy == "knn":
-                return self._knn_predict(_shape_feat(extends, pasts))
+            if self._miss_strategy != "zero":
+                return self._knn_predict(extends, pasts)
             return self._miss_fallback, 0.0
         return latencies
 

@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU execution selected through vLLM's out-of-tree platform interface."""
 
+import math
 import sys
-from copy import copy
+from copy import copy, deepcopy
 
 from vllm.exceptions import VLLMValidationError
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
@@ -92,16 +93,6 @@ class SimulatorPlatform(Platform):
 
         simulator_config = SimulatorConfig.backup_parallel_config(config)
         parallel = config.parallel_config
-        if (
-            parallel.nnodes != 1
-            or parallel.data_parallel_external_lb
-            or parallel.data_parallel_hybrid_lb
-        ):
-            raise ValueError(
-                "The simulator requires a single node with internal DP load balancing"
-            )
-        if parallel.data_parallel_size_local != parallel.data_parallel_size:
-            raise ValueError("All simulated DP ranks must be local")
         parallel.tensor_parallel_size = 1
         parallel.pipeline_parallel_size = 1
         parallel.prefill_context_parallel_size = 1
@@ -110,8 +101,16 @@ class SimulatorPlatform(Platform):
         parallel.enable_eplb = False
         parallel.world_size = 1
         parallel.rank = 0
+        parallel.nnodes = 1
+        parallel.node_rank = 0
         parallel.master_addr = "127.0.0.1"
-        parallel.data_parallel_master_ip = "127.0.0.1"
+        if not parallel.data_parallel_external_lb:
+            parallel.data_parallel_size_local = parallel.data_parallel_size
+            parallel.data_parallel_rank = 0
+            parallel.data_parallel_rank_local = None
+            parallel.data_parallel_index = 0
+            parallel.data_parallel_master_ip = "127.0.0.1"
+        cls._adapt_kv_transfer(config)
         config.parallel_config.worker_cls = (
             "vllm_simulator.plugin.worker.SimulatorWorker"
         )
@@ -143,6 +142,75 @@ class SimulatorPlatform(Platform):
         install_simulator_launcher()
 
     @classmethod
+    def _adapt_kv_transfer(cls, config) -> None:
+        from vllm_simulator.plugin.kv_transfer.protocol import (
+            CONNECTOR_MODULE,
+            CONNECTOR_NAME,
+        )
+
+        simulation = SimulatorConfig.from_config(config)
+        transfer = config.kv_transfer_config
+        if transfer is None:
+            if simulation.kv_transfer:
+                raise ValueError("simulator.kv_transfer requires --kv-transfer-config")
+            return
+        native = transfer.kv_connector in ("NixlConnector", "MooncakeConnector")
+        if not native and (
+            transfer.kv_connector != CONNECTOR_NAME
+            or transfer.kv_connector_module_path != CONNECTOR_MODULE
+        ):
+            if simulation.kv_transfer:
+                raise ValueError(
+                    "simulator.kv_transfer requires a supported P/D connector"
+                )
+            return
+        if native:
+            if transfer.kv_connector_module_path is not None:
+                raise ValueError("Simulator cannot adapt custom connector modules")
+            extra = transfer.kv_connector_extra_config
+            transport_options = (
+                {"backends", "ucx_backend_params"}
+                if transfer.kv_connector == "NixlConnector"
+                else {"mooncake_protocol", "device_name", "bootstrap_server_address"}
+            )
+            if extra.keys() - transport_options:
+                raise ValueError(
+                    "Unsupported native connector settings for simulation: "
+                    f"{sorted(extra.keys() - transport_options)}"
+                )
+            if transfer.kv_connector == "NixlConnector" and extra.get(
+                "backends", ["UCX"]
+            ) != ["UCX"]:
+                raise ValueError("Simulator NixlConnector adaptation supports UCX only")
+            config.additional_config["simulator"].setdefault(
+                "original_kv_transfer_config", deepcopy(transfer)
+            )
+        adapted = copy(transfer)
+        role = simulation.kv_transfer.get("kv_role", transfer.kv_role)
+        if transfer.kv_role != "kv_both" and role != transfer.kv_role:
+            raise ValueError(
+                "simulator.kv_transfer.kv_role conflicts with the native role"
+            )
+        if role not in ("kv_producer", "kv_consumer"):
+            raise ValueError(
+                "P/D simulation requires simulator.kv_transfer.kv_role "
+                "to select kv_producer or kv_consumer for kv_both"
+            )
+        adapted.kv_connector = CONNECTOR_NAME
+        adapted.kv_connector_module_path = CONNECTOR_MODULE
+        adapted.kv_buffer_device = "cpu"
+        adapted.kv_role = role
+        adapted.kv_connector_extra_config = {
+            **({} if native else transfer.kv_connector_extra_config),
+            **{
+                key: value
+                for key, value in simulation.kv_transfer.items()
+                if key != "kv_role"
+            },
+        }
+        config.kv_transfer_config = adapted
+
+    @classmethod
     def check_and_update_config(cls, config) -> None:
         if config.model_config is None:
             return
@@ -150,6 +218,10 @@ class SimulatorPlatform(Platform):
         parallel = config.parallel_config
         if parallel.data_parallel_backend != "mp":
             raise ValueError("Simulator DP currently requires the mp backend")
+        if parallel.data_parallel_hybrid_lb:
+            raise ValueError("Simulator DP does not support hybrid load balancing")
+        if parallel.data_parallel_external_lb and simulator_config.mode != "BLOCKING":
+            raise ValueError("Simulator external load balancing requires BLOCKING mode")
         if (
             parallel.data_parallel_size > 1
             and not config.model_config.is_moe
@@ -190,6 +262,72 @@ class SimulatorPlatform(Platform):
 
         transfer = config.kv_transfer_config
         if transfer is None:
+            return
+        if (
+            transfer.kv_connector == "SimulatorOfflineKVConnector"
+            and transfer.kv_connector_module_path
+            == "vllm_simulator.plugin.kv_transfer.offline"
+        ):
+            simulation = SimulatorConfig.from_config(config)
+            original = simulation.original_parallel_config
+            if (
+                simulation.mode != "NON_BLOCKING"
+                or transfer.kv_role != "kv_consumer"
+                or any(
+                    getattr(original, key) != 1
+                    for key in (
+                        "data_parallel_size",
+                        "pipeline_parallel_size",
+                        "prefill_context_parallel_size",
+                        "decode_context_parallel_size",
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Offline KV import requires NON_BLOCKING, kv_consumer "
+                    "and DP=PP=PCP=DCP=1"
+                )
+            return
+        from vllm_simulator.plugin.kv_transfer.protocol import (
+            CONNECTOR_MODULE,
+            CONNECTOR_NAME,
+        )
+
+        if (
+            transfer.kv_connector == CONNECTOR_NAME
+            and transfer.kv_connector_module_path == CONNECTOR_MODULE
+        ):
+            simulation = SimulatorConfig.from_config(config)
+            if (
+                simulation.mode != "BLOCKING"
+                or config.parallel_config.data_parallel_size != 1
+                or transfer.kv_role not in ("kv_producer", "kv_consumer")
+                or any(
+                    getattr(simulation.original_parallel_config, name) != 1
+                    for name in (
+                        "pipeline_parallel_size",
+                        "prefill_context_parallel_size",
+                        "decode_context_parallel_size",
+                    )
+                )
+            ):
+                raise ValueError(
+                    "Simulator PD requires BLOCKING, DP=PP=PCP=DCP=1 and P/D roles"
+                )
+            from urllib.parse import urlparse
+
+            extra = transfer.kv_connector_extra_config
+            url = urlparse(extra.get("broker_url", ""))
+            if url.scheme not in ("http", "https") or not url.hostname:
+                raise ValueError("Simulator PD requires an HTTP(S) broker_url")
+            for key, default in (("rpc_timeout_s", 2), ("poll_interval_s", 0.005)):
+                value = extra.get(key, default)
+                if (
+                    type(value) not in (int, float)
+                    or not math.isfinite(value)
+                    or value <= 0
+                ):
+                    raise ValueError(f"Simulator PD {key} must be finite and positive")
             return
         if (
             transfer.kv_connector
@@ -260,6 +398,37 @@ class SimulatorPlatform(Platform):
             raise VLLMValidationError("The simulator supports text inputs only")
         if params.n != 1:
             raise VLLMValidationError("The simulator requires n=1")
+        transfer = (params.extra_args or {}).get("kv_transfer_params") or {}
+        if not isinstance(transfer, dict):
+            raise VLLMValidationError("kv_transfer_params must be an object")
+        if (
+            transfer.get("do_remote_decode") or transfer.get("do_remote_prefill")
+        ) and processed_inputs.get("prompt_embeds") is not None:
+            raise VLLMValidationError("Simulator P/D handoff requires prompt token IDs")
+        if "offline_kv_tokens" in transfer:
+            from vllm_simulator.plugin.kv_transfer.offline import validate_import
+
+            try:
+                validate_import(
+                    transfer, len(processed_inputs.get("prompt_token_ids") or [])
+                )
+            except ValueError as error:
+                raise VLLMValidationError(str(error)) from error
+            if params.skip_reading_prefix_cache:
+                raise VLLMValidationError(
+                    "Offline KV import requires external KV reads"
+                )
+        if transfer.get("do_remote_decode") and params.max_tokens != 1:
+            raise VLLMValidationError("Simulator P handoff requires max_tokens=1")
+        if transfer.get("do_remote_prefill") and not all(
+            isinstance(transfer.get(key), str) and transfer[key]
+            for key in ("remote_engine_id", "remote_request_id")
+        ):
+            raise VLLMValidationError(
+                "Simulator D requires the P response's kv_transfer_params"
+            )
+        if transfer.get("do_remote_prefill") and params.skip_reading_prefix_cache:
+            raise VLLMValidationError("Simulator D requires external KV reads")
         try:
             ReplayMetadata.from_extra_args(params.extra_args, 0.0)
         except (ValueError, TypeError) as error:

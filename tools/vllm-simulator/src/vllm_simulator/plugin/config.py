@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from vllm_simulator.plugin.device import SimulatorDevice
 
 if TYPE_CHECKING:
-    from vllm.config import ParallelConfig
+    from vllm.config import KVTransferConfig, ParallelConfig
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,9 @@ class SimulatorConfig:
     predictor: dict = field(default_factory=dict)
     request_dispatcher: dict = field(default_factory=dict)
     step_trace_dir: str | None = None
+    kv_transfer: dict = field(default_factory=dict)
     original_parallel_config: ParallelConfig | None = None
+    original_kv_transfer_config: KVTransferConfig | None = None
     physical_kv_cache_block_size: int | None = None
 
     def __post_init__(self):
@@ -31,9 +33,19 @@ class SimulatorConfig:
             raise ValueError("simulator.mode must be BLOCKING or NON_BLOCKING")
         if type(self.token_id) is not int or self.token_id < 0:
             raise ValueError("simulator.token_id must be a non-negative integer")
-        for name in ("predictor", "request_dispatcher"):
+        for name in ("predictor", "request_dispatcher", "kv_transfer"):
             if not isinstance(getattr(self, name), dict):
                 raise ValueError(f"simulator.{name} must be a JSON object")
+        unknown = self.kv_transfer.keys() - {
+            "broker_url",
+            "kv_role",
+            "rpc_timeout_s",
+            "poll_interval_s",
+        }
+        if unknown:
+            raise ValueError(
+                f"Unsupported simulator.kv_transfer settings: {sorted(unknown)}"
+            )
         if self.original_parallel_config is not None:
             from vllm.config import ParallelConfig
 
@@ -74,6 +86,8 @@ class SimulatorConfig:
             "data_parallel_index",
         ):
             setattr(result.parallel_config, name, getattr(config.parallel_config, name))
+        if self.original_kv_transfer_config is not None:
+            result.kv_transfer_config = deepcopy(self.original_kv_transfer_config)
         result.cache_config = copy(config.cache_config)
         if self.physical_kv_cache_block_size is not None:
             result.cache_config.block_size = self.physical_kv_cache_block_size

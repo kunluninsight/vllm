@@ -85,6 +85,19 @@ class RequestManager:
             return False
 
     def _receive(self, request):
+        transfer = request.kv_transfer_params or {}
+        if transfer:
+            from vllm_simulator.plugin.kv_transfer.offline import (
+                SimulatorOfflineKVConnector,
+                validate_import,
+            )
+
+            if isinstance(self.scheduler.connector, SimulatorOfflineKVConnector):
+                validate_import(transfer, request.num_prompt_tokens)
+            elif "offline_kv_tokens" in transfer:
+                raise ValueError(
+                    "offline_kv_tokens requires SimulatorOfflineKVConnector"
+                )
         if self.blocking:
             now = self.clock.now
             created = now - max(0.0, time.time() - request.arrival_time)

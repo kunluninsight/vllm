@@ -48,7 +48,7 @@ workload=(--model "$MODEL" --backend openai --dataset-name random --seed 42 --re
 frontend=()
 if [[ -n "${FRONTEND_PROFILE:-}" ]]; then frontend=(--frontend-timing "$FRONTEND_PROFILE"); fi
 vllm bench serve "${workload[@]}" --base-url http://localhost:8000 --result-filename "native-${rate}.json"
-VLLM_PLUGINS=simulator pythonn -m vllm_simulator.benchmark.bench_serving "${workload[@]}" "${frontend[@]}" \
+VLLM_PLUGINS=simulator .venv/bin/python -m vllm_simulator.benchmark.bench_serving "${workload[@]}" "${frontend[@]}" \
   --base-url http://localhost:8001 --result-filename "sim-${rate}.json"
 ```
 
@@ -124,8 +124,13 @@ if __name__ == "__main__":
         bench.flush_cache()
 ```
 
+## Disaggregated prefill and decode
+
+- **Online handoff.** Run prefill and decode as separate `BLOCKING` servers with a shared KV transfer broker. The router forwards the prefill response’s `kv_transfer_params` to decode. See the [deployment commands and request example](docs/disaggregated-serving.md).
+- **Offline sizing.** Use `NON_BLOCKING` to compare prefill/decode replica counts on the same request trace under a fixed GPU budget. See the [P:D ratio sweep](docs/offline-pd-ratio-analysis.md).
+
 ## Implementation and tests
 
 The platform plugin selects the simulator worker, executor and scheduler. Model construction on PyTorch's meta device supplies the native KV layout. The simulator substitutes a predicted completion time and synthetic tokens for model forward. Both `SimpleCPUOffloadConnector` and CPU-backed `OffloadingConnector` track eviction and restoration with zero modeled copy time.
 
-Run `VLLM_PLUGINS=simulator pythonn -m pytest --confcutdir=tools/vllm-simulator tools/vllm-simulator/tests` from the repository root. Tests cover Qwen, DeepSeek, GLM and Kimi. For offline runs, set `SIMULATOR_TEST_MODEL_DIR` to the local `organization/model` tree, including the Qwen3-4B tokenizer.
+Run `VLLM_PLUGINS=simulator .venv/bin/python -m pytest --confcutdir=tools/vllm-simulator tools/vllm-simulator/tests` from the repository root. Tests cover Qwen, DeepSeek, GLM and Kimi. For offline runs, set `SIMULATOR_TEST_MODEL_DIR` to the local `organization/model` tree, including the Qwen3-4B tokenizer.

@@ -193,10 +193,39 @@ class OffloadingAdapter(ConnectorAdapter):
         super().shutdown()
 
 
+class PDAdapter(ConnectorAdapter):
+    def __init__(self):
+        pass
+
+    def begin_step(self, metadata):
+        pass
+
+    def end_step(self, metadata):
+        return KVConnectorOutput(
+            finished_sending=metadata.sending or None,
+            finished_recving=metadata.receiving or None,
+            failed_recving=metadata.failed or None,
+        )
+
+    def shutdown(self):
+        pass
+
+
+class OfflineKVAdapter(PDAdapter):
+    def end_step(self, metadata):
+        return KVConnectorOutput(finished_recving=metadata.receiving or None)
+
+
 def create_connector_adapter(config, kv_cache_config) -> ConnectorAdapter | None:
     transfer = config.kv_transfer_config
     if transfer is None:
         return None
+    from vllm_simulator.plugin.kv_transfer.protocol import CONNECTOR_NAME
+
+    if transfer.kv_connector == CONNECTOR_NAME:
+        return PDAdapter()
+    if transfer.kv_connector == "SimulatorOfflineKVConnector":
+        return OfflineKVAdapter()
     if transfer.kv_connector == "SimpleCPUOffloadConnector":
         if not config.cache_config.enable_prefix_caching:
             return None
