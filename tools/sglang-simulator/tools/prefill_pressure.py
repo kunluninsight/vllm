@@ -29,7 +29,17 @@ def payload(template, seed, namespace, index):
     return body, family
 
 
+def _ramp_up_seconds(args, request_rate):
+    seconds = getattr(args, "ramp_up_seconds", 0.0)
+    if not 0 <= seconds < args.duration:
+        raise ValueError("--ramp-up-seconds must satisfy 0 <= ramp < duration")
+    if request_rate is not None and seconds:
+        raise ValueError("--ramp-up-seconds is supported only in closed-loop concurrency mode")
+    return seconds
+
+
 async def case(args, sender, target, template, key, concurrency, case_index, request_rate=None):
+    ramp_up_seconds = _ramp_up_seconds(args, request_rate)
     name = f"c{concurrency}" if request_rate is None else "r" + format(request_rate, "g").replace(".", "p")
     out = args.output / name
     out.mkdir(mode=0o700, exist_ok=False)
@@ -41,7 +51,7 @@ async def case(args, sender, target, template, key, concurrency, case_index, req
     stop_reason, peak_inflight = None, 0
     manifest = dict(run_id=run_id, label=namespace, concurrency=concurrency,
                     arrival_mode="closed_loop" if request_rate is None else "constant_rate",
-                    request_rate=request_rate,
+                    request_rate=request_rate, ramp_up_seconds=ramp_up_seconds,
                     inflight_limit_behavior="stop admissions, then drain; never throttle rate",
                     duration_s=args.duration, max_requests=args.max_requests,
                     start_unix_s=wall0, start_monotonic_s=mono0,
@@ -77,15 +87,18 @@ async def case(args, sender, target, template, key, concurrency, case_index, req
                     print(json.dumps(dict(case=namespace, completed=len(records),
                                           elapsed_s=round(time.monotonic()-mono0, 1))), flush=True)
 
-            async def worker():
+            async def worker(worker_index):
                 nonlocal issued
+                if ramp_up_seconds:
+                    await asyncio.sleep(max(0, mono0 + ramp_up_seconds * worker_index / concurrency
+                                            - time.monotonic()))
                 while not abort and time.monotonic() < deadline and issued < args.max_requests:
                     index = issued
                     issued += 1
                     await submit(index, time.monotonic()-mono0)
 
             if request_rate is None:
-                await asyncio.gather(*(worker() for _ in range(concurrency)))
+                await asyncio.gather(*(worker(i) for i in range(concurrency)))
             else:
                 active = set()
                 while issued < args.max_requests:
@@ -120,6 +133,7 @@ async def case(args, sender, target, template, key, concurrency, case_index, req
     actual_sends = [r["actual_send_unix_s"] for r in records.values() if r.get("actual_send_unix_s") is not None]
     summary = dict(case=namespace, concurrency=concurrency, sent=issued,
                    arrival_mode=manifest["arrival_mode"], request_rate=request_rate,
+                   ramp_up_seconds=ramp_up_seconds,
                    stop_reason=stop_reason, peak_client_inflight=peak_inflight if request_rate is not None else None,
                    scheduled_requests=min(args.max_requests, math.ceil(args.duration * request_rate)) if request_rate is not None else None,
                    actual_send_count=len(actual_sends),
@@ -174,11 +188,17 @@ if __name__ == "__main__":
     p.add_argument("--max-inflight", type=int, default=1024)
     p.add_argument("--max-send-lag", type=float, default=0.25)
     p.add_argument("--duration", type=float, default=600)
+    p.add_argument("--ramp-up-seconds", type=float, default=0,
+                   help="spread closed-loop worker starts over this interval; excluded from request latency")
     p.add_argument("--gap", type=float, default=300)
     p.add_argument("--timeout", type=float, default=120)
     p.add_argument("--max-requests", type=int, default=20000)
     p.add_argument("--seed", type=int, default=1161637)
     a = p.parse_args()
+    try:
+        _ramp_up_seconds(a, a.request_rate)
+    except ValueError as error:
+        p.error(str(error))
     assert 1 <= a.max_inflight <= 2048 and 0 < a.max_send_lag <= 1
     assert a.request_rate is None or (all(math.isfinite(r) and 0 < r <= 100 for r in a.request_rate) and len(set(a.request_rate)) == len(a.request_rate))
     assert 0 < a.timeout <= 300
