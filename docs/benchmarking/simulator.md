@@ -73,6 +73,11 @@ outside its scope.
   `--kv-cache-memory-bytes` to set the budget explicitly.
 - **Parallelism.** Set native TP and PP options for the target layout.
   The plugin simulates model-parallel execution in one CPU worker.
+- **CPU KV offload.** Use `--kv-offloading-size 4 --kv-offloading-backend native`
+  for a 4 GiB CPU cache. The simulator supports the native
+  `SimpleCPUOffloadConnector` and `OffloadingConnector` with the CPU backend.
+  Stores and loads exercise native eviction and prefix reuse. Metadata
+  transfers have zero modeled duration.
 - **Timing.** Set `additional_config.simulator.predictor`. The default
   `linear` predictor assigns 10 ms per step. Set `base_ms` and
   `per_token_ms` for a linear timing model. For measured latencies use

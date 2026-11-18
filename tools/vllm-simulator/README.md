@@ -3,7 +3,7 @@
 Run vLLM serving or virtual-time workload replay on a single CPU host using
 synthetic tokens and predicted model latency.
 
-- [Installation, serving and replay](../../docs/benchmarking/simulator.md)
+- [Installation, serving, replay and CPU KV offload](../../docs/benchmarking/simulator.md)
 - [Collect native timings and build a predictor](docs/collectors.md)
 
 ## Run the end-to-end tests

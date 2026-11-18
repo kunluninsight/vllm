@@ -16,13 +16,17 @@ from vllm_simulator.time_predictor import (
 class TimedModelOutput(AsyncModelRunnerOutput):
     """Synchronize the predicted device work when the executor consumes its output."""
 
-    def __init__(self, output, clock, deadline):
+    def __init__(self, output, clock, deadline, finish_connector=None):
         self.output = output
         self.clock = clock
         self.deadline = deadline
+        self.finish_connector = finish_connector
 
     def get_output(self, timeout=None):
         self.clock.wait_until(self.deadline, timeout)
+        if self.finish_connector is not None:
+            self.output.kv_connector_output = self.finish_connector()
+            self.finish_connector = None
         return self.output
 
     def get_kv_connector_output(self):

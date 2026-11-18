@@ -3,6 +3,7 @@
 """CPU execution selected through vLLM's out-of-tree platform interface."""
 
 import sys
+from copy import copy
 
 from vllm.exceptions import VLLMValidationError
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
@@ -108,15 +109,13 @@ class SimulatorPlatform(Platform):
         config.parallel_config.distributed_executor_backend = (
             "vllm_simulator.plugin.executor.SimulatorExecutor"
         )
-        if (
-            config.kv_transfer_config
-            or config.cache_config.kv_offloading_size is not None
-        ):
-            raise ValueError("The simulator requires local KV cache")
+        config._post_init_kv_transfer_config()
         topology = simulator_config.original_parallel_config
         requested_async = config.scheduler_config.async_scheduling
         use_async = (
-            requested_async is not False and topology.pipeline_parallel_size == 1
+            requested_async is not False
+            and topology.pipeline_parallel_size == 1
+            and config.kv_transfer_config is None
         )
         config.scheduler_config.scheduler_cls = (
             "vllm_simulator.plugin.scheduler.SimulatorAsyncScheduler"
@@ -155,8 +154,81 @@ class SimulatorPlatform(Platform):
             raise ValueError(
                 "Speculation, LoRA, encoder connectors and pooling are not supported"
             )
+        cls._configure_offload(config)
         if simulator_config.token_id >= model.get_vocab_size():
             raise ValueError("simulator.token_id must be inside the model vocabulary")
+
+    @classmethod
+    def _configure_offload(cls, config) -> None:
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            simple_cpu_offload_connector,
+        )
+
+        transfer = config.kv_transfer_config
+        if transfer is None:
+            return
+        if (
+            transfer.kv_connector
+            not in ("SimpleCPUOffloadConnector", "OffloadingConnector")
+            or transfer.kv_connector_module_path is not None
+            or transfer.kv_role != "kv_both"
+        ):
+            raise ValueError(
+                "Simulator KV offload requires native SimpleCPUOffloadConnector or "
+                "OffloadingConnector with kv_role=kv_both"
+            )
+        extra = dict(transfer.kv_connector_extra_config)
+        if extra.get("kv_offload_backend", "cpu") != "cpu":
+            raise ValueError("Simulator KV offload supports only the CPU backend")
+        if transfer.kv_connector == "SimpleCPUOffloadConnector":
+            original = SimulatorConfig.from_config(config).original_parallel_config
+            extra.setdefault(
+                "cpu_bytes_to_use_per_rank",
+                int(
+                    extra.get(
+                        "cpu_bytes_to_use",
+                        simple_cpu_offload_connector.DEFAULT_CPU_CAPACITY_BYTES,
+                    )
+                )
+                // original.world_size,
+            )
+            capacity = extra["cpu_bytes_to_use_per_rank"]
+        else:
+            if (
+                extra.get("spec_name", "CPUOffloadingSpec") != "CPUOffloadingSpec"
+                or extra.get("spec_module_path") is not None
+                or extra.get("canonical_layout", False)
+                or extra.get("secondary_tiers")
+            ):
+                raise ValueError(
+                    "Simulator OffloadingConnector requires CPUOffloadingSpec "
+                    "with the native local layout and no secondary tiers"
+                )
+            capacity = extra.get("cpu_bytes_to_use", 0)
+        if int(capacity) <= 0:
+            raise ValueError("Simulator CPU offload capacity must be positive")
+        transfer.kv_connector_extra_config = extra
+
+    @classmethod
+    def get_scheduler_config(cls, config, kv_cache_config):
+        """Return a scheduler config view with a single-worker offload budget."""
+        from vllm.utils.math_utils import round_up
+        from vllm_simulator.plugin.kv_transfer.capacity import cpu_offloading_spec
+
+        transfer = config.kv_transfer_config
+        if transfer is None or transfer.kv_connector != "OffloadingConnector":
+            return config
+        spec = cpu_offloading_spec(config, kv_cache_config)
+        view = copy(config)
+        view.kv_transfer_config = copy(transfer)
+        view.kv_transfer_config.kv_connector_extra_config = {
+            **transfer.kv_connector_extra_config,
+            "cpu_bytes_to_use": spec.num_chunks
+            * round_up(spec.cpu_page_size_per_worker, spec.BLOCK_SIZE_ALIGNMENT),
+        }
+        if spec.num_chunks == 0:
+            raise ValueError("Simulator CPU offload capacity is smaller than one chunk")
+        return view
 
     @classmethod
     def validate_request(cls, processed_inputs, params) -> None:

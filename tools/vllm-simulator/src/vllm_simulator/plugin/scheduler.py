@@ -8,12 +8,18 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
+from vllm_simulator.plugin.platform import SimulatorPlatform
 from vllm_simulator.request_manager.manager import RequestManager
 
 
 class SimulatorScheduler(Scheduler):
     def __init__(self, vllm_config, kv_cache_config, *args, **kwargs):
-        super().__init__(vllm_config, kv_cache_config, *args, **kwargs)
+        super().__init__(
+            SimulatorPlatform.get_scheduler_config(vllm_config, kv_cache_config),
+            kv_cache_config,
+            *args,
+            **kwargs,
+        )
         self.request_manager: RequestManager | None = None
 
     def add_request(self, request: Request) -> None:

@@ -3,6 +3,7 @@
 """Implement the worker contract using cache accounting and synthetic tokens."""
 
 import json
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -11,6 +12,11 @@ from vllm.logger import init_logger
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm_simulator.plugin.config import SimulatorConfig
+from vllm_simulator.plugin.kv_transfer.adapters import (
+    ConnectorAdapter,
+    SimpleCPUOffloadAdapter,
+    create_connector_adapter,
+)
 from vllm_simulator.plugin.model_runner import SimulatorModelRunner, TimedModelOutput
 from vllm_simulator.time_predictor import ScheduleBatch, ScheduleRequest
 
@@ -33,6 +39,7 @@ class SimulatorWorker(WorkerBase):
             directory.mkdir(parents=True, exist_ok=True)
             self.step_trace = (directory / "dp0.steps.jsonl").open("x", buffering=1)
         self.model_runner.model_memory_usage = self.model_layout.model_memory_bytes
+        self.kv_connector: ConnectorAdapter | None = None
         self.request_lengths: dict[str, tuple[int, int]] = {}
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
@@ -89,11 +96,21 @@ class SimulatorWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config) -> None:
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+        self.kv_connector = create_connector_adapter(self.vllm_config, kv_cache_config)
+
+    def get_simple_cpu_offload_num_cpu_blocks(self) -> int | None:
+        return (
+            self.kv_connector.num_cpu_blocks
+            if isinstance(self.kv_connector, SimpleCPUOffloadAdapter)
+            else None
+        )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         return CompilationTimes(0.0, 0.0)
 
     def execute_model(self, output) -> ModelRunnerOutput | TimedModelOutput:
+        if self.kv_connector is not None:
+            self.kv_connector.begin_step(output.kv_connector_metadata)
         for request_id in output.finished_req_ids:
             self.request_lengths.pop(request_id, None)
         computed_tokens = dict(
@@ -140,14 +157,24 @@ class SimulatorWorker(WorkerBase):
                 )
                 self.step_index += 1
         result = ModelRunnerOutput(req_ids=ids, sampled_token_ids=sampled)
+        finish_connector = (
+            partial(self.kv_connector.end_step, output.kv_connector_metadata)
+            if self.kv_connector is not None
+            else None
+        )
         if ids:
             return TimedModelOutput(
                 result,
                 self.model_runner.clock,
                 self.model_runner.clock.device_available_at,
+                finish_connector,
             )
+        if finish_connector:
+            result.kv_connector_output = finish_connector()
         return result
 
     def shutdown(self) -> None:
+        if self.kv_connector is not None:
+            self.kv_connector.shutdown()
         if self.step_trace is not None:
             self.step_trace.close()
