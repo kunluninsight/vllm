@@ -5,7 +5,7 @@ import pytest
 from sglang_simulator.simulation.vllm.tpu_pp import stage_runtime as rt
 
 
-@pytest.mark.parametrize('overhead', [0.0, 0.0013])
+@pytest.mark.parametrize('overhead', [0.0, 0.00058, 0.0013])
 def test_barrier_blocks_host_but_payload_readiness_can_overlap(monkeypatch, overhead):
     clock = [100.0]
     monkeypatch.setattr(rt.time, 'monotonic', lambda: clock[0])

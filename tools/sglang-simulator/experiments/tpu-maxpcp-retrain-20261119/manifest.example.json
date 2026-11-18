@@ -1,0 +1,15 @@
+{
+  "datasets": [
+    {
+      "name": "ramp-1117",
+      "features_csv": "/host/qwen38-tpu-pp/work/pressure-1116/ramp-predictor-1117/step-features.csv",
+      "contexts_json": "/host/qwen38-tpu-pp/work/pressure-1116/ramp-predictor-1117/cases.json",
+      "stage_dirs": [
+        "/host/qwen38-tpu-pp/work/pressure-1116/maxpcp-1119/raw/stage0",
+        "/host/qwen38-tpu-pp/work/pressure-1116/maxpcp-1119/raw/stage1",
+        "/host/qwen38-tpu-pp/work/pressure-1116/maxpcp-1119/raw/stage2",
+        "/host/qwen38-tpu-pp/work/pressure-1116/p3-distribution-1118"
+      ]
+    }
+  ]
+}

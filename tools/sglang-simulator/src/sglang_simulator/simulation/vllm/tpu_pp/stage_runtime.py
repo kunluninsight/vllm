@@ -158,9 +158,6 @@ def worker_main(rank, cfg, control, reply, barrier, payloads, events):
     emit_hook_event("STAGE_READY", stage=rank, stages=cfg.stages, status="ready",
                     model_loaded=isinstance(model, StageModel))
     reply.send((0, True, {"ready": rank, "pid": os.getpid()}))
-    # Personal test4 calibration: residual from forward entry to the native drain/output boundary.
-    # Rows are global PCP padding, columns are P0..P3; all values in milliseconds.
-    warm_offsets_ms = {2048: (5, 3, 2, -1), 4096: (4, 5, 3, 4), 8192: (1, 3, 6, 0)}
     pending = None
     try:
         while True:
@@ -191,9 +188,6 @@ def worker_main(rank, cfg, control, reply, barrier, payloads, events):
                     if rank == cfg.stages - 1:
                         features = {**features, **payload.tail}
                     duration = model.predict(features)
-                    offsets = warm_offsets_ms.get(features["global_padded_tokens"])
-                    if offsets is not None:
-                        duration = max(0.0, duration + offsets[rank] / 1000)
                     if not 0 <= duration < 60:
                         raise ValueError(f"invalid stage prediction {duration}")
                     # 起点已包含本次模型查询，不再额外叠加预测器 CPU 耗时
