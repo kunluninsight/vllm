@@ -1,16 +1,7 @@
-# ML and Replay GPU collector
+# Collect GPU and frontend timings
 
-`simulator_collector` is an opt-in vLLM endpoint plugin paired with
-`vllm_simulator.collector.worker.CollectorWorker`, a native GPU Worker subclass.
-It exports measured execution for ML and Replay predictors without enabling the
-simulator platform or modifying vLLM classes. Tensor parallelism is supported;
-PP, DP, context parallelism and speculative decoding are unsupported here.
-
-## Enable collection
-
-Install the simulator package into the vLLM environment. Set `SIM_MODEL` to the
-requested model ID or local directory, and add the native serving options for
-that model and topology:
+Enable `simulator_collector` on a native server with the target model and deployment flags.
+The worker supports TP with PP=DP=PCP=DCP=1 and speculative decoding disabled.
 
 ```bash
 VLLM_PLUGINS=simulator_collector \
@@ -19,64 +10,38 @@ VLLM_PLUGINS=simulator_collector \
   --additional-config '{"simulator":{"collector":{"output_dir":"/path/to/exports","gzip":true}}}'
 ```
 
-POST `/start_profile` and `/stop_profile` while the engine is idle to delimit
-collection windows, or use the native `vllm bench serve --profile` flag.
-No `--profiler-config` is required; these routes control collection. Only steps
-between start and stop are recorded. Start resets the in-memory buffer without
-creating or changing export files. Stop waits for recorded CUDA events and
-exports the buffered rows, replacing the previous export. Archive completed
-exports between runs. Shutdown without stop discards the unfinished window.
-Enable `simulator` separately when replaying on CPU.
+Use `vllm bench serve --profile`, or POST `/start_profile` and `/stop_profile` on
+an idle server around each window. Stop synchronizes outstanding CUDA events
+and replaces the previous files. Archive them between runs. Rows are buffered
+in memory until stop; shutdown discards an unfinished window.
 
-## Export contract
-
-Collection parameters live in `additional_config.simulator.collector` and are
-passed to every worker through vLLM's engine configuration:
-
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `output_dir` | `"."` | Export directory, relative to each worker's current directory. |
-| `gzip` | `true` | Write gzip-compressed JSONL; `false` writes plain JSONL. |
-
-Use an export directory accessible to all workers. Each worker owns its
-`rank{rank}.schedule_batch.jsonl.gz` (or `.jsonl`) file and resets `step_id` to
-zero at the start of a window.
-
-Each row contains a step ID, wall-clock start timestamp, scheduled token total,
-forward mode, `iter_latency` (forward seconds), `sample_tokens_latency`
-(sampling seconds), and `requests` tuples:
-
-```text
-[full_request_id, extend_length, past_kv_length, output_length]
-```
-
-The scheduled lengths are captured before model execution. Request token IDs
-are not exported. CUDA events surround the native Worker RPCs. Subsequent
-steps drain completed events into memory without synchronization; stopping
-synchronizes outstanding end events and writes the file. Memory usage grows
-with the number of recorded steps until stop. Native return values and async
-output objects pass through unchanged. GPU stream durations exclude some
-CPU/HTTP overhead; event recording and buffering also have collection cost.
-
-## Fit a predictor
-
-Use a calibration trace from the target model, hardware, parallelism and
-scheduler configuration. For a single GPU, build either a lookup table or
-a regression model from its export. Install the plugin's `ml` extra for the
-regression model.
+Each worker writes `rank{rank}.schedule_batch.jsonl.gz` under `output_dir`
+(default `.`). Set `gzip: false` for plain JSONL. Rows contain a window-local
+step ID, wall-clock start time, forward mode, scheduled token count, forward
+and sampling durations in seconds, and `[request_id, extend_length, past_kv_length,
+output_length]` per request. Event recording adds overhead and measures GPU
+stream time around worker RPCs. For TP, align steps across ranks and take both
+durations from the rank with the largest forward-plus-sampling time.
 
 ```python
 from vllm_simulator.time_predictor.ml import MLTimePredictor
 from vllm_simulator.time_predictor.replay import ReplayTimePredictor
 
-trace = "rank0.schedule_batch.jsonl.gz"
+trace = "rank0.schedule_batch.jsonl.gz"  # Single-GPU calibration
 ReplayTimePredictor.build_table_from_schedule_batch(trace, "replay.json")
 MLTimePredictor.build_model_from_schedule_batch(trace, "ml.joblib")
 ```
 
-Set `predictor` to `{"name": "replay", "database_path": "replay.json"}` or
-`{"name": "ml", "database_path": "ml.joblib"}` under
-`additional_config.simulator`. Replay averages matching step shapes. For
-unseen shapes it defaults to zero seconds. Set `miss_strategy` to `knn` to
-interpolate from neighboring shapes. Validate request-level TTFT and TPOT on
-a separate trace with the predictor held fixed.
+Set `additional_config.simulator.predictor` to `{"name":"ml","database_path":"ml.joblib"}`
+or `{"name":"replay","database_path":"replay.json"}`. ML requires the plugin's `ml`
+extra. Replay averages exact shape matches; unseen shapes take zero time by
+default, or use `miss_strategy: knn` for interpolation. Validate on separate traffic.
+
+For frontend calibration use a single API process, `request_timeline: true` in
+the collector config, `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1`, unique request
+IDs and `--save-detailed`. On one host, match the client's monotonic `start_times`,
+`ttfts` and `latencies` to `queued_at`, `first_token_at` and `last_token_at` in
+`requests.jsonl.gz`. Fit ingress and first-chunk delivery against prompt length;
+use `queued_at - start_time` and `start_time + ttft - first_token_at`, respectively.
+For later-chunk delivery use `start_time + latency - last_token_at` from multi-token
+requests. Convert seconds to the units in the simulator client profile.

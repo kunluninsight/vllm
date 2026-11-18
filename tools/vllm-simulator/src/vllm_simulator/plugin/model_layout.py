@@ -64,6 +64,7 @@ class _NullCudaObject:
 def virtual_parallel_groups(parallel, pp_rank):
     """Lend model constructors rank metadata, restoring native groups on exit."""
     import vllm.distributed.parallel_state as ps
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
 
     sizes = {
         "_WORLD": parallel.world_size,
@@ -78,14 +79,20 @@ def virtual_parallel_groups(parallel, pp_rank):
         "_ETP": parallel.tensor_parallel_size,
     }
     with ExitStack() as stack:
+        if parallel.enable_expert_parallel:
+            # The log formatter reads tensor values that meta weights do not have.
+            stack.enter_context(
+                patch.object(
+                    ExpertMapManager, "get_compressed_map_string", lambda _: "meta"
+                )
+            )
         for name, size in sizes.items():
             group = object.__new__(ps.GroupCoordinator)
             group.world_size = size
-            group.rank_in_group = pp_rank if name == "_PP" else 0
-            group.rank = group.rank_in_group
+            group.rank = group.rank_in_group = pp_rank if name == "_PP" else 0
             group.local_rank = 0
             group.ranks = list(range(size))
-            group.device_group = _VirtualProcessGroup(size, group.rank_in_group)
+            group.device_group = _VirtualProcessGroup(size, group.rank)
             group.cpu_group = group.device_group
             group.device_communicator = None
             stack.enter_context(patch.object(ps, name, group))
@@ -156,17 +163,14 @@ def meta_model_context(device: SimulatorDevice, *, model_type=None):
             total_memory=device.total_memory_bytes,
         )
         stack.enter_context(
-            patch.object(
-                torch.cuda, "get_device_properties", lambda device=None: properties
+            patch.multiple(
+                torch.cuda,
+                get_device_properties=lambda device=None: properties,
+                get_device_capability=lambda device=None: capability,
+                Stream=_NullCudaObject,
+                Event=_NullCudaObject,
             )
         )
-        stack.enter_context(
-            patch.object(
-                torch.cuda, "get_device_capability", lambda device=None: capability
-            )
-        )
-        stack.enter_context(patch.object(torch.cuda, "Stream", _NullCudaObject))
-        stack.enter_context(patch.object(torch.cuda, "Event", _NullCudaObject))
         # These paths select or warm up compute kernels, never cache layouts.
         for name in ("VLLM_KIMI_K3_GEMM_AR", "VLLM_ENABLE_GEMM_RS"):
             stack.enter_context(patch.object(envs, name, False))
@@ -234,11 +238,9 @@ def build_model_layout(config):
         with virtual_parallel_groups(view.parallel_config, 0):
             current_platform.update_block_size_for_backend(view)
             layers = get_kv_cache_layer_configs(view)
+            backends = get_current_attn_backends(view)
             supported_layouts = tuple(
-                layout.name
-                for layout in get_supported_kv_cache_layouts(
-                    get_current_attn_backends(view)
-                )
+                layout.name for layout in get_supported_kv_cache_layouts(backends)
             )
 
     # A single scheduler represents PP. Budget for the busiest stage of each
@@ -277,9 +279,7 @@ def build_model_layout(config):
         }
     for field in fields(view.cache_config):
         setattr(config.cache_config, field.name, getattr(view.cache_config, field.name))
-    config.cache_config.block_size = (
-        view.cache_config.block_size * view.parallel_config.decode_context_parallel_size
-    )
+    config.cache_config.block_size = view.cache_config.block_size * dcp
     config.additional_config["simulator"]["physical_kv_cache_block_size"] = (
         view.cache_config.block_size
     )
