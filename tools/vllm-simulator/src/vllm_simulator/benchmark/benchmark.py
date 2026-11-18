@@ -138,6 +138,12 @@ class Benchmark:
             or request_id in self._pending
         ):
             raise ValueError("Request ids must be non-empty and unique")
+        rank = req.custom_params.get("data_parallel_rank")
+        if rank is not None and (
+            type(rank) is not int
+            or not 0 <= rank < self.vllm_config.parallel_config.data_parallel_size
+        ):
+            raise ValueError("data_parallel_rank must identify an engine DP rank")
         options = deepcopy(req.sampling_kwargs)
         options.setdefault("max_tokens", req.output_length)
         options.setdefault("ignore_eos", True)
@@ -164,7 +170,7 @@ class Benchmark:
         try:
             final_output = None
             async for output in self._llm.generate(
-                prompt, params, request_id=request_id
+                prompt, params, request_id=request_id, data_parallel_rank=rank
             ):
                 final_output = output
             stats = (

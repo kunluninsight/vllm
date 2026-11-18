@@ -60,6 +60,9 @@ class RequestStats:
                     stats["output_length"] = int(stats["ttft"] is not None) + len(
                         stats["itls"]
                     )
+                    if step.dp_rank is not None:
+                        stats["dp_rank"] = step.dp_rank
+                        stats["step_batch_tokens"] = list(step.batch_tokens)
                     output.kv_transfer_params = {
                         **(output.kv_transfer_params or {}),
                         "simulation": stats,

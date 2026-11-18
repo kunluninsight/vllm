@@ -72,7 +72,10 @@ outside its scope.
   uses `gpu_memory_utilization` and model tensor storage. Use
   `--kv-cache-memory-bytes` to set the budget explicitly.
 - **Parallelism.** Set native TP and PP options for the target layout.
-  The plugin simulates model-parallel execution in one CPU worker.
+  The plugin simulates model-parallel execution in one CPU worker per DP
+  rank. Set `--data-parallel-size` for single-host internal load balancing
+  with the `mp` backend. MoE DP ranks share a replay clock. Independent dense
+  DP replicas require `BLOCKING` mode.
 - **CPU KV offload.** Use `--kv-offloading-size 4 --kv-offloading-backend native`
   for a 4 GiB CPU cache. The simulator supports the native
   `SimpleCPUOffloadConnector` and `OffloadingConnector` with the CPU backend.

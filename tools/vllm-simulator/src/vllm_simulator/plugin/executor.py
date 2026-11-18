@@ -15,6 +15,8 @@ class StepSnapshot:
     started_at: float
     finished_at: float
     scheduled_ids: tuple[str, ...]
+    dp_rank: int | None
+    batch_tokens: tuple[int, ...]
 
 
 class BatchFuture(Future):
@@ -45,6 +47,12 @@ class SimulatorExecutor(Executor):
         self.worker.init_device()
         self.worker.load_model()
         self.clock = self.worker.model_runner.clock
+        topology = self.worker.model_runner.simulator_config.original_parallel_config
+        self.dp_index = (
+            self.parallel_config.data_parallel_index
+            if topology.data_parallel_size > 1
+            else None
+        )
         self.sample_future = None
         self.last_scheduled_ids: tuple[str, ...] = ()
 
@@ -68,6 +76,13 @@ class SimulatorExecutor(Executor):
             future.set_exception(error)
         return future
 
+    @property
+    def dp(self):
+        return self.worker.model_runner.dp
+
+    def bind_dp_group(self, group) -> None:
+        self.worker.model_runner.bind_dp_group(group)
+
     def begin_step(self) -> None:
         self.last_scheduled_ids = ()
 
@@ -77,6 +92,8 @@ class SimulatorExecutor(Executor):
             started_at=runner.last_step_start,
             finished_at=self.clock.now,
             scheduled_ids=self.last_scheduled_ids,
+            dp_rank=self.dp_index,
+            batch_tokens=tuple(batch.num_tokens for batch in runner.last_batches),
         )
 
     def execute_model(self, scheduler_output, non_block=False):
@@ -87,6 +104,8 @@ class SimulatorExecutor(Executor):
             submitted_at,
             self.clock.device_available_at if self.last_scheduled_ids else submitted_at,
             self.last_scheduled_ids,
+            self.dp_index,
+            (scheduler_output.total_num_scheduled_tokens,),
         )
         future = BatchFuture(output, snapshot)
         if self.scheduler_config.async_scheduling and self.last_scheduled_ids:
@@ -99,6 +118,11 @@ class SimulatorExecutor(Executor):
         if future is None:
             return super().sample_tokens(grammar_output, non_block)
         return future if non_block else future.result()
+
+    def execute_dummy_batch(self) -> None:
+        self.last_scheduled_ids = ()
+        self.worker.execute_dummy_batch()
+        self.clock.wait_until(self.clock.device_available_at)
 
     def check_health(self) -> None:
         pass

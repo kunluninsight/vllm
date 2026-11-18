@@ -64,12 +64,15 @@ def test_offload_restores_evicted_prefix(model_path, connector, monkeypatch):
         assert restored["ttft"] < cold["ttft"]
 
 
-def test_replay_observes_virtual_arrivals(model_path):
+@pytest.mark.parametrize("dp_size", [1, 2])
+def test_replay_observes_virtual_arrivals_on_each_rank(model_path, dp_size):
     with Benchmark(
         EngineArgs(
-            model=model_path("Qwen/Qwen3-4B"),
+            model=model_path("Qwen/Qwen3-30B-A3B" if dp_size > 1 else "Qwen/Qwen3-4B"),
+            data_parallel_size=dp_size,
             skip_tokenizer_init=True,
             max_model_len=256,
+            max_num_seqs=4,
         )
     ) as bench:
         trace = [
@@ -77,11 +80,15 @@ def test_replay_observes_virtual_arrivals(model_path):
                 token_ids=[42, 43],
                 output_length=2,
                 sampling_kwargs={"detokenize": False},
-                custom_params={"created_time": 0.5},
+                custom_params={"created_time": 0.5, "data_parallel_rank": rank},
             )
+            for rank in range(dp_size)
         ]
-        assert bench.benchmark(BenchmarkConfig(), trace)["completed"] == 1
-        (stats,) = bench.get_request_stats()
-        assert stats["admitted_at"] == 0.5
-        assert stats["ttft"] == pytest.approx(0.01)
-        assert stats["itls"] == pytest.approx([0.01])
+        assert bench.benchmark(BenchmarkConfig(), trace)["completed"] == dp_size
+        for rank, stats in enumerate(bench.get_request_stats()):
+            if dp_size > 1:
+                assert stats["dp_rank"] == rank
+                assert stats["step_batch_tokens"] == [1, 1]
+            assert stats["admitted_at"] == 0.5
+            assert stats["ttft"] == pytest.approx(0.01)
+            assert stats["itls"] == pytest.approx([0.01])

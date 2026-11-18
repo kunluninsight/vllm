@@ -5,6 +5,9 @@
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from typing import NamedTuple
+
+import torch
 
 from vllm.outputs import RequestError
 from vllm.v1.core.sched.interface import PauseState
@@ -17,16 +20,30 @@ from vllm_simulator.request_manager.dispatcher import PendingRequest
 from vllm_simulator.request_manager.stats import RequestStats
 
 
+class RankReplayState(NamedTuple):
+    now: float
+    next_arrival: float
+    has_scheduled_requests: bool
+    received_count: int
+    expected_count: int
+    active_count: int
+    pending_count: int
+    round_validated: bool
+    failed: bool
+
+
 class RequestManager:
     def __init__(
         self,
         config,
         *,
         clock,
+        dp,
         scheduler,
         notify_aborted: Callable[[list[Request]], None],
     ):
         self.clock = clock
+        self.dp = dp
         self.scheduler = scheduler
         self.notify_aborted = notify_aborted
         self.blocking = SimulatorConfig.from_config(config).mode == "BLOCKING"
@@ -118,28 +135,64 @@ class RequestManager:
         if self.blocking:
             return True
         unpaused = self.scheduler.pause_state == PauseState.UNPAUSED
-        if self.failure:
-            return self._fail_round(self.failure)
-        if self.expected_count and self.received_count < self.expected_count:
+        local = RankReplayState(
+            self.clock.now,
+            self.dispatcher.next_time() if unpaused else float("inf"),
+            any(self.scheduler.get_request_counts()),
+            self.received_count,
+            self.expected_count or 0,
+            len(self.active),
+            self.pending_count,
+            self.round_validated,
+            self.failure is not None,
+        )
+        states = (
+            [local]
+            if self.dp.size == 1
+            else [
+                RankReplayState(*row.tolist())
+                for row in self.dp.gather(torch.tensor(local, dtype=torch.float64))
+            ]
+        )
+        if any(state.failed for state in states):
+            messages = self.dp.gather_json(self.failure)
+            return self._fail_round(next(message for message in messages if message))
+        expected = {
+            int(state.expected_count) for state in states if state.received_count > 0
+        }
+        if len(expected) > 1:
+            return self._fail_round("DP replay requests must agree on total_requests")
+        total = sum(int(state.received_count) for state in states)
+        barrier = next(iter(expected), 0)
+        if barrier and total > barrier:
+            return self._fail_round("DP received more requests than total_requests")
+        if barrier and total < barrier:
             return not unpaused
         if (
             self.dispatcher.sync_metadata
-            and self.expected_count
-            and not self.round_validated
+            and barrier
+            and not all(state.round_validated for state in states)
         ):
+            records = self.dp.gather_json(self.dispatcher.round_metadata())
             try:
-                self.dispatcher.validate_round(self.dispatcher.round_metadata())
+                self.dispatcher.validate_round(
+                    [item for rank in records for item in rank]
+                )
             except (ValueError, TypeError) as error:
                 return self._fail_round(str(error))
             self.round_validated = True
-        if unpaused and not any(self.scheduler.get_request_counts()):
-            arrival = min(next_completion, self.dispatcher.next_time())
+        self.clock.now = max(state.now for state in states)
+        if not any(state.has_scheduled_requests for state in states):
+            arrival = min(next_completion, min(state.next_arrival for state in states))
             if arrival != float("inf"):
                 self.clock.now = max(self.clock.now, arrival)
         candidates = self.dispatcher.candidates(self.clock.now) if unpaused else []
         cap = self.dispatcher.max_concurrency
-        if cap:
-            candidates = candidates[: max(0, cap - len(self.active))]
+        width = (
+            min(cap, max(int(state.pending_count) for state in states)) if cap else 0
+        )
+        if width:
+            candidates = self._select_global_candidates(candidates, width, cap, states)
         for entry in candidates:
             item = self.dispatcher.take(entry.request_id)
             self.active.add(entry.request_id)
@@ -147,12 +200,27 @@ class RequestManager:
             self.scheduler.admit_deferred(item.request)
         return True
 
+    def _select_global_candidates(self, candidates, width, cap, states):
+        slots = max(0, cap - sum(int(state.active_count) for state in states))
+        times = torch.full((width,), float("inf"), dtype=torch.float64)
+        for i, entry in enumerate(candidates):
+            times[i] = entry.dispatch_at
+        selected = sorted(
+            (float(value), rank, index)
+            for rank, values in enumerate(self.dp.gather(times))
+            for index, value in enumerate(values)
+            if float(value) != float("inf")
+        )[:slots]
+        indices = {index for _, rank, index in selected if rank == self.dp.rank}
+        return [entry for i, entry in enumerate(candidates) if i in indices]
+
     def finish_step(self, outputs, snapshot):
         for rid in self.stats.update(snapshot, outputs):
             self.active.discard(rid)
             self.dispatcher.complete(rid)
         if self.dispatcher.sync_metadata:
-            self.dispatcher.apply_events(self.dispatcher.drain_events())
+            events = self.dp.gather_json(self.dispatcher.drain_events())
+            self.dispatcher.apply_events([item for rank in events for item in rank])
         self._reset_if_drained()
         for client, errors in self._errors.items():
             batch = outputs.setdefault(client, EngineCoreOutputs())
@@ -192,5 +260,16 @@ class RequestManager:
         outstanding = bool(self.pending_count) or any(
             self.scheduler.get_request_counts()
         )
-        if not outstanding and self.received_count >= (self.expected_count or 0):
-            self._clear_round()
+        counts = (outstanding, self.received_count, self.expected_count or 0)
+        ranks = (
+            [counts]
+            if self.dp.size == 1
+            else [
+                row.tolist()
+                for row in self.dp.gather(torch.tensor(counts, dtype=torch.int64))
+            ]
+        )
+        outstanding_by_rank, received_by_rank, expected_by_rank = zip(*ranks)
+        if any(outstanding_by_rank) or sum(received_by_rank) < max(expected_by_rank):
+            return
+        self._clear_round()

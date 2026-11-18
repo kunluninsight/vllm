@@ -68,6 +68,12 @@ class SimulatorConfig:
         result.parallel_config = deepcopy(
             self.original_parallel_config or config.parallel_config
         )
+        for name in (
+            "data_parallel_rank",
+            "data_parallel_rank_local",
+            "data_parallel_index",
+        ):
+            setattr(result.parallel_config, name, getattr(config.parallel_config, name))
         result.cache_config = copy(config.cache_config)
         if self.physical_kv_cache_block_size is not None:
             result.cache_config.block_size = self.physical_kv_cache_block_size

@@ -92,8 +92,16 @@ class SimulatorPlatform(Platform):
 
         simulator_config = SimulatorConfig.backup_parallel_config(config)
         parallel = config.parallel_config
-        if parallel.nnodes != 1 or parallel.data_parallel_size != 1:
-            raise ValueError("The simulator requires a single node and DP size 1")
+        if (
+            parallel.nnodes != 1
+            or parallel.data_parallel_external_lb
+            or parallel.data_parallel_hybrid_lb
+        ):
+            raise ValueError(
+                "The simulator requires a single node with internal DP load balancing"
+            )
+        if parallel.data_parallel_size_local != parallel.data_parallel_size:
+            raise ValueError("All simulated DP ranks must be local")
         parallel.tensor_parallel_size = 1
         parallel.pipeline_parallel_size = 1
         parallel.prefill_context_parallel_size = 1
@@ -103,6 +111,7 @@ class SimulatorPlatform(Platform):
         parallel.world_size = 1
         parallel.rank = 0
         parallel.master_addr = "127.0.0.1"
+        parallel.data_parallel_master_ip = "127.0.0.1"
         config.parallel_config.worker_cls = (
             "vllm_simulator.plugin.worker.SimulatorWorker"
         )
@@ -114,7 +123,7 @@ class SimulatorPlatform(Platform):
         requested_async = config.scheduler_config.async_scheduling
         use_async = (
             requested_async is not False
-            and topology.pipeline_parallel_size == 1
+            and topology.data_parallel_size == topology.pipeline_parallel_size == 1
             and config.kv_transfer_config is None
         )
         config.scheduler_config.scheduler_cls = (
@@ -138,6 +147,21 @@ class SimulatorPlatform(Platform):
         if config.model_config is None:
             return
         simulator_config = SimulatorConfig.from_config(config)
+        parallel = config.parallel_config
+        if parallel.data_parallel_backend != "mp":
+            raise ValueError("Simulator DP currently requires the mp backend")
+        if (
+            parallel.data_parallel_size > 1
+            and not config.model_config.is_moe
+            and simulator_config.mode == "NON_BLOCKING"
+        ):
+            raise ValueError(
+                "NON_BLOCKING replay requires a shared clock across DP ranks. "
+                "Dense DP ranks run independently. Use BLOCKING mode for dense DP "
+                "or data_parallel_size=1 for virtual-time replay."
+            )
+        if parallel.enable_dbo or parallel.enable_elastic_ep:
+            raise ValueError("Simulator DP does not support DBO or elastic EP")
         model = config.model_config
         if (
             model.is_encoder_decoder

@@ -37,7 +37,9 @@ class SimulatorWorker(WorkerBase):
         if self.simulator_config.step_trace_dir is not None:
             directory = Path(self.simulator_config.step_trace_dir)
             directory.mkdir(parents=True, exist_ok=True)
-            self.step_trace = (directory / "dp0.steps.jsonl").open("x", buffering=1)
+            self.step_trace = (
+                directory / f"dp{self.model_runner.rank}.steps.jsonl"
+            ).open("x", buffering=1)
         self.model_runner.model_memory_usage = self.model_layout.model_memory_bytes
         self.kv_connector: ConnectorAdapter | None = None
         self.request_lengths: dict[str, tuple[int, int]] = {}
@@ -126,7 +128,7 @@ class SimulatorWorker(WorkerBase):
             )
             computed_tokens[request.req_id] = request.num_computed_tokens
         ids = list(output.num_scheduled_tokens)
-        batch = ScheduleBatch()
+        batch = ScheduleBatch(rank=self.model_runner.rank)
         sampled = []
         for rid in ids:
             prompt_length, prefill_length = self.request_lengths[rid]
@@ -173,8 +175,12 @@ class SimulatorWorker(WorkerBase):
             result.kv_connector_output = finish_connector()
         return result
 
+    def execute_dummy_batch(self) -> None:
+        self.model_runner.forward(ScheduleBatch(rank=self.model_runner.rank))
+
     def shutdown(self) -> None:
         if self.kv_connector is not None:
             self.kv_connector.shutdown()
         if self.step_trace is not None:
             self.step_trace.close()
+        self.model_runner.shutdown()

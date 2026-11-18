@@ -6,17 +6,20 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from vllm.v1.engine import core
-from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm_simulator.request_manager.manager import RequestManager
 
 
-class SimulatorEngineCoreProc(EngineCoreProc):
+class SimulatorCoreMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         executor = self.model_executor
+        if executor.dp.size > 1:
+            executor.bind_dp_group(self.dp_group)
         self.scheduler.request_manager = RequestManager(
             self.vllm_config,
             clock=executor.clock,
+            dp=executor.dp,
             scheduler=self.scheduler,
             notify_aborted=self._send_abort_outputs,
         )
@@ -58,14 +61,35 @@ class SimulatorEngineCoreProc(EngineCoreProc):
         manager = self.scheduler.request_manager
         executor.begin_step()
         outputs, executed = super().step() if manager.prepare_step() else ({}, False)
+        if executor.dp.size > 1 and not executed:
+            # Join the peer forwards before finish_step uses the same DP group.
+            executor.execute_dummy_batch()
+            executed = True
         return manager.finish_step(outputs, executor.step_snapshot()), executed
+
+
+class SimulatorEngineCoreProc(SimulatorCoreMixin, EngineCoreProc):
+    """Native MP transport with simulator replay."""
+
+
+class SimulatorDPEngineCoreProc(SimulatorCoreMixin, DPEngineCoreProc):
+    """Native coordinated DP transport and replay."""
+
+    def has_work(self) -> bool:
+        # Finished-request cleanup waits for a coordinated wave.
+        return self.engines_running
 
 
 _native_launcher = EngineCoreProc.run_engine_core
 
 
 def run_simulator_core(*args, **kwargs):
-    with patch.object(core, "EngineCoreProc", SimulatorEngineCoreProc):
+    # The native launcher chooses the correct class for single-rank and MoE DP.
+    with patch.multiple(
+        core,
+        EngineCoreProc=SimulatorEngineCoreProc,
+        DPEngineCoreProc=SimulatorDPEngineCoreProc,
+    ):
         _native_launcher(*args, **kwargs)
 
 
