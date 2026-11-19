@@ -8,6 +8,9 @@ without CUDA/TPU memory, SRPC, RDMA, or a real decode peer.
 D 端时使用本地完成契约；V6D sibling 的查询、保存和延迟释放仍由原生管理。
 """
 
+from dataclasses import asdict, is_dataclass
+from functools import wraps
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
@@ -30,19 +33,22 @@ class C_MultiKVConnectorPromMetricsHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+        if target.__dict__.get("_sim_nested_stats_hook", False):
+            return
 
         original = target.observe
 
+        @wraps(original)
         def observe(self, transfer_stats_data, engine_idx=0):
-            # Native IPC turns each stats dataclass into {"data": ...}.
+            # Match native IPC serialization, including nested connector stats.
             serialized = {
-                name: {"data": stats.data} if isinstance(stats, KVConnectorStats) else stats
+                name: asdict(stats) if is_dataclass(stats) else stats
                 for name, stats in transfer_stats_data.items()
             }
             return original(self, serialized, engine_idx)
 
         target.observe = observe
+        target._sim_nested_stats_hook = True
 
 
 class C_TPUV6dConnectorAdmissionHook(BaseHook):

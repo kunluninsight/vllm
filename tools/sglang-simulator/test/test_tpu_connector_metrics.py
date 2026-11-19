@@ -51,8 +51,19 @@ def test_mixed_and_nested_stats_are_not_reduced_or_reset(metrics):
     nested = Stats({"V6D": leaf})
     data = {"Nested": nested, "V6D": {"data": {"hits": 0}}}
     metrics.observe(data)
-    assert metrics.samples == [("Nested", {"V6D": leaf}, 0), ("V6D", {"hits": 0}, 0)]
+    assert metrics.samples == [
+        ("Nested", {"V6D": {"data": {"query_ms": [1.5, 3.5]}}}, 0),
+        ("V6D", {"hits": 0}, 0),
+    ]
     assert nested.data["V6D"] is leaf and leaf.data["query_ms"] == [1.5, 3.5]
+
+
+def test_repeated_hook_does_not_wrap_metrics_twice(metrics):
+    target = type(metrics)
+    original = target.observe
+    C_MultiKVConnectorPromMetricsHook.hook(target)
+    assert target.observe is original
+    assert metrics.observe({}) == "observed"
 
 
 def test_native_validation_is_preserved(metrics):
