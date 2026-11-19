@@ -1,0 +1,26 @@
+[
+  {
+    "concurrency": 64,
+    "pairs": 5632,
+    "equal_hit_tokens": 5632,
+    "different_hit_tokens": 0
+  },
+  {
+    "concurrency": 128,
+    "pairs": 5741,
+    "equal_hit_tokens": 5741,
+    "different_hit_tokens": 0
+  },
+  {
+    "concurrency": 256,
+    "pairs": 5876,
+    "equal_hit_tokens": 5876,
+    "different_hit_tokens": 0
+  },
+  {
+    "concurrency": 512,
+    "pairs": 6091,
+    "equal_hit_tokens": 6087,
+    "different_hit_tokens": 4
+  }
+]

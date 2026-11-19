@@ -1,0 +1,62 @@
+[
+  {
+    "concurrency": 512,
+    "sample": "mry-maxpcp-main-1119-c512-000326",
+    "request_id": "fdf6179f-540c-997e-9267-7d7b33a36396",
+    "real_input_tokens": "4565",
+    "sim_input_tokens": "4565",
+    "real_hit_tokens": "3072",
+    "sim_hit_tokens": "0",
+    "real_scheduled_query_tokens": "1493",
+    "sim_scheduled_query_tokens": "4565",
+    "real_steps": "327016",
+    "sim_steps": "6423|6424",
+    "real_core_ms": "15156.941995024681",
+    "sim_core_ms": "15126.387713999975"
+  },
+  {
+    "concurrency": 512,
+    "sample": "mry-maxpcp-main-1119-c512-000358",
+    "request_id": "cb0f2494-e05d-91f0-a7c9-95daa0ffde31",
+    "real_input_tokens": "4565",
+    "sim_input_tokens": "4565",
+    "real_hit_tokens": "0",
+    "sim_hit_tokens": "3072",
+    "real_scheduled_query_tokens": "4565",
+    "sim_scheduled_query_tokens": "1493",
+    "real_steps": "327014|327015",
+    "sim_steps": "6424",
+    "real_core_ms": "15063.569096848369",
+    "sim_core_ms": "15085.148661999938"
+  },
+  {
+    "concurrency": 512,
+    "sample": "mry-maxpcp-main-1119-c512-000602",
+    "request_id": "31768d8f-bec2-94f4-9685-0a3d2c8fbcc1",
+    "real_input_tokens": "4556",
+    "sim_input_tokens": "4556",
+    "real_hit_tokens": "3072",
+    "sim_hit_tokens": "0",
+    "real_scheduled_query_tokens": "1484",
+    "sim_scheduled_query_tokens": "4556",
+    "real_steps": "327097",
+    "sim_steps": "6500|6501",
+    "real_core_ms": "25686.83600286022",
+    "sim_core_ms": "25069.88979300013"
+  },
+  {
+    "concurrency": 512,
+    "sample": "mry-maxpcp-main-1119-c512-000634",
+    "request_id": "20daf996-49a3-9724-a118-617b632d2382",
+    "real_input_tokens": "4556",
+    "sim_input_tokens": "4556",
+    "real_hit_tokens": "0",
+    "sim_hit_tokens": "3072",
+    "real_scheduled_query_tokens": "4556",
+    "sim_scheduled_query_tokens": "1484",
+    "real_steps": "327095|327096",
+    "sim_steps": "6503",
+    "real_core_ms": "25449.067160021514",
+    "sim_core_ms": "25302.190570999755"
+  }
+]

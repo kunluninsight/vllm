@@ -83,3 +83,7 @@ loader clips each model output to nonnegative; there is a single total-duration
 model, so no negative residual is silently lost.
 
 No commit, push, model deployment or final fit is part of script preparation.
+
+## Completed live validation
+
+[Four-case paired engine and monitor results](online-report/README.md): 23,340 successful requests all paired; C64 still fails the TTFT target. Raw monitor CSVs, summaries and plotting script are included.

@@ -1,0 +1,246 @@
+[
+  {
+    "case": "mry-maxpcp-main-1119-c64",
+    "concurrency": 64,
+    "from_ms": 1795025040000,
+    "to_exclusive_ms": 1795025220000,
+    "minutes": 3,
+    "sent": 5632,
+    "real_success": 5632,
+    "real_errors": 0,
+    "real_outcomes": {
+      "success": 5632,
+      "error": 0,
+      "timeout": 0,
+      "cancelled": 0,
+      "not_sent": 0
+    },
+    "stop_reason": null,
+    "window_within_admissions": true,
+    "deployment_first_ms_minutes": 3,
+    "deployment_first_ms_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "deployment_first_ms_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "deployment_first_ms_coverage": "complete",
+    "real_deployment_first_ms": 2538.523728648027,
+    "sim_deployment_first_ms": 1950.332864738987,
+    "deployment_first_ms_error_pct": -23.170587584867686,
+    "INPUT_TPS_minutes": 3,
+    "INPUT_TPS_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "INPUT_TPS_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "INPUT_TPS_coverage": "complete",
+    "real_INPUT_TPS": 62014.35833333334,
+    "sim_INPUT_TPS": 61982.40416666667,
+    "INPUT_TPS_error_pct": -0.0515270455511474,
+    "PREFIX_HIT_minutes": 3,
+    "PREFIX_HIT_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "PREFIX_HIT_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "PREFIX_HIT_coverage": "complete",
+    "real_PREFIX_HIT": 0.3498342241909052,
+    "sim_PREFIX_HIT": 0.35028620111443587,
+    "PREFIX_HIT_error_pct": 0.12919745761752477,
+    "prefix_difference_pp": 0.04519769235306614,
+    "real_service_id": "6842e3d9",
+    "sim_service_id": "31d907b1"
+  },
+  {
+    "case": "mry-maxpcp-main-1119-c128",
+    "concurrency": 128,
+    "from_ms": 1795025640000,
+    "to_exclusive_ms": 1795025820000,
+    "minutes": 3,
+    "sent": 5741,
+    "real_success": 5741,
+    "real_errors": 0,
+    "real_outcomes": {
+      "success": 5741,
+      "error": 0,
+      "timeout": 0,
+      "cancelled": 0,
+      "not_sent": 0
+    },
+    "stop_reason": null,
+    "window_within_admissions": true,
+    "deployment_first_ms_minutes": 3,
+    "deployment_first_ms_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "deployment_first_ms_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "deployment_first_ms_coverage": "complete",
+    "real_deployment_first_ms": 5867.73523815508,
+    "sim_deployment_first_ms": 5411.360375873721,
+    "deployment_first_ms_error_pct": -7.777700318067716,
+    "INPUT_TPS_minutes": 3,
+    "INPUT_TPS_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "INPUT_TPS_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "INPUT_TPS_coverage": "complete",
+    "real_INPUT_TPS": 62671.694444444445,
+    "sim_INPUT_TPS": 62272.16527777778,
+    "INPUT_TPS_error_pct": -0.6374953959810803,
+    "PREFIX_HIT_minutes": 3,
+    "PREFIX_HIT_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "PREFIX_HIT_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "PREFIX_HIT_coverage": "complete",
+    "real_PREFIX_HIT": 0.3487451028498562,
+    "sim_PREFIX_HIT": 0.3489236124524765,
+    "PREFIX_HIT_error_pct": 0.05118626789639702,
+    "prefix_difference_pp": 0.017850960262028037,
+    "real_service_id": "6842e3d9",
+    "sim_service_id": "31d907b1"
+  },
+  {
+    "case": "mry-maxpcp-main-1119-c256",
+    "concurrency": 256,
+    "from_ms": 1795026240000,
+    "to_exclusive_ms": 1795026420000,
+    "minutes": 3,
+    "sent": 5876,
+    "real_success": 5876,
+    "real_errors": 0,
+    "real_outcomes": {
+      "success": 5876,
+      "error": 0,
+      "timeout": 0,
+      "cancelled": 0,
+      "not_sent": 0
+    },
+    "stop_reason": null,
+    "window_within_admissions": true,
+    "deployment_first_ms_minutes": 3,
+    "deployment_first_ms_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "deployment_first_ms_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "deployment_first_ms_coverage": "complete",
+    "real_deployment_first_ms": 12638.364985657667,
+    "sim_deployment_first_ms": 12545.788716049832,
+    "deployment_first_ms_error_pct": -0.732501947149744,
+    "INPUT_TPS_minutes": 3,
+    "INPUT_TPS_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "INPUT_TPS_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "INPUT_TPS_coverage": "complete",
+    "real_INPUT_TPS": 62206.08888888889,
+    "sim_INPUT_TPS": 62276.058333333334,
+    "INPUT_TPS_error_pct": 0.11248005732915622,
+    "PREFIX_HIT_minutes": 3,
+    "PREFIX_HIT_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "PREFIX_HIT_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "PREFIX_HIT_coverage": "complete",
+    "real_PREFIX_HIT": 0.35005790843103063,
+    "sim_PREFIX_HIT": 0.34992444711778437,
+    "PREFIX_HIT_error_pct": -0.03812549581995173,
+    "prefix_difference_pp": -0.013346131324626365,
+    "real_service_id": "6842e3d9",
+    "sim_service_id": "31d907b1"
+  },
+  {
+    "case": "mry-maxpcp-main-1119-c512",
+    "concurrency": 512,
+    "from_ms": 1795026840000,
+    "to_exclusive_ms": 1795027020000,
+    "minutes": 3,
+    "sent": 6092,
+    "real_success": 6091,
+    "real_errors": 1,
+    "real_outcomes": {
+      "success": 6091,
+      "error": 0,
+      "timeout": 1,
+      "cancelled": 0,
+      "not_sent": 0
+    },
+    "stop_reason": null,
+    "window_within_admissions": true,
+    "deployment_first_ms_minutes": 3,
+    "deployment_first_ms_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "deployment_first_ms_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "deployment_first_ms_coverage": "complete",
+    "real_deployment_first_ms": 26269.46412998346,
+    "sim_deployment_first_ms": 25250.28602742123,
+    "deployment_first_ms_error_pct": -3.8797064817129634,
+    "INPUT_TPS_minutes": 3,
+    "INPUT_TPS_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "INPUT_TPS_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "INPUT_TPS_coverage": "complete",
+    "real_INPUT_TPS": 61941.5,
+    "sim_INPUT_TPS": 61808.60277777778,
+    "INPUT_TPS_error_pct": -0.21455279937072635,
+    "PREFIX_HIT_minutes": 3,
+    "PREFIX_HIT_missing_minutes": {
+      "real": [],
+      "sim": []
+    },
+    "PREFIX_HIT_missing_native_samples": {
+      "real": 0,
+      "sim": 0
+    },
+    "PREFIX_HIT_coverage": "complete",
+    "real_PREFIX_HIT": 0.35053735509575146,
+    "sim_PREFIX_HIT": 0.3497043499184843,
+    "PREFIX_HIT_error_pct": -0.2376366356274917,
+    "prefix_difference_pp": -0.08330051772671432,
+    "real_service_id": "6842e3d9",
+    "sim_service_id": "31d907b1"
+  }
+]

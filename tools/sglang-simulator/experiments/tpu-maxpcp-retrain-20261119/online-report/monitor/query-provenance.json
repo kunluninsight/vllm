@@ -1,0 +1,49 @@
+{
+  "source": "Grafana System Monitor V2 / Explore",
+  "datasource": "bfs1jewo09x4wb",
+  "tenant": "bailian",
+  "real_service": "6842e3d9",
+  "sim_service": "31d907b1",
+  "lookback": "1m",
+  "requested_step": "15s",
+  "queries": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bfs1jewo09x4wb"
+      },
+      "editorMode": "code",
+      "expr": "sum by (service_id) (rate(dashscope_turbo_batch_token_input{spectrum_workspace_id=~\"464482ce|bb1035d8\",service_id=~\"31d907b1|6842e3d9\",spectrum_deployment_name!=\"-\"}[1m]))",
+      "instant": false,
+      "range": true,
+      "refId": "A",
+      "tenant": "bailian",
+      "legendFormat": "INPUT_TPS {{service_id}}",
+      "interval": "15s"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bfs1jewo09x4wb"
+      },
+      "editorMode": "code",
+      "expr": "sum by (service_id) (rate(dashscope_turbo_batch_token_input_cached{spectrum_workspace_id=~\"464482ce|bb1035d8\",service_id=~\"31d907b1|6842e3d9\",spectrum_deployment_name!=\"-\"}[1m])) / sum by (service_id) (rate(dashscope_turbo_batch_token_input_aligned{spectrum_workspace_id=~\"464482ce|bb1035d8\",service_id=~\"31d907b1|6842e3d9\",spectrum_deployment_name!=\"-\"}[1m]))",
+      "instant": false,
+      "range": true,
+      "refId": "B",
+      "tenant": "bailian",
+      "legendFormat": "PREFIX_HIT {{service_id}}",
+      "interval": "15s"
+    }
+  ],
+  "scope": "Prefill deployments only",
+  "status": "Executed through authenticated Grafana Explore UI; CSV downloaded",
+  "source_provenance": "diagnostics/qwen38-tpu-pp-rate-20261117/monitor-shared-main/system-query-provenance.json",
+  "from_ms": 1795024920000,
+  "to_ms": 1795027500000,
+  "export_date": "2026-11-19",
+  "real_first_source": "Spectrum realtime dashboard spectrum-rt-deploy_v1118_1, panel-175, service6842e3d9",
+  "sim_first_source": "Spectrum realtime dashboard spectrum-rt-deploy_v1118_1, panel-175, service31d907b1",
+  "first_latency_raw_unit": "ms",
+  "normalization": "Raw First Latency CSV metric column renamed First Latency; values unmodified"
+}
