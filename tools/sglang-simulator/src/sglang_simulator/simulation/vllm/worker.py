@@ -367,23 +367,24 @@ def _build_kv_cache_spec(vllm_config) -> dict:
             else:
                 kv_cache_spec[layer_name] = full_attn_spec
 
-    # Speculative draft model layers: the real server's get_kv_cache_spec()
-    # walks static_forward_context, which also contains the draft model's
-    # attention layers — qwen3_5_mtp registers mtp_num_hidden_layers
-    # full-attention layers (same head config as the main model) under
-    # model.mtp.layers.<num_hidden_layers + idx>.  Mirror that here so the
-    # v6d attention group has the same layer count; otherwise every block
-    # object is under-sized by mtp_num_hidden_layers pages (real server:
-    # 16 attn layers = 132 MiB/block, sim was 15 = 123.75 MiB/block).
+    # QwenNext's native MTP has a default draft layer even when the HF
+    # checkpoint omits num_nextn_predict_layers. Its mtp.* prefix also
+    # determines the Prefill-only cache group's Eagle flag.
     spec_cfg = getattr(vllm_config, "speculative_config", None)
     spec_method = getattr(spec_cfg, "method", None) if spec_cfg else None
+    qwen_next_mtp = (
+        spec_method == "mtp"
+        and getattr(model_config, "architecture", None) == "Qwen3NextForCausalLM"
+    )
     num_mtp_layers = (
-        getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
+        (getattr(hf_config, "num_nextn_predict_layers", 1) if qwen_next_mtp
+         else getattr(hf_config, "mtp_num_hidden_layers", 0)) or 0
         if spec_method not in (None, "ngram", "suffix")
         else 0
     )
     for idx in range(num_mtp_layers):
-        layer_name = f"model.mtp.layers.{num_hidden_layers + idx}"
+        layer_name = (f"mtp.layers.{idx}" if qwen_next_mtp
+                      else f"model.mtp.layers.{num_hidden_layers + idx}")
         kv_cache_spec[layer_name] = full_attn_spec
 
     logger.info(
