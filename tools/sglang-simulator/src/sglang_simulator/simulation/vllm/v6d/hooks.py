@@ -15,29 +15,30 @@ def register_v6d_hooks(hooks: list) -> None:
     Hook-module imports stay inside this function: their load order is
     orchestrated exclusively by init_hook() (after the v6d ipc env setup).
     """
+    from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+        C_MultiKVConnectorPromMetricsHook,
+        C_TPURaidenConnectorHook,
+        C_TPURaidenConnectorWorkerHook,
+        C_TPUV6dConnectorAdmissionHook,
+        C_TPUV6dObjectConnectorWorkerHook,
+        C_TPUV6dObjectLayoutHook,
+    )
     from sglang_simulator.simulation.vllm.v6d.v6d_backend import (
         C_HybridBackendHook,
         C_HybridConnectorHook,
         C_HybridControlPlaneHook,
-        C_V6dObjectBackendHook,
         C_KVTPBackendHook,
+        C_V6dObjectBackendHook,
     )
     from sglang_simulator.simulation.vllm.v6d.v6d_manager import (
-        C_V6dMmapManagerHook,
         C_TPUV6dObjectFetchHelperHook,
+        C_V6dMmapManagerHook,
         C_V6dObjectConnectorSchedulerHook,
         C_V6dObjectFetchHelperHook,
         C_V6dObjectManagerHook,
     )
     from sglang_simulator.simulation.vllm.v6d.v6d_worker import (
         C_V6dObjectConnectorWorkerHook,
-    )
-    from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
-        C_MultiKVConnectorPromMetricsHook,
-        C_TPUV6dConnectorAdmissionHook,
-        C_TPURaidenConnectorHook,
-        C_TPURaidenConnectorWorkerHook,
-        C_TPUV6dObjectConnectorWorkerHook,
     )
 
     # NOTE: C_V6dSwapHandlerHook was removed with v6d_swap.py — the worker
@@ -50,6 +51,7 @@ def register_v6d_hooks(hooks: list) -> None:
         C_HybridControlPlaneHook,
         C_V6dObjectConnectorWorkerHook,
         C_TPUV6dObjectConnectorWorkerHook,
+        C_TPUV6dObjectLayoutHook,
         C_MultiKVConnectorPromMetricsHook,
         C_TPUV6dConnectorAdmissionHook,
         C_TPURaidenConnectorHook,

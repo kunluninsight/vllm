@@ -14,7 +14,6 @@ from functools import wraps
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
-
 logger = get_logger()
 
 
@@ -23,6 +22,84 @@ def _metadata_with(args, kwargs, field):
         if hasattr(value, field):
             return value
     return None
+
+
+class C_TPUV6dObjectLayoutHook(BaseHook):
+    """Charge the folded local cache for one complete target node's page.
+
+    This fixes capacity accounting. The single physical daemon still cannot
+    express independent node failures or differences in publication readiness.
+    """
+
+    HOOK_MODULE_NAME = "kvs_connector.v6d_object_connector"
+    HOOK_CLASS_NAME = "V6dObjectConnectorScheduler"
+
+    @classmethod
+    def hook(cls, target):
+        original = target._compute_group_block_bytes
+
+        def compute(self, spec, group_id):
+            result = original(self, spec, group_id)
+            from sglang_simulator.simulation.manager import ConfigManager
+            from sglang_simulator.simulation.vllm.tpu_kv_geometry import (
+                _positive_int,
+                is_tpu_target,
+            )
+
+            raw = ConfigManager._get_raw_config()
+            scheduler = raw.get("scheduler", {})
+            if not is_tpu_target(raw) or scheduler.get("pp_size", 1) == 1:
+                return result
+            if not hasattr(self, "_sim_tpu_v6d_layout"):
+                from vllm.v1.core.kv_cache_utils import (
+                    _pool_bytes_per_block,
+                    _project_kv_cache_groups_to_worker,
+                )
+
+                from sglang_simulator.simulation.vllm.tpu_kv_capacity import (
+                    _parse_partition,
+                    _project_layers,
+                )
+
+                if self.vllm_config.parallel_config.local_world_size != 1:
+                    raise ValueError("TPU V6D folding requires one physical CPU worker")
+                groups = self.kv_cache_config.kv_cache_groups
+                specs = {
+                    name: group.kv_cache_spec
+                    for group in groups
+                    for name in group.layer_names
+                }
+                stages = _positive_int(scheduler["pp_size"], "scheduler.pp_size")
+                partition = _parse_partition(
+                    scheduler,
+                    self.vllm_config.model_config.hf_text_config.num_hidden_layers,
+                    stages,
+                )
+                stage_specs = _project_layers(specs, partition)
+                pages = [
+                    _pool_bytes_per_block(_project_kv_cache_groups_to_worker(groups, s))
+                    for s in stage_specs
+                ]
+                ranks = _positive_int(
+                    raw["platform"]["num_device_per_node"], "num_device_per_node"
+                )
+                if ranks != scheduler.get("tp_size", 1) * scheduler.get("pcp_size", 1):
+                    raise ValueError(
+                        "TPU V6D requires one complete PP stage per target node"
+                    )
+                page = max(pages)
+                self._sim_tpu_v6d_layout = (ranks * page, [ranks, 1, page], result[2])
+                logger.info(
+                    "[TPU V6D capacity] target_nodes=%d target_local_ranks=%d stage_page_bytes=%s object_bytes=%d; physical_daemons=1, node readiness remains folded",
+                    stages,
+                    ranks,
+                    pages,
+                    ranks * page,
+                )
+            size, shape, dtype = self._sim_tpu_v6d_layout
+            return size, list(shape), dtype
+
+        target._compute_group_block_bytes = compute
 
 
 class C_MultiKVConnectorPromMetricsHook(BaseHook):
@@ -71,7 +148,9 @@ class C_TPUV6dConnectorAdmissionHook(BaseHook):
                                and getattr(request, "num_preemptions", 0) == 0)
             result = original(self, request, blocks, num_external_tokens)
             if first_admission:
-                from sglang_simulator.simulation.req_stats_manager import request_stats_manager
+                from sglang_simulator.simulation.req_stats_manager import (
+                    request_stats_manager,
+                )
                 if request.request_id in request_stats_manager.stats:
                     request_stats_manager.external_prefix_tokens.setdefault(
                         request.request_id, max(num_external_tokens, 0)
