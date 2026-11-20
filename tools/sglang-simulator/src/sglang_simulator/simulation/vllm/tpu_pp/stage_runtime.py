@@ -360,6 +360,13 @@ class VirtualPPExecutor:
         while self.futures_queue:
             self.futures_queue.pop()._wait_for_response()
 
+    def take_draft_token_ids(self):
+        # Match TPUMultiprocExecutor: prefill-only MTP fills KV but never
+        # proposes tokens. A delegated RPC would settle and drain PP early.
+        if os.environ.get("TPU_MTP_PREFILL_ONLY", "0") == "1":
+            return None
+        return self.inner.take_draft_token_ids()
+
     def __getattr__(self, name):
         # inner 未设置前（构造早期/反序列化）不能委托，否则无限递归
         if name == "inner" or name.startswith("__"):
