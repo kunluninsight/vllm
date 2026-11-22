@@ -8,8 +8,15 @@ without CUDA/TPU memory, SRPC, RDMA, or a real decode peer.
 D 端时使用本地完成契约；V6D sibling 的查询、保存和延迟释放仍由原生管理。
 """
 
-from dataclasses import asdict, is_dataclass
+from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, is_dataclass
 from functools import wraps
+import math
+import time
+import weakref
+from typing import Callable
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
@@ -22,6 +29,147 @@ def _metadata_with(args, kwargs, field):
         if hasattr(value, field):
             return value
     return None
+
+
+@dataclass
+class _TPUTransferGate:
+    # Set only by the modeled device-ready RPC response, never a log timestamp.
+    ready_at: float | None = None
+    wait_ready: Callable[[], object] | None = None
+
+
+_transfer_gate = ContextVar("tpu_transfer_gate", default=None)
+_store_queues = weakref.WeakSet()
+
+
+@contextmanager
+def tpu_transfer_step():
+    """Bind stores submitted by this execute_model to its PP device-ready gate."""
+    gate = _TPUTransferGate()
+    token = _transfer_gate.set(gate)
+    try:
+        yield gate
+    finally:
+        _transfer_gate.reset(token)
+
+
+@dataclass
+class _TPUStoreJob:
+    job_id: int
+    req_id: str
+    gate: _TPUTransferGate
+    duration: float
+    deadline: float | None = None
+
+
+class _TPUStoreQueue:
+    def __init__(self):
+        self.jobs = deque()
+        self.seen = {}
+        self.highest_job_id = -1
+        self.lane_ready_at = 0.0
+        _store_queues.add(self)
+
+    def resolve_deadlines(self):
+        for job in self.jobs:
+            if job.deadline is not None:
+                continue
+            if job.gate.ready_at is None:
+                break
+            if not math.isfinite(job.gate.ready_at):
+                raise ValueError("TPU transfer ready_at must be finite")
+            job.deadline = max(job.gate.ready_at, self.lane_ready_at) + job.duration
+            self.lane_ready_at = job.deadline
+
+
+def wait_for_tpu_store_progress():
+    """Wait for the earliest store event only after all PP gates resolve.
+
+    Queues are worker-owned; weak registration never keeps an old engine alive.
+    Nonempty execute_model and unresolved PP futures must never wait here.
+    """
+    queues = list(_store_queues)
+    if any(job.gate.ready_at is None for q in queues for job in q.jobs):
+        return
+    deadlines = []
+    for queue in queues:
+        queue.resolve_deadlines()
+        if queue.jobs:
+            deadlines.append(queue.jobs[0].deadline)
+    if deadlines:
+        delay = min(deadlines) - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _tpu_node_object_layout(vllm_config, kv_cache_config):
+    """Shared scheduler/worker geometry; no extra PP or PCP byte multiplier."""
+    from sglang_simulator.simulation.manager import ConfigManager
+    from sglang_simulator.simulation.vllm.tpu_kv_geometry import (
+        _positive_int,
+        is_tpu_target,
+    )
+
+    raw = ConfigManager._get_raw_config()
+    scheduler = raw.get("scheduler", {})
+    if not is_tpu_target(raw) or scheduler.get("pp_size", 1) == 1:
+        return None
+    from vllm.v1.core.kv_cache_utils import (
+        _pool_bytes_per_block,
+        _project_kv_cache_groups_to_worker,
+    )
+    from sglang_simulator.simulation.vllm.tpu_kv_capacity import (
+        _parse_partition,
+        _project_layers,
+    )
+
+    if vllm_config.parallel_config.local_world_size != 1:
+        raise ValueError("TPU V6D folding requires one physical CPU worker")
+    groups = kv_cache_config.kv_cache_groups
+    specs = {
+        name: group.kv_cache_spec for group in groups for name in group.layer_names
+    }
+    stages = _positive_int(scheduler["pp_size"], "scheduler.pp_size")
+    partition = _parse_partition(
+        scheduler, vllm_config.model_config.hf_text_config.num_hidden_layers, stages
+    )
+    pages = [
+        _pool_bytes_per_block(_project_kv_cache_groups_to_worker(groups, stage))
+        for stage in _project_layers(specs, partition)
+    ]
+    ranks = _positive_int(raw["platform"]["num_device_per_node"], "num_device_per_node")
+    if ranks != scheduler.get("tp_size", 1) * scheduler.get("pcp_size", 1):
+        raise ValueError("TPU V6D requires one complete PP stage per target node")
+    page = _positive_int(max(pages), "TPU stage page bytes")
+    logger.info(
+        "[TPU V6D capacity] target_nodes=%d target_local_ranks=%d stage_page_bytes=%s "
+        "object_bytes=%d; physical_daemons=1, node readiness remains folded",
+        stages, ranks, pages, ranks * page,
+    )
+    return ranks * page, [ranks, 1, page]
+
+
+def _tpu_store_bytes_per_second():
+    from sglang_simulator.simulation.manager import ConfigManager
+
+    value = ConfigManager._get_raw_config().get("platform", {}).get(
+        "memory_write_bandwidth_gb"
+    )
+    if isinstance(value, bool):
+        raise ValueError("TPU memory_write_bandwidth_gb must be positive and finite")
+    try:
+        bandwidth = float(value) * 1e9  # PlatformConfig uses decimal GB.
+    except (TypeError, ValueError):
+        raise ValueError("TPU memory_write_bandwidth_gb must be positive and finite") from None
+    if not math.isfinite(bandwidth) or bandwidth <= 0:
+        raise ValueError("TPU memory_write_bandwidth_gb must be positive and finite")
+    return bandwidth
+
+
+@dataclass(frozen=True)
+class _LocalRaidenHandoff:
+    group_block_ids: tuple[tuple[int, ...], ...]
+    num_tokens: int
 
 
 class C_TPUV6dObjectLayoutHook(BaseHook):
@@ -40,62 +188,11 @@ class C_TPUV6dObjectLayoutHook(BaseHook):
 
         def compute(self, spec, group_id):
             result = original(self, spec, group_id)
-            from sglang_simulator.simulation.manager import ConfigManager
-            from sglang_simulator.simulation.vllm.tpu_kv_geometry import (
-                _positive_int,
-                is_tpu_target,
-            )
-
-            raw = ConfigManager._get_raw_config()
-            scheduler = raw.get("scheduler", {})
-            if not is_tpu_target(raw) or scheduler.get("pp_size", 1) == 1:
-                return result
             if not hasattr(self, "_sim_tpu_v6d_layout"):
-                from vllm.v1.core.kv_cache_utils import (
-                    _pool_bytes_per_block,
-                    _project_kv_cache_groups_to_worker,
-                )
-
-                from sglang_simulator.simulation.vllm.tpu_kv_capacity import (
-                    _parse_partition,
-                    _project_layers,
-                )
-
-                if self.vllm_config.parallel_config.local_world_size != 1:
-                    raise ValueError("TPU V6D folding requires one physical CPU worker")
-                groups = self.kv_cache_config.kv_cache_groups
-                specs = {
-                    name: group.kv_cache_spec
-                    for group in groups
-                    for name in group.layer_names
-                }
-                stages = _positive_int(scheduler["pp_size"], "scheduler.pp_size")
-                partition = _parse_partition(
-                    scheduler,
-                    self.vllm_config.model_config.hf_text_config.num_hidden_layers,
-                    stages,
-                )
-                stage_specs = _project_layers(specs, partition)
-                pages = [
-                    _pool_bytes_per_block(_project_kv_cache_groups_to_worker(groups, s))
-                    for s in stage_specs
-                ]
-                ranks = _positive_int(
-                    raw["platform"]["num_device_per_node"], "num_device_per_node"
-                )
-                if ranks != scheduler.get("tp_size", 1) * scheduler.get("pcp_size", 1):
-                    raise ValueError(
-                        "TPU V6D requires one complete PP stage per target node"
-                    )
-                page = max(pages)
-                self._sim_tpu_v6d_layout = (ranks * page, [ranks, 1, page], result[2])
-                logger.info(
-                    "[TPU V6D capacity] target_nodes=%d target_local_ranks=%d stage_page_bytes=%s object_bytes=%d; physical_daemons=1, node readiness remains folded",
-                    stages,
-                    ranks,
-                    pages,
-                    ranks * page,
-                )
+                layout = _tpu_node_object_layout(self.vllm_config, self.kv_cache_config)
+                if layout is None:
+                    return result
+                self._sim_tpu_v6d_layout = (*layout, result[2])
             size, shape, dtype = self._sim_tpu_v6d_layout
             return size, list(shape), dtype
 
@@ -177,6 +274,8 @@ class C_TPURaidenConnectorHook(BaseHook):
         original_meta = target.build_connector_meta
         original_finish = target.request_finished
         original_finish_groups = target.request_finished_all_groups
+        original_update = target.update_connector_output
+        original_pending = getattr(target, "has_pending_push_work", None)
 
         def init(self, vllm_config, role, kv_cache_config):
             groups = kv_cache_config.kv_cache_groups
@@ -194,6 +293,8 @@ class C_TPURaidenConnectorHook(BaseHook):
             original_init(self, vllm_config, role, kv_cache_config)
             self._sim_local_raiden = local
             self._sim_raiden_num_groups = len(groups)
+            self._sim_raiden_pending_sends = {}
+            self._sim_raiden_inflight = {}
             if local:
                 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
                     MambaSpec,
@@ -207,7 +308,7 @@ class C_TPURaidenConnectorHook(BaseHook):
             if local and self.connector_scheduler is not None:
                 logger.info(
                     "[Raiden CPU] local-only producer enabled: kv_groups=%d; "
-                    "no remote handoff or Raiden block pinning; V6D lifecycle unchanged",
+                    "local handoff pin/ACK only, no remote transfer timing; V6D lifecycle unchanged",
                     len(groups),
                 )
 
@@ -259,7 +360,10 @@ class C_TPURaidenConnectorHook(BaseHook):
             from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
                 TPUConnectorMetadata,
             )
-            return TPUConnectorMetadata()
+            result = TPUConnectorMetadata()
+            result.reqs_to_send = self._sim_raiden_pending_sends
+            self._sim_raiden_pending_sends = {}
+            return result
 
         def finished(self, request, block_ids):
             if not self._sim_local_raiden:
@@ -274,10 +378,44 @@ class C_TPURaidenConnectorHook(BaseHook):
                     "Raiden simulation KV group count mismatch: "
                     f"expected {self._sim_raiden_num_groups}, got {len(block_ids)}"
                 )
-            # 不压平、不取第一组，也不直接释放任何 block。此 Raiden 子连接器
-            # 没有未完成传输；原生 MultiConnector 仍聚合 V6D 的 delay_free，
-            # 最终由 Scheduler 统一释放全部组，避免虚构完成事件或抢先释放。
-            return False, None
+            from vllm.v1.request import RequestStatus
+
+            req_id = request.request_id
+            if getattr(request, "_sim_raiden_handoff_submitted", False):
+                return req_id in self._sim_raiden_inflight, None
+            if request.status not in (
+                RequestStatus.FINISHED_LENGTH_CAPPED, RequestStatus.FINISHED_STOPPED
+            ):
+                return False, None
+            tokens = self.connector_scheduler._stage3_transfer_tokens(
+                request, request.num_computed_tokens
+            )
+            if tokens <= 0 or not any(block_ids):
+                return False, None
+            record = _LocalRaidenHandoff(
+                tuple(tuple(ids) for ids in block_ids), tokens
+            )
+            self._sim_raiden_inflight[req_id] = record
+            self._sim_raiden_pending_sends[req_id] = record
+            request._sim_raiden_handoff_submitted = True
+            # Native MultiConnector counts this independent asynchronous child.
+            # Only its aggregated output permits scheduler block release.
+            return True, None
+
+        def update(self, output):
+            if not self._sim_local_raiden:
+                return original_update(self, output)
+            for req_id in output.finished_sending or ():
+                self._sim_raiden_inflight.pop(req_id, None)
+
+        def pending(self):
+            if not self._sim_local_raiden:
+                return original_pending(self) if original_pending is not None else False
+            worker = getattr(self, "connector_worker", None)
+            return bool(
+                self._sim_raiden_pending_sends or self._sim_raiden_inflight
+                or (worker is not None and worker.has_pending_push_work())
+            )
 
         target.__init__ = init
         target.on_new_request = admit
@@ -286,6 +424,8 @@ class C_TPURaidenConnectorHook(BaseHook):
         target.build_connector_meta = metadata
         target.request_finished = finished
         target.request_finished_all_groups = finished_groups
+        target.update_connector_output = update
+        target.has_pending_push_work = pending
         target._sim_local_raiden_hook = True
 
 
@@ -322,8 +462,11 @@ def install_tpu_v6d_completion_guard(scheduler):
     pending_release = set()
 
     def request_finished(request):
+        if hasattr(request, "_sim_connector_finish_result"):
+            return request._sim_connector_finish_result
         # 以原生返回值为准；仅请求终结且确实延迟释放才形成发送义务。
         result = original_finished(request)
+        request._sim_connector_finish_result = result
         if result[0]:
             pending_release.add(request.request_id)
         else:
@@ -479,6 +622,11 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
             return
         cpu_load = target.start_load_kv
 
+        def queue_for(self):
+            if not hasattr(self, "_sim_tpu_store_queue"):
+                self._sim_tpu_store_queue = _TPUStoreQueue()
+            return self._sim_tpu_store_queue
+
         def validate(self, metadata):
             if not hasattr(metadata, "store_job_ids") or not hasattr(metadata, "store_waits"):
                 raise ValueError("TPU V6D job protocol requires store_job_ids and store_waits")
@@ -486,7 +634,12 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
                 raise ValueError("TPU V6D metadata/worker KV group count mismatch")
             if self._load_handler is not None or self._store_handler is not None:
                 raise RuntimeError("TPU V6D CPU job adapter requires disabled DMA handlers")
-            if self._pending_jobs or self._saving_req_jobs or self._loading_req_jobs:
+            owned = {}
+            for job in queue_for(self).jobs:
+                owned.setdefault(job.req_id, set()).add(job.job_id)
+            saving = {rid: jobs for rid, jobs in self._saving_req_jobs.items() if jobs}
+            if (self._pending_jobs or saving != owned or self._loading_req_jobs
+                    or getattr(self, "_store_job_ids", {})):
                 raise RuntimeError("TPU V6D CPU job adapter found unexpected native DMA jobs")
 
         def start_load(self, metadata):
@@ -503,7 +656,7 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
             stores = metadata.reqs_to_store
             if set(stores) != set(metadata.store_job_ids):
                 raise ValueError("TPU V6D store_job_ids must match reqs_to_store")
-            results = {}
+            queue = queue_for(self)
             for req_id, groups in stores.items():
                 job_id = metadata.store_job_ids[req_id]
                 if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id < 0:
@@ -511,18 +664,78 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
                 for keys, blocks, masks in groups.values():
                     if not len(keys) == len(blocks) == len(masks):
                         raise ValueError("TPU V6D store keys/blocks/node masks length mismatch")
-                # 仅模拟 DMA 成功；每个物理 rank 都要确认，即使本节点没有
-                # mask 选中的数据。保留 scheduler 的 job ID，不按 req_id 合并。
-                ranks = self._worker_meta.store_results.get(job_id, {})
-                if self._worker_rank in ranks and ranks[self._worker_rank] is not None:
-                    raise ValueError("Conflicting TPU V6D store result")
-                results[job_id] = {**ranks, self._worker_rank: None}
-            self._worker_meta.store_results.update(results)
-            # 不 seal，不清 scheduler._store_jobs，也不发请求级 finished_sending。
-            # 原生 scheduler 收齐 store_results 后发布对象并释放作业保护块。
+                if job_id in queue.seen:
+                    if queue.seen[job_id] != req_id:
+                        raise ValueError("Conflicting TPU V6D store job ID")
+                    continue
+                # Native build_connector_meta allocates IDs in dispatch order.
+                if job_id <= queue.highest_job_id:
+                    continue
+                if not hasattr(self, "_sim_tpu_node_layout"):
+                    self._sim_tpu_node_layout = _tpu_node_object_layout(
+                        self._vllm_config, self._kv_cache_config
+                    )
+                layout = self._sim_tpu_node_layout
+                selected = sum(
+                    bool(mask & (1 << self._node_id))
+                    for _keys, _blocks, masks in groups.values() for mask in masks
+                ) if layout is not None else 0
+                if selected:
+                    duration = selected * layout[0] / _tpu_store_bytes_per_second()
+                    gate = _transfer_gate.get()
+                    if gate is None:
+                        gate = _TPUTransferGate(time.monotonic())
+                    queue.jobs.append(_TPUStoreJob(job_id, req_id, gate, duration))
+                    self._saving_req_jobs.setdefault(req_id, set()).add(job_id)
+                    queue.seen[job_id] = req_id
+                else:
+                    # No DMA for mask=0; do not wait on PP or occupy the lane.
+                    # Non-TPU/non-PP keeps its existing immediate ACK behavior.
+                    acknowledge(self, job_id)
+                queue.highest_job_id = job_id
+            # No synthetic DMA entry in _pending_jobs, and no seal/free here.
+
+        def acknowledge(self, job_id):
+            ranks = self._worker_meta.store_results.setdefault(job_id, {})
+            if self._worker_rank in ranks and ranks[self._worker_rank] is not None:
+                raise ValueError("Conflicting TPU V6D store result")
+            ranks[self._worker_rank] = None
+
+        def harvest(self):
+            queue = queue_for(self)
+            queue.resolve_deadlines()
+            now = time.monotonic()
+            while queue.jobs:
+                job = queue.jobs[0]
+                if job.deadline is None or job.deadline > now:
+                    break
+                acknowledge(self, job.job_id)
+                self._saving_req_jobs[job.req_id].remove(job.job_id)
+                if not self._saving_req_jobs[job.req_id]:
+                    del self._saving_req_jobs[job.req_id]
+                queue.jobs.popleft()
+                del queue.seen[job.job_id]
+
+        def handle_preemptions(self, metadata):
+            queue = queue_for(self)
+            preempted = set(metadata.preempted_req_ids or ())
+            selected = [i for i, job in enumerate(queue.jobs) if job.req_id in preempted]
+            if not selected:
+                return
+            jobs = list(queue.jobs)[:max(selected) + 1]
+            for job in jobs:
+                if job.gate.ready_at is None:
+                    if job.gate.wait_ready is None:
+                        raise RuntimeError("Preempted store has no PP completion future")
+                    job.gate.wait_ready()
+            queue.resolve_deadlines()
+            delay = max(jobs[i].deadline for i in selected) - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
 
         def get_finished(self, finished_req_ids=None):
             cls._ensure_state(self)
+            harvest(self)
             # 原生实现仅在 store_waits 已登记且没有未完成 DMA 时返回发送终态。
             # handler 为 None，不会访问 TPU；builder 稍后独立导出作业确认。
             sent, received = original_get_finished(self, finished_req_ids or set())
@@ -533,12 +746,14 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
         def has_pending_push_work(self):
             cls._ensure_state(self)
             return bool(
-                self._sim_tpu_load_done or self._finished_reqs_waiting_for_store
+                queue_for(self).jobs or self._sim_tpu_load_done
+                or self._finished_reqs_waiting_for_store
                 or self._worker_meta.store_results or self._worker_meta.failed_loads
             )
 
         target.start_load_kv = start_load
         target.start_store_kv = start_store
+        target.handle_preemptions = handle_preemptions
         target.get_finished = get_finished
         target.has_pending_push_work = has_pending_push_work
         # 不重写原生 builder：保持 V6dWorkerMetadata 类型、聚合和换对象语义，

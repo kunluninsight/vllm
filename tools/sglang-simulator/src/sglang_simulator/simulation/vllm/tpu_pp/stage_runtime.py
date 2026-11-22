@@ -207,11 +207,12 @@ def worker_main(rank, cfg, control, reply, barrier, payloads, events):
                     if payload.empty_host_s is not None:
                         Descriptor(ready_at=start + payload.empty_host_s[rank]).wait()
                     wave.event("empty", start_at=start, end_at=time.monotonic())
-                result = payload.step_id
+                ready_at = wave.device_ready if payload.num_tokens else time.monotonic()
+                result = (payload.step_id, ready_at)
             elif method == "sample_tokens":
                 if pending is None:
                     raise AssertionError("sample_tokens without execute_model")
-                result, pending = pending.step_id, None
+                result, pending = (pending.step_id, wave.device_ready), None
                 if rank == cfg.stages - 1:
                     Descriptor(ready_at=wave.device_ready).wait()
             elif method == "pp_push":
@@ -377,7 +378,7 @@ class VirtualPPExecutor:
         return (getattr(self.inner, "kv_output_aggregator", None) is not None
                 or getattr(self.inner, "ec_output_aggregator", None) is not None)
 
-    def _stage_rpc(self, method, arg, all_ranks: bool, value):
+    def _stage_rpc(self, method, arg, all_ranks: bool, value, transfer_step=None):
         self._next_call += 1
         call_id = self._next_call
         if method in ("pp_push", "pp_settle"):
@@ -391,15 +392,26 @@ class VirtualPPExecutor:
         rings = tuple(self.response_mqs[r] for r in ranks)
 
         def response():
+            ready_at = 0.0
             for ring in rings:
                 received, ok, result = ring.remote_socket.recv()
                 if not ok:
                     raise RuntimeError(f"TPU PP stage worker failed:\n{result}")
                 if received != call_id:
                     raise AssertionError((method, call_id, received))
+                if transfer_step is not None:
+                    stage_ready = float(result[1])
+                    if not math.isfinite(stage_ready) or stage_ready < 0:
+                        raise ValueError("Invalid TPU transfer source-ready time")
+                    ready_at = max(ready_at, stage_ready)
+            if transfer_step is not None:
+                transfer_step.ready_at = ready_at
+                transfer_step.wait_ready = None
             return value
 
         future = self.native.FutureWrapper(self.futures_queue, response)
+        if transfer_step is not None and transfer_step.ready_at is None:
+            transfer_step.wait_ready = future.result
         future._tpu_reply_rings = rings
         return future
 
@@ -432,14 +444,21 @@ class VirtualPPExecutor:
         return spans
 
     def execute_model(self, scheduler_output, non_block=False):
+        from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+            tpu_transfer_step, wait_for_tpu_store_progress,
+        )
+
         tokens = int(scheduler_output.total_num_scheduled_tokens)
+        if tokens <= 0:
+            wait_for_tpu_store_progress()
         if tokens > 0:
             self._next_step += 1
             scheduler_output._sim_tpu_pp_step_id = self._next_step
         started = time.monotonic_ns() if self.lifecycle is not None else None
         native_ok = False
         try:
-            output = self.inner.execute_model(scheduler_output, non_block=False)
+            with tpu_transfer_step() as transfer_step:
+                output = self.inner.execute_model(scheduler_output, non_block=False)
             native_ok = True
         finally:
             if tokens > 0 and self.lifecycle is not None:
@@ -452,7 +471,7 @@ class VirtualPPExecutor:
         if tokens <= 0:
             payload = StagePayload(0, 0, empty_host_s=self._empty_host_s)
             future = self._stage_rpc("execute_model", payload,
-                                     self._aggregated(), output)
+                                     self._aggregated(), output, transfer_step=transfer_step)
             return future if non_block else future.result()
         prepared_start = time.monotonic_ns() if self.lifecycle is not None else None
         prepared_ok = False
@@ -489,7 +508,7 @@ class VirtualPPExecutor:
             self.step_records[step_id].update(
                 lifecycle_step_id=lifecycle_step_id, requests=requests,
                 run_id=self.lifecycle.run_id)
-        self._pending_sample = (step_id, output, scheduler_output)
+        self._pending_sample = (step_id, output, scheduler_output, transfer_step)
         future = self._stage_rpc("execute_model", payload,
                                  self._aggregated(), None)
         self._emit_lifecycle("pp.dispatch", step_id=lifecycle_step_id,
@@ -498,7 +517,7 @@ class VirtualPPExecutor:
         return future if non_block else future.result()
 
     def sample_tokens(self, grammar_output, non_block=False):
-        step_id, output, scheduler_output = self._pending_sample
+        step_id, output, scheduler_output, transfer_step = self._pending_sample
         self._pending_sample = None
         started = time.monotonic_ns() if self.lifecycle is not None else None
         native_ok = False
@@ -516,7 +535,7 @@ class VirtualPPExecutor:
         if sampled is None:
             sampled = output
         future = self._stage_rpc("sample_tokens", None, self._aggregated(),
-                                 sampled)
+                                 sampled, transfer_step=transfer_step)
         if self.lifecycle is not None:
             for method, event in (("_wait_for_response", "request.engine_output_wait"),
                                   ("result", "request.engine_output_result")):

@@ -654,7 +654,7 @@ class C_VLLMEngineCoreHook(BaseHook):
 
             executor = getattr(self, "model_executor", None)
             stepper = getattr(self, "_sim_pipeline_stepper", None)
-            work_in_flight = bool(self.batch_queue) or (
+            work_in_flight = self.scheduler.has_requests() or bool(self.batch_queue) or (
                 stepper is not None and bool(stepper.in_flight)
             )
             if getattr(executor, "step_records", None) is not None:

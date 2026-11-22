@@ -1,9 +1,25 @@
 import sys
 from types import SimpleNamespace as NS
+from enum import IntEnum
 
 import pytest
 
-from sglang_simulator.simulation.vllm.v6d.tpu_connector import C_TPURaidenConnectorHook
+from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
+    C_TPURaidenConnectorHook,
+    C_TPURaidenConnectorWorkerHook,
+)
+
+
+class RequestStatus(IntEnum):
+    FINISHED_LENGTH_CAPPED = 1
+    FINISHED_STOPPED = 2
+    FINISHED_ABORTED = 3
+
+
+class TPUConnectorMetadata:
+    def __init__(self):
+        self.reqs_to_send = {}
+        self.reqs_to_load = {}
 
 
 class MambaSpec:
@@ -12,12 +28,20 @@ class MambaSpec:
 
 def connector(monkeypatch, cache='mamba', producer=True, native_stage3=False):
     # CPU transport does not initialize native Stage-3 geometry or truncate.
-    module = NS(MambaSpec=MambaSpec,
+    module = NS(MambaSpec=MambaSpec, TPUConnectorMetadata=TPUConnectorMetadata,
                 _stage3_group_window_tokens=lambda spec: getattr(spec, 'sliding_window', None))
     monkeypatch.setitem(sys.modules,
                         'vllm_torchtpu.distributed.kv_transfer.tpu_connector', module)
 
+    monkeypatch.setitem(sys.modules, 'vllm.v1.request', NS(RequestStatus=RequestStatus))
+
     class Scheduler:
+        @staticmethod
+        def _stage3_transfer_tokens(request, computed_tokens):
+            prompt = request.num_prompt_tokens
+            truncated = (request.kv_transfer_params or {}).get('_p_side_truncated')
+            return min(computed_tokens, prompt - int(not truncated))
+
         def _maybe_truncate_prompt_for_handoff(self, request):
             params = request.kv_transfer_params or {}
             if request.num_prompt_tokens > 1 and not params.get('_p_side_truncated'):
@@ -45,6 +69,9 @@ def connector(monkeypatch, cache='mamba', producer=True, native_stage3=False):
 
         def build_connector_meta(self, *args):
             pass
+
+        def update_connector_output(self, output):
+            raise AssertionError('local handoff must not enter native Stage-3')
 
         def request_finished(self, *args):
             return False, None
@@ -93,3 +120,73 @@ def test_nonlocal_connector_keeps_native_admission(monkeypatch):
                  num_prompt_tokens=2, kv_transfer_params=None)
     c.on_new_request(request)
     assert c.admitted == [request] and request.num_prompt_tokens == 2
+
+
+def raiden_worker():
+    class NativeWorker:
+        def get_finished(self, *args):
+            raise AssertionError('real transport must not run')
+
+        def has_pending_push_work(self):
+            return False
+
+        def process_send_load(self, *args):
+            raise AssertionError('real transport must not run')
+
+    C_TPURaidenConnectorWorkerHook.hook(NativeWorker)
+    worker = NativeWorker()
+    worker.is_producer = True
+    return worker
+
+
+def finished_request(status=RequestStatus.FINISHED_LENGTH_CAPPED, tokens=7):
+    return NS(request_id='r', status=status, num_computed_tokens=tokens,
+              num_prompt_tokens=8, kv_transfer_params=None)
+
+
+@pytest.mark.parametrize('status', [RequestStatus.FINISHED_LENGTH_CAPPED,
+                                    RequestStatus.FINISHED_STOPPED])
+def test_local_handoff_pin_metadata_ack_and_scheduler_consumption(monkeypatch, status):
+    c = connector(monkeypatch)
+    request = finished_request(status)
+    blocks = ([4, 5], [9])
+    assert c.request_finished_all_groups(request, blocks) == (True, None)
+    assert request.kv_transfer_params is None
+    assert c.has_pending_push_work()
+    assert c.request_finished_all_groups(request, blocks) == (True, None)
+    meta = c.build_connector_meta(None)
+    assert isinstance(meta, TPUConnectorMetadata)
+    assert meta.reqs_to_send['r'].group_block_ids == ((4, 5), (9,))
+    assert meta.reqs_to_send['r'].num_tokens == 7
+    blocks[0].append(6)
+    assert meta.reqs_to_send['r'].group_block_ids == ((4, 5), (9,))
+    assert not c.build_connector_meta(None).reqs_to_send
+    worker = raiden_worker()
+    worker.process_send_load(meta)
+    sent, received = worker.get_finished()
+    assert sent == {'r'} and not received
+    assert not worker.get_finished()[0]
+    # Worker ACK alone is not scheduler consumption (nor a manual block free).
+    assert c.has_pending_push_work()
+    c.update_connector_output(NS(finished_sending=sent))
+    assert not c.has_pending_push_work()
+    assert c.request_finished_all_groups(request, blocks) == (False, None)
+    assert not c.build_connector_meta(None).reqs_to_send
+
+
+@pytest.mark.parametrize('status,tokens,blocks', [
+    (RequestStatus.FINISHED_ABORTED, 7, ([1], [2])),
+    (RequestStatus.FINISHED_STOPPED, 0, ([1], [2])),
+    (RequestStatus.FINISHED_STOPPED, 7, ([], [])),
+])
+def test_local_abort_empty_or_no_tokens_never_pins(monkeypatch, status, tokens, blocks):
+    c = connector(monkeypatch)
+    assert c.request_finished_all_groups(finished_request(status, tokens), blocks) == (False, None)
+    assert not c.has_pending_push_work()
+    assert not c.build_connector_meta(None).reqs_to_send
+
+
+def test_local_handoff_validates_all_group_tables(monkeypatch):
+    c = connector(monkeypatch)
+    with pytest.raises(ValueError, match='group count mismatch'):
+        c.request_finished_all_groups(finished_request(), ([1],))
