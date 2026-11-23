@@ -122,13 +122,14 @@ def test_nonlocal_connector_keeps_native_admission(monkeypatch):
     assert c.admitted == [request] and request.num_prompt_tokens == 2
 
 
-def raiden_worker():
+def raiden_worker(native_pending=True):
     class NativeWorker:
         def get_finished(self, *args):
             raise AssertionError('real transport must not run')
 
-        def has_pending_push_work(self):
-            return False
+        if native_pending:
+            def has_pending_push_work(self):
+                return False
 
         def process_send_load(self, *args):
             raise AssertionError('real transport must not run')
@@ -137,6 +138,17 @@ def raiden_worker():
     worker = NativeWorker()
     worker.is_producer = True
     return worker
+
+
+def test_raiden_worker_without_native_pending_method(monkeypatch):
+    monkeypatch.setenv('HISIM_TPU_RAIDEN_HANDOFF_BASE_S', '0')
+    monkeypatch.setenv('HISIM_TPU_RAIDEN_HANDOFF_BANDWIDTH_GB', '0')
+    worker = raiden_worker(native_pending=False)
+    assert not worker.has_pending_push_work()
+    worker.process_send_load(NS(reqs_to_send={'r': NS(num_tokens=1)}))
+    assert worker.has_pending_push_work()
+    assert worker.get_finished() == ({'r'}, set())
+    assert not worker.has_pending_push_work()
 
 
 def finished_request(status=RequestStatus.FINISHED_LENGTH_CAPPED, tokens=7):

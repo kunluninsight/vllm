@@ -669,11 +669,13 @@ class _TPUConnectorWorkerCPUHook(BaseHook):
         def empty_errors(self, *args, **kwargs):
             return []
 
+        # The CPU adapter owns these queues even on workers without a native pending probe.
+        target.has_pending_push_work = has_pending_push_work
+
         replacements = {
             "start_load_kv": start_load,
             "start_store_kv": start_store,
             "get_finished": get_finished,
-            "has_pending_push_work": has_pending_push_work,
             "get_finished_count": get_finished_count,
             "register_kv_caches": register_kv_caches,
             "register_cross_layers_kv_cache": register_cross_layers_kv_cache,
