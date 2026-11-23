@@ -9,10 +9,37 @@ without moving bytes, so every KVCM control-plane call (location allocation,
 event report, lookup, reclaim) still runs for real against the manager.
 """
 
+import math
+import os
+import time
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
+
+
+
+def _tair_bandwidth_bps(env_name: str) -> float:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        gb_s = float(raw)
+    except ValueError:
+        raise ValueError(f"{env_name} must be a non-negative finite number") from None
+    if not math.isfinite(gb_s) or gb_s < 0:
+        raise ValueError(f"{env_name} must be a non-negative finite number")
+    return gb_s * 1e9
+
+
+def _sleep_for_bytes(sizes, env_name: str) -> None:
+    bps = _tair_bandwidth_bps(env_name)
+    if bps <= 0:
+        return
+    total_bytes = sum(int(s) for s in sizes if s and s > 0)
+    if total_bytes > 0:
+        time.sleep(total_bytes / bps)
 
 
 class _NoopTransferClient:
@@ -41,6 +68,7 @@ class C_TairKVCMTransferRuntimeHook(BaseHook):
                 raise ValueError("uris, pointers, and sizes length mismatch")
             from v6d.common.tair_kvcm.transfer import _record_transfer_result
 
+            _sleep_for_bytes(sizes, "HISIM_TAIR_KVCM_READ_BANDWIDTH_GB")
             _record_transfer_result("read", True)
             return True
 
@@ -51,6 +79,7 @@ class C_TairKVCMTransferRuntimeHook(BaseHook):
                 raise ValueError("uris, pointers, and sizes length mismatch")
             from v6d.common.tair_kvcm.transfer import _record_transfer_result
 
+            _sleep_for_bytes(sizes, "HISIM_TAIR_KVCM_WRITE_BANDWIDTH_GB")
             _record_transfer_result("write", True)
             return [True] * len(uris)
 

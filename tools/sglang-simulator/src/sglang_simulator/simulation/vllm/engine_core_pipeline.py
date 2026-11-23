@@ -201,9 +201,11 @@ class C_VLLMSchedulerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        from .tpu_cache_patches import install_tpu_cache_patches
         from .tpu_eagle_cache import patch_disable_eagle_block_drop
 
         patch_disable_eagle_block_drop(target)
+        install_tpu_cache_patches(target)
         original_get_num_unfinished = target.get_num_unfinished_requests
         target.get_num_unfinished_requests = lambda self: (
             original_get_num_unfinished(self) + len(ReqDispatcher())

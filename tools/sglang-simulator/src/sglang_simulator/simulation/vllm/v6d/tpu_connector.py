@@ -14,6 +14,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import wraps
 import math
+import os
 import time
 import weakref
 from typing import Callable
@@ -40,6 +41,84 @@ class _TPUTransferGate:
 
 _transfer_gate = ContextVar("tpu_transfer_gate", default=None)
 _store_queues = weakref.WeakSet()
+_timed_queues = weakref.WeakSet()
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _nonneg_env_float(name: str, default: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a non-negative finite number") from None
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a non-negative finite number")
+    return value
+
+
+def _tpu_load_bytes_per_second() -> float:
+    gb_s = _nonneg_env_float("HISIM_TPU_V6D_LOAD_BANDWIDTH_GB", 0.0)
+    return gb_s * 1e9 if gb_s > 0 else 0.0
+
+
+def _tpu_raiden_handoff_timing() -> tuple[float, float]:
+    base_s = _nonneg_env_float("HISIM_TPU_RAIDEN_HANDOFF_BASE_S", 0.0)
+    bw_gb = _nonneg_env_float("HISIM_TPU_RAIDEN_HANDOFF_BANDWIDTH_GB", 0.0)
+    return base_s, (bw_gb * 1e9 if bw_gb > 0 else 0.0)
+
+
+@dataclass
+class _TimedReqJob:
+    req_id: str
+    deadline: float
+
+
+class _TimedReqQueue:
+    # FIFO timed completion queue for H2D V6D loads and Raiden handoff holds.
+
+    def __init__(self, lanes: int = 1):
+        self.jobs = deque()
+        self._lanes = [0.0] * max(1, lanes)
+        _timed_queues.add(self)
+
+    def enqueue(self, req_id: str, duration: float, now: float) -> float:
+        idx = min(range(len(self._lanes)), key=self._lanes.__getitem__)
+        deadline = max(now, self._lanes[idx]) + duration
+        self._lanes[idx] = deadline
+        self.jobs.append(_TimedReqJob(req_id, deadline))
+        return deadline
+
+    def harvest(self, now: float) -> set[str]:
+        ready = set()
+        if not self.jobs:
+            return ready
+        remaining = deque()
+        for job in self.jobs:
+            if job.deadline <= now:
+                ready.add(job.req_id)
+            else:
+                remaining.append(job)
+        self.jobs = remaining
+        return ready
+
+    def earliest_deadline(self) -> float | None:
+        if not self.jobs:
+            return None
+        return min(job.deadline for job in self.jobs)
 
 
 @contextmanager
@@ -68,6 +147,8 @@ class _TPUStoreQueue:
         self.seen = {}
         self.highest_job_id = -1
         self.lane_ready_at = 0.0
+        self._num_lanes = _positive_env_int("HISIM_TPU_V6D_STORE_LANES", 1)
+        self._lanes = [0.0] * self._num_lanes
         _store_queues.add(self)
 
     def resolve_deadlines(self):
@@ -75,15 +156,28 @@ class _TPUStoreQueue:
             if job.deadline is not None:
                 continue
             if job.gate.ready_at is None:
-                break
+                if self._num_lanes == 1:
+                    break
+                continue
             if not math.isfinite(job.gate.ready_at):
                 raise ValueError("TPU transfer ready_at must be finite")
-            job.deadline = max(job.gate.ready_at, self.lane_ready_at) + job.duration
-            self.lane_ready_at = job.deadline
+            if self._num_lanes == 1:
+                job.deadline = max(job.gate.ready_at, self.lane_ready_at) + job.duration
+                self.lane_ready_at = job.deadline
+                self._lanes[0] = job.deadline
+            else:
+                idx = min(range(self._num_lanes), key=self._lanes.__getitem__)
+                job.deadline = max(job.gate.ready_at, self._lanes[idx]) + job.duration
+                self._lanes[idx] = job.deadline
+                self.lane_ready_at = max(self._lanes)
+
+    def earliest_deadline(self) -> float | None:
+        deadlines = [j.deadline for j in self.jobs if j.deadline is not None]
+        return min(deadlines) if deadlines else None
 
 
 def wait_for_tpu_store_progress():
-    """Wait for the earliest store event only after all PP gates resolve.
+    """Wait for the earliest store/load/handoff event after PP gates resolve.
 
     Queues are worker-owned; weak registration never keeps an old engine alive.
     Nonempty execute_model and unresolved PP futures must never wait here.
@@ -94,8 +188,13 @@ def wait_for_tpu_store_progress():
     deadlines = []
     for queue in queues:
         queue.resolve_deadlines()
-        if queue.jobs:
-            deadlines.append(queue.jobs[0].deadline)
+        earliest = queue.earliest_deadline()
+        if earliest is not None:
+            deadlines.append(earliest)
+    for tq in list(_timed_queues):
+        earliest = tq.earliest_deadline()
+        if earliest is not None:
+            deadlines.append(earliest)
     if deadlines:
         delay = min(deadlines) - time.monotonic()
         if delay > 0:
@@ -642,9 +741,34 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
                     or getattr(self, "_store_job_ids", {})):
                 raise RuntimeError("TPU V6D CPU job adapter found unexpected native DMA jobs")
 
+        def load_queue_for(self):
+            if not hasattr(self, "_sim_tpu_load_queue"):
+                self._sim_tpu_load_queue = _TimedReqQueue(
+                    lanes=_positive_env_int("HISIM_TPU_V6D_LOAD_LANES", 1)
+                )
+            return self._sim_tpu_load_queue
+
         def start_load(self, metadata):
             validate(self, metadata)
-            cpu_load(self, metadata)
+            read_bps = _tpu_load_bytes_per_second()
+            if read_bps > 0:
+                cls._ensure_state(self)
+                if not hasattr(self, "_sim_tpu_node_layout"):
+                    self._sim_tpu_node_layout = _tpu_node_object_layout(
+                        self._vllm_config, self._kv_cache_config
+                    )
+                layout = self._sim_tpu_node_layout
+                if layout is not None:
+                    now = time.monotonic()
+                    lqueue = load_queue_for(self)
+                    for req_id, groups in (getattr(metadata, "reqs_to_load", {}) or {}).items():
+                        n_objs = sum(len(keys) for keys, _ids in groups.values())
+                        if n_objs > 0:
+                            lqueue.enqueue(req_id, n_objs * layout[0] / read_bps, now)
+                else:
+                    cpu_load(self, metadata)
+            else:
+                cpu_load(self, metadata)
             # 这是原生 scheduler 明确承诺 delay_free 的增量集合，可能只有
             # wait 而没有新 store/load；不能拿 finished_req_ids 代替它。
             self._finished_reqs_waiting_for_store.update(metadata.store_waits)
@@ -705,16 +829,31 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
             queue = queue_for(self)
             queue.resolve_deadlines()
             now = time.monotonic()
-            while queue.jobs:
-                job = queue.jobs[0]
-                if job.deadline is None or job.deadline > now:
-                    break
-                acknowledge(self, job.job_id)
-                self._saving_req_jobs[job.req_id].remove(job.job_id)
-                if not self._saving_req_jobs[job.req_id]:
-                    del self._saving_req_jobs[job.req_id]
-                queue.jobs.popleft()
-                del queue.seen[job.job_id]
+            if queue._num_lanes == 1:
+                while queue.jobs:
+                    job = queue.jobs[0]
+                    if job.deadline is None or job.deadline > now:
+                        break
+                    acknowledge(self, job.job_id)
+                    self._saving_req_jobs[job.req_id].remove(job.job_id)
+                    if not self._saving_req_jobs[job.req_id]:
+                        del self._saving_req_jobs[job.req_id]
+                    queue.jobs.popleft()
+                    del queue.seen[job.job_id]
+            else:
+                remaining = deque()
+                for job in queue.jobs:
+                    if job.deadline is not None and job.deadline <= now:
+                        acknowledge(self, job.job_id)
+                        self._saving_req_jobs[job.req_id].remove(job.job_id)
+                        if not self._saving_req_jobs[job.req_id]:
+                            del self._saving_req_jobs[job.req_id]
+                        del queue.seen[job.job_id]
+                    else:
+                        remaining.append(job)
+                queue.jobs = remaining
+            if hasattr(self, "_sim_tpu_load_queue"):
+                self._sim_tpu_load_done.update(self._sim_tpu_load_queue.harvest(now))
 
         def handle_preemptions(self, metadata):
             queue = queue_for(self)
@@ -745,8 +884,13 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
 
         def has_pending_push_work(self):
             cls._ensure_state(self)
+            load_pending = (
+                bool(self._sim_tpu_load_queue.jobs)
+                if hasattr(self, "_sim_tpu_load_queue")
+                else False
+            )
             return bool(
-                queue_for(self).jobs or self._sim_tpu_load_done
+                queue_for(self).jobs or load_pending or self._sim_tpu_load_done
                 or self._finished_reqs_waiting_for_store
                 or self._worker_meta.store_results or self._worker_meta.failed_loads
             )
@@ -773,14 +917,43 @@ class C_TPURaidenConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
     @classmethod
     def hook(cls, target):
         super().hook(target)
+        base_get_finished = target.get_finished
+        base_has_pending = target.has_pending_push_work
+
+        def hold_queue_for(self):
+            if not hasattr(self, "_sim_raiden_hold_queue"):
+                self._sim_raiden_hold_queue = _TimedReqQueue(
+                    lanes=_positive_env_int("HISIM_TPU_RAIDEN_HANDOFF_LANES", 4)
+                )
+            return self._sim_raiden_hold_queue
 
         def process_send_load(
             self, metadata, wait_for_completion=False, report_completion=True
         ):
             cls._ensure_state(self)
             if self.is_producer:
-                for req_id in (getattr(metadata, "reqs_to_send", {}) or {}):
-                    self._sim_tpu_store_done.add(req_id)
+                base_s, bw_bps = _tpu_raiden_handoff_timing()
+                if base_s > 0 or bw_bps > 0:
+                    now = time.monotonic()
+                    hqueue = hold_queue_for(self)
+                    bytes_per_token = _nonneg_env_float(
+                        "HISIM_TPU_RAIDEN_BYTES_PER_TOKEN", 0.0
+                    )
+                    for req_id, req_meta in (getattr(metadata, "reqs_to_send", {}) or {}).items():
+                        tokens = max(0, int(getattr(req_meta, "num_tokens", 0) or 0))
+                        xfer_s = (
+                            (tokens * bytes_per_token / bw_bps)
+                            if (bw_bps > 0 and bytes_per_token > 0 and tokens > 0)
+                            else 0.0
+                        )
+                        duration = base_s + xfer_s
+                        if duration > 0:
+                            hqueue.enqueue(req_id, duration, now)
+                        else:
+                            self._sim_tpu_store_done.add(req_id)
+                else:
+                    for req_id in (getattr(metadata, "reqs_to_send", {}) or {}):
+                        self._sim_tpu_store_done.add(req_id)
                 return None
             if not report_completion:
                 return None
@@ -789,4 +962,20 @@ class C_TPURaidenConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
                     self._sim_tpu_load_done.add(req_id)
             return None
 
+        def get_finished(self, *args, **kwargs):
+            cls._ensure_state(self)
+            if hasattr(self, "_sim_raiden_hold_queue"):
+                self._sim_tpu_store_done.update(
+                    self._sim_raiden_hold_queue.harvest(time.monotonic())
+                )
+            return base_get_finished(self, *args, **kwargs)
+
+        def has_pending_push_work(self):
+            cls._ensure_state(self)
+            if hasattr(self, "_sim_raiden_hold_queue") and self._sim_raiden_hold_queue.jobs:
+                return True
+            return base_has_pending(self)
+
         target.process_send_load = process_send_load
+        target.get_finished = get_finished
+        target.has_pending_push_work = has_pending_push_work

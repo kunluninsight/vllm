@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import contextvars
 import ipaddress
+import math
 import os
 import sys
+import time
 
 from sglang_simulator.hook import BaseHook, install_class_hooks
 from sglang_simulator.utils import get_logger
@@ -104,8 +106,47 @@ def _fmt_keys(object_keys) -> str:
 #     calls them (data load is client-side, and the sim connector never
 #     loads).
 
+def _p2p_bandwidth_bps() -> float:
+    raw = os.environ.get("HISIM_V6D_P2P_BANDWIDTH_GB", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        gb_s = float(raw)
+    except ValueError:
+        raise ValueError("HISIM_V6D_P2P_BANDWIDTH_GB must be non-negative and finite") from None
+    if not math.isfinite(gb_s) or gb_s < 0:
+        raise ValueError("HISIM_V6D_P2P_BANDWIDTH_GB must be non-negative and finite")
+    return gb_s * 1e9
+
+
+def _infer_transfer_bytes(args, kwargs) -> int:
+    for key in ("sizes", "nbytes", "size", "length"):
+        val = kwargs.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        if isinstance(val, (list, tuple)):
+            return sum(int(x) for x in val if isinstance(x, (int, float)) and x > 0)
+    total = 0
+    for arg in args:
+        if isinstance(arg, (list, tuple)):
+            for item in arg:
+                sz = getattr(item, "size", None) or getattr(item, "nbytes", None)
+                if isinstance(sz, (int, float)) and sz > 0:
+                    total += int(sz)
+        else:
+            sz = getattr(arg, "size", None) or getattr(arg, "nbytes", None)
+            if isinstance(sz, (int, float)) and sz > 0:
+                total += int(sz)
+    return total
+
+
 def _sim_load_data_noop(*args, **kwargs):
     """Skip the remote blob copy (eager strategies only; lazy never calls)."""
+    bps = _p2p_bandwidth_bps()
+    if bps > 0:
+        nbytes = _infer_transfer_bytes(args, kwargs)
+        if nbytes > 0:
+            time.sleep(nbytes / bps)
     logger.debug("[v6d-sim] skip remote blob data transfer (no data plane)")
     return None
 
