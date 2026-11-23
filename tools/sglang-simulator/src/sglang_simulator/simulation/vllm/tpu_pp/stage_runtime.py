@@ -445,12 +445,18 @@ class VirtualPPExecutor:
 
     def execute_model(self, scheduler_output, non_block=False):
         from sglang_simulator.simulation.vllm.v6d.tpu_connector import (
-            tpu_transfer_step, wait_for_tpu_store_progress,
+            _nonneg_env_float,
+            tpu_idle_wait_cap,
+            tpu_transfer_step,
+            wait_for_tpu_store_progress,
         )
 
         tokens = int(scheduler_output.total_num_scheduled_tokens)
         if tokens <= 0:
-            wait_for_tpu_store_progress()
+            slice_ms = _nonneg_env_float("HISIM_TPU_IDLE_WAIT_SLICE_MS", 5.0)
+            cap_s = (slice_ms / 1000.0) if slice_ms > 0 else None
+            with tpu_idle_wait_cap(cap_s):
+                wait_for_tpu_store_progress()
         if tokens > 0:
             self._next_step += 1
             scheduler_output._sim_tpu_pp_step_id = self._next_step

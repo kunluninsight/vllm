@@ -173,3 +173,145 @@ def test_tair_and_p2p_optional_bandwidth_sleep(monkeypatch):
     monkeypatch.setenv("HISIM_V6D_P2P_BANDWIDTH_GB", "4.0")
     v6d_capacity._sim_load_data_noop(sizes=[2_000_000_000])
     assert p2p_sleeps == pytest.approx([0.5])
+
+
+def test_same_step_guard_allows_direct_pool_lookup_outside_schedule(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", "1")
+    monkeypatch.delenv("HISIM_TPU_DISABLE_SAME_STEP_PREFIX_PATCH", raising=False)
+
+    class FakeBlockPool:
+        def __init__(self):
+            self.cache = {}
+
+        def _insert_block_hash(self, key, block, num_tokens):
+            self.cache[key] = block
+
+        def get_cached_block(self, block_hash, kv_cache_group_ids):
+            blocks = [self.cache.get((block_hash, gid)) for gid in kv_cache_group_ids]
+            return blocks if all(b is not None for b in blocks) else None
+
+    class SchedulelessMock:
+        pass
+
+    # Must not raise when scheduler class omits schedule().
+    patches.patch_same_step_prefix_hits(SchedulelessMock, FakeBlockPool)
+    pool = FakeBlockPool()
+    pool._insert_block_hash(("h2", 0), NS(block_id=7), 8)
+    hit = pool.get_cached_block("h2", [0])
+    assert hit is not None and hit[0].block_id == 7
+
+
+def test_inproc_llm_engine_keeps_stepping_until_kv_cleanup_drains(monkeypatch):
+    import inspect
+    from collections import deque
+
+    from sglang_simulator.simulation.vllm.engine_core_pipeline import (
+        C_VLLMLLMEngineHook,
+    )
+
+    monkeypatch.setattr(
+        "sglang_simulator.simulation.vllm.engine_core_pipeline._register_tpu_connector_names",
+        lambda: None,
+    )
+
+    class FakeLLMEngine:
+        def __init__(self, core):
+            self._output_unfinished = False
+            self.engine_core = NS(engine_core=core)
+
+        def has_unfinished_requests(self, local: bool = False) -> bool:
+            return self._output_unfinished
+
+    C_VLLMLLMEngineHook.hook(FakeLLMEngine)
+    assert "local" in inspect.signature(FakeLLMEngine.has_unfinished_requests).parameters
+
+    # 1. No connector + abort-before-schedule (finished_req_ids non-empty) -> False.
+    core_no_conn = NS(
+        batch_queue=deque(),
+        scheduler=NS(
+            connector=None,
+            requests={},
+            waiting=[],
+            skipped_waiting=[],
+            running=[],
+            finished_req_ids={"abort-1"},
+        ),
+    )
+    eng_no_conn = FakeLLMEngine(core_no_conn)
+    assert eng_no_conn.has_unfinished_requests(local=True) is False
+
+    # 2. In-flight empty cleanup step in batch_queue -> True until drained.
+    core_no_conn.batch_queue.append("empty-step-E1")
+    assert eng_no_conn.has_unfinished_requests() is True
+    core_no_conn.batch_queue.popleft()
+    assert eng_no_conn.has_unfinished_requests() is False
+
+    # 3. Delayed connector release pinned in scheduler.requests -> True until freed.
+    push_pending = [False]
+    connector = NS(has_pending_push_work=lambda: push_pending[0])
+    core_conn = NS(
+        batch_queue=deque(),
+        scheduler=NS(
+            connector=connector,
+            requests={"req-tail": NS()},
+            waiting=[],
+            skipped_waiting=[],
+            running=[],
+        ),
+    )
+    eng_conn = FakeLLMEngine(core_conn)
+    assert eng_conn.has_unfinished_requests() is True
+    core_conn.scheduler.requests.pop("req-tail")
+    assert eng_conn.has_unfinished_requests() is False
+
+    # 4. Connector pending push work (e.g. V6D store / Raiden hold) -> True until done.
+    push_pending[0] = True
+    assert eng_conn.has_unfinished_requests() is True
+    push_pending[0] = False
+    assert eng_conn.has_unfinished_requests() is False
+
+
+def test_v6d_connector_exposes_has_pending_push_work():
+    class FakeV6dConnector:
+        def __init__(self, sched=None, worker=None):
+            self.scheduler = sched
+            self.worker = worker
+
+        def update_state_after_alloc(self, request, blocks, num_external_tokens):
+            return None
+
+    adapter.C_TPUV6dConnectorAdmissionHook.hook(FakeV6dConnector)
+    sched = NS(_store_jobs={}, _store_waits=set())
+    worker_busy = [False]
+    worker = NS(has_pending_push_work=lambda: worker_busy[0])
+    conn = FakeV6dConnector(sched=sched, worker=worker)
+
+    assert conn.has_pending_push_work() is False
+    sched._store_jobs[1] = "job"
+    assert conn.has_pending_push_work() is True
+    sched._store_jobs.clear()
+    sched._store_waits.add("r1")
+    assert conn.has_pending_push_work() is True
+    sched._store_waits.clear()
+    worker_busy[0] = True
+    assert conn.has_pending_push_work() is True
+    worker_busy[0] = False
+    assert conn.has_pending_push_work() is False
+
+
+def test_tpu_idle_wait_cap_slices_long_handoff_hold(monkeypatch):
+    now = NS(value=100.0)
+    sleeps = []
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: now.value)
+    monkeypatch.setattr(adapter.time, "sleep", lambda s: (sleeps.append(s), setattr(now, "value", now.value + s)))
+
+    tq = adapter._TimedReqQueue(lanes=1)
+    tq.enqueue("r-hold", 1.5, now.value)
+
+    with adapter.tpu_idle_wait_cap(0.005):
+        adapter.wait_for_tpu_store_progress()
+    assert sleeps == pytest.approx([0.005])
+
+    # Uncapped direct call still waits the remaining duration.
+    adapter.wait_for_tpu_store_progress()
+    assert sleeps == pytest.approx([0.005, 1.495])

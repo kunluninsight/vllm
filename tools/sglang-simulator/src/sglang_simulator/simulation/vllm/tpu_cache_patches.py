@@ -131,53 +131,68 @@ def patch_same_step_prefix_hits(scheduler_cls, block_pool_cls=None) -> None:
 
         block_pool_cls = BlockPool
 
-    if getattr(block_pool_cls.get_cached_block, _SAME_STEP_MARKER, False):
-        return
-
-    original_insert = block_pool_cls._insert_block_hash
-    original_get_cached = block_pool_cls.get_cached_block
-    original_schedule = scheduler_cls.schedule
-
     def unwritten_block_ids(pool) -> set[int]:
         return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
 
-    @wraps(original_insert)
-    def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
-        original_insert(self, block_hash_with_group_id, block, num_tokens)
-        if _tpu_cache_patches_active():
-            unwritten_block_ids(self).add(block.block_id)
+    if not getattr(block_pool_cls.get_cached_block, _SAME_STEP_MARKER, False):
+        original_insert = block_pool_cls._insert_block_hash
+        original_get_cached = block_pool_cls.get_cached_block
 
-    @wraps(original_get_cached)
-    def get_cached_block(self, block_hash, kv_cache_group_ids):
-        blocks = original_get_cached(self, block_hash, kv_cache_group_ids)
-        if not _tpu_cache_patches_active():
+        @wraps(original_insert)
+        def _insert_block_hash(self, block_hash_with_group_id, block, num_tokens):
+            original_insert(self, block_hash_with_group_id, block, num_tokens)
+            # Only track unwritten hashes during an active Scheduler.schedule()
+            # call so direct BlockPool unit tests outside schedule() stay intact.
+            if (
+                _tpu_cache_patches_active()
+                and self.__dict__.get("_tpu_in_schedule", 0) > 0
+            ):
+                unwritten_block_ids(self).add(block.block_id)
+
+        @wraps(original_get_cached)
+        def get_cached_block(self, block_hash, kv_cache_group_ids):
+            blocks = original_get_cached(self, block_hash, kv_cache_group_ids)
+            if not _tpu_cache_patches_active():
+                return blocks
+            unwritten = self.__dict__.get("_tpu_unwritten_block_ids")
+            if (
+                blocks
+                and unwritten
+                and any(block.block_id in unwritten for block in blocks)
+            ):
+                return None
             return blocks
-        unwritten = self.__dict__.get("_tpu_unwritten_block_ids")
-        if (
-            blocks
-            and unwritten
-            and any(block.block_id in unwritten for block in blocks)
-        ):
-            return None
-        return blocks
 
-    @wraps(original_schedule)
-    def schedule(self, *args, **kwargs):
-        manager = getattr(self, "kv_cache_manager", None)
-        pool = getattr(manager, "block_pool", None)
-        if pool is not None:
-            unwritten_block_ids(pool).clear()
-        return original_schedule(self, *args, **kwargs)
+        setattr(_insert_block_hash, _SAME_STEP_MARKER, True)
+        setattr(get_cached_block, _SAME_STEP_MARKER, True)
+        block_pool_cls._insert_block_hash = _insert_block_hash
+        block_pool_cls.get_cached_block = get_cached_block
 
-    setattr(_insert_block_hash, _SAME_STEP_MARKER, True)
-    setattr(get_cached_block, _SAME_STEP_MARKER, True)
-    setattr(schedule, _SAME_STEP_MARKER, True)
-    block_pool_cls._insert_block_hash = _insert_block_hash
-    block_pool_cls.get_cached_block = get_cached_block
-    scheduler_cls.schedule = schedule
-    logger.info(
-        "[TPU cache] installed same-step prefix-hit guard on BlockPool/Scheduler"
-    )
+    original_schedule = getattr(scheduler_cls, "schedule", None)
+    if original_schedule is not None and not getattr(
+        original_schedule, _SAME_STEP_MARKER, False
+    ):
+
+        @wraps(original_schedule)
+        def schedule(self, *args, **kwargs):
+            manager = getattr(self, "kv_cache_manager", None)
+            pool = getattr(manager, "block_pool", None)
+            if pool is not None:
+                unwritten_block_ids(pool).clear()
+                pool._tpu_in_schedule = pool.__dict__.get("_tpu_in_schedule", 0) + 1
+            try:
+                return original_schedule(self, *args, **kwargs)
+            finally:
+                if pool is not None:
+                    pool._tpu_in_schedule = max(
+                        0, pool.__dict__.get("_tpu_in_schedule", 1) - 1
+                    )
+
+        setattr(schedule, _SAME_STEP_MARKER, True)
+        scheduler_cls.schedule = schedule
+        logger.info(
+            "[TPU cache] installed same-step prefix-hit guard on BlockPool/Scheduler"
+        )
 
 
 def patch_hybrid_kv_load_failure_recovery(scheduler_cls) -> None:
@@ -250,3 +265,12 @@ def install_tpu_cache_patches(scheduler_cls) -> None:
     patch_explicit_cache_checkpoint()
     patch_same_step_prefix_hits(scheduler_cls)
     patch_hybrid_kv_load_failure_recovery(scheduler_cls)
+    if _tpu_cache_patches_active() and not _env_enabled(
+        "DS_LLM_ENABLE_PREDICT_CACHE_HINT"
+    ):
+        logger.warning(
+            "[TPU cache] explicit cache checkpoint patch is active, but "
+            "DS_LLM_ENABLE_PREDICT_CACHE_HINT is not enabled; DashLLM will not "
+            "forward x-ds-max-user-theoretical-hit-num into "
+            "cache_control_params.token_positions unless set to 1"
+        )

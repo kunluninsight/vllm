@@ -40,8 +40,19 @@ class _TPUTransferGate:
 
 
 _transfer_gate = ContextVar("tpu_transfer_gate", default=None)
+_idle_wait_cap_s = ContextVar("tpu_idle_wait_cap_s", default=None)
 _store_queues = weakref.WeakSet()
 _timed_queues = weakref.WeakSet()
+
+
+@contextmanager
+def tpu_idle_wait_cap(max_wait_s: float | None):
+    """Cap per-step idle polling sleep so single-process serving stays responsive."""
+    token = _idle_wait_cap_s.set(max_wait_s)
+    try:
+        yield
+    finally:
+        _idle_wait_cap_s.reset(token)
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -197,6 +208,9 @@ def wait_for_tpu_store_progress():
             deadlines.append(earliest)
     if deadlines:
         delay = min(deadlines) - time.monotonic()
+        cap = _idle_wait_cap_s.get()
+        if cap is not None and delay > cap:
+            delay = cap
         if delay > 0:
             time.sleep(delay)
 
@@ -211,7 +225,12 @@ def _tpu_node_object_layout(vllm_config, kv_cache_config):
 
     raw = ConfigManager._get_raw_config()
     scheduler = raw.get("scheduler", {})
-    if not is_tpu_target(raw) or scheduler.get("pp_size", 1) == 1:
+    if (
+        not is_tpu_target(raw)
+        or scheduler.get("pp_size", 1) == 1
+        or vllm_config is None
+        or kv_cache_config is None
+    ):
         return None
     from vllm.v1.core.kv_cache_utils import (
         _pool_bytes_per_block,
@@ -288,7 +307,10 @@ class C_TPUV6dObjectLayoutHook(BaseHook):
         def compute(self, spec, group_id):
             result = original(self, spec, group_id)
             if not hasattr(self, "_sim_tpu_v6d_layout"):
-                layout = _tpu_node_object_layout(self.vllm_config, self.kv_cache_config)
+                layout = _tpu_node_object_layout(
+                    getattr(self, "vllm_config", None),
+                    getattr(self, "kv_cache_config", None),
+                )
                 if layout is None:
                     return result
                 self._sim_tpu_v6d_layout = (*layout, result[2])
@@ -353,7 +375,26 @@ class C_TPUV6dConnectorAdmissionHook(BaseHook):
                     )
             return result
 
+        original_pending = getattr(target, "has_pending_push_work", None)
+
+        def has_pending_push_work(self):
+            if original_pending is not None and original_pending(self):
+                return True
+            sched = getattr(self, "scheduler", None)
+            if sched is not None and (
+                getattr(sched, "_store_jobs", None)
+                or getattr(sched, "_store_waits", None)
+            ):
+                return True
+            worker = getattr(self, "worker", None)
+            if worker is not None:
+                worker_pending = getattr(worker, "has_pending_push_work", None)
+                if worker_pending is not None and worker_pending():
+                    return True
+            return False
+
         target.update_state_after_alloc = allocated
+        target.has_pending_push_work = has_pending_push_work
 
 
 class C_TPURaidenConnectorHook(BaseHook):

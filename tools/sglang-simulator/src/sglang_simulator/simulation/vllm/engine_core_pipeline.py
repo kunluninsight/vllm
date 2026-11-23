@@ -365,8 +365,43 @@ def _register_tpu_connector_names():
                 raise
 
 
+def _inproc_core_has_pending_cleanup(engine) -> bool:
+    """Keep in-process EngineCore stepping until delayed KV releases drain.
+
+    In multiprocess mode, EngineCoreProc.run_busy_loop() keeps stepping on
+    ``bool(batch_queue) or scheduler.has_requests()`` even after OutputProcessor
+    emits the final token. In single-process CPU simulation (InprocClient),
+    DashLLM only steps while LLMEngine.has_unfinished_requests() is True, so
+    without this check tail empty steps and delayed V6D/Raiden KV releases
+    freeze across idle gaps until the next request arrives.
+    """
+    client = getattr(engine, "engine_core", None)
+    core = getattr(client, "engine_core", None)
+    if core is None:
+        return False
+    if getattr(core, "batch_queue", None):
+        return True
+    scheduler = getattr(core, "scheduler", None)
+    if scheduler is None:
+        return False
+    connector = getattr(scheduler, "connector", None)
+    if connector is None:
+        return False
+    requests = getattr(scheduler, "requests", None)
+    if requests is not None:
+        num_in_queues = (
+            len(getattr(scheduler, "waiting", ()))
+            + len(getattr(scheduler, "skipped_waiting", ()))
+            + len(getattr(scheduler, "running", ()))
+        )
+        if len(requests) > num_in_queues:
+            return True
+    has_pending_push = getattr(connector, "has_pending_push_work", None)
+    return bool(has_pending_push() if has_pending_push is not None else False)
+
+
 class C_VLLMLLMEngineHook(BaseHook):
-    """在前端进程初始化前注册名称，供跨进程 KV 统计反序列化使用。"""
+    """在前端进程初始化前注册名称，并保持单进程异步释放排空。"""
 
     HOOK_CLASS_NAME = "LLMEngine"
     HOOK_MODULE_NAME = "vllm.v1.engine.llm_engine"
@@ -389,6 +424,15 @@ class C_VLLMLLMEngineHook(BaseHook):
             original_init(self, *args, **kwargs)
 
         target.__init__ = wrapped_init
+        original_has_unfinished = getattr(target, "has_unfinished_requests", None)
+        if original_has_unfinished is not None:
+            @wraps(original_has_unfinished)
+            def wrapped_has_unfinished_requests(self, *args, **kwargs):
+                if original_has_unfinished(self, *args, **kwargs):
+                    return True
+                return _inproc_core_has_pending_cleanup(self)
+
+            target.has_unfinished_requests = wrapped_has_unfinished_requests
         target._sim_frontend_connector_registration = True
 
 
