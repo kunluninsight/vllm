@@ -297,6 +297,10 @@ class _TPUConnectorWorkerCPUHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
+        # Compose with the simulator hook: class registration selects only one match.
+        from sglang_simulator.transfer_observation_hook import C_TransferWorkerObservationHook
+        C_TransferWorkerObservationHook.hook(target)
+
         def start_load(self, *args, **kwargs):
             cls._ensure_state(self)
             metadata = _metadata_with(args, kwargs, "reqs_to_load")
