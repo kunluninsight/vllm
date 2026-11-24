@@ -188,7 +188,14 @@ def flag_outliers(rows):
             row['outlier_threshold_ms'] = threshold
 
 
-def fit_stage(rows, stage, n_estimators=300):
+def fit_stage(
+    rows,
+    stage,
+    n_estimators=400,
+    alpha=0.95,
+    min_samples_leaf=6,
+    batch_size_weight_power=1.0,
+):
     names = FEATURE_NAMES + (TAIL_FEATURES if stage == 3 else [])
     selected = [r for r in rows if r['stage'] == stage and r['split'] == 'train']
     if not selected:
@@ -196,9 +203,15 @@ def fit_stage(rows, stage, n_estimators=300):
     x = np.array([[r[name] for name in names] for r in selected])
     y = np.array([r['target_ms']/1000 for r in selected])
     model = GradientBoostingRegressor(
-        loss='huber', alpha=.9, n_estimators=n_estimators, learning_rate=.05,
-        max_depth=6, min_samples_leaf=12, subsample=.8, random_state=42)
-    model.fit(x, y)
+        loss='huber', alpha=alpha, n_estimators=n_estimators, learning_rate=.05,
+        max_depth=6, min_samples_leaf=min_samples_leaf, subsample=.8, random_state=42)
+    sample_weight = None
+    if batch_size_weight_power > 0:
+        sample_weight = np.array([
+            max(1.0, float(r.get('batch_size', 1.0))) ** batch_size_weight_power
+            for r in selected
+        ])
+    model.fit(x, y, sample_weight=sample_weight)
     return dict(models=[model], mode='direct', features=names,
                 feature_schema='tpu_stage3_tail_26_v1' if stage == 3 else 'tpu_stage_22_v1',
                 feature_dimension=len(names), stage=stage, time_unit='seconds',
@@ -208,6 +221,7 @@ def fit_stage(rows, stage, n_estimators=300):
                 endpoint=endpoint(stage), external_offset_ms=0,
                 train_rows=len(selected), train_cases=dict(Counter(f'{r["dataset"]}/{r["case"]}' for r in selected)),
                 outlier_policy='No latency outlier removed or capped; Huber loss downweights large residuals',
+                batch_size_weight_power=batch_size_weight_power,
                 numpy_version=np.__version__, sklearn_version=sklearn.__version__,
                 training_parameters=model.get_params(), split='last 20% per dataset/case; preceding 4 steps excluded from fit')
 
@@ -250,6 +264,10 @@ def main():
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--min-train-per-padding', type=int, default=20,
                         help='Fail fitting if any stage has fewer actual train rows in 2048/4096/8192')
+    parser.add_argument('--n-estimators', type=int, default=400)
+    parser.add_argument('--alpha', type=float, default=0.95)
+    parser.add_argument('--min-samples-leaf', type=int, default=6)
+    parser.add_argument('--batch-size-weight-power', type=float, default=1.0)
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
     names = [s['name'] for s in manifest['datasets']]
@@ -284,7 +302,14 @@ def main():
                 if n < args.min_train_per_padding:
                     raise ValueError(f'stage {stage}, padding {padding}: only {n} actual training rows; need {args.min_train_per_padding}; aggregation saved, no training performed')
         for stage in range(4):
-            bundle=fit_stage(all_rows, stage)
+            bundle=fit_stage(
+                all_rows,
+                stage,
+                n_estimators=args.n_estimators,
+                alpha=args.alpha,
+                min_samples_leaf=args.min_samples_leaf,
+                batch_size_weight_power=args.batch_size_weight_power,
+            )
             bundle['source_manifest']=manifest
             path=args.output/f'DIAGNOSTIC_ONLY_stage-{stage}_native_return.pkl'
             joblib.dump(bundle,path)

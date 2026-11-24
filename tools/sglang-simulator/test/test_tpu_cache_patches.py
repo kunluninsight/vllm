@@ -315,3 +315,189 @@ def test_tpu_idle_wait_cap_slices_long_handoff_hold(monkeypatch):
     # Uncapped direct call still waits the remaining duration.
     adapter.wait_for_tpu_store_progress()
     assert sleeps == pytest.approx([0.005, 1.495])
+
+
+def test_v6d_load_base_plus_bandwidth_timing(monkeypatch):
+    monkeypatch.setenv("HISIM_TPU_V6D_LOAD_BASE_S", "0.128")
+    monkeypatch.setenv("HISIM_TPU_V6D_LOAD_BANDWIDTH_GB", "10.0")
+    monkeypatch.setenv("HISIM_TPU_V6D_LOAD_LANES", "1")
+    now = NS(value=10.0)
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: now.value)
+    monkeypatch.setattr(
+        adapter,
+        "_tpu_node_object_layout",
+        lambda vcfg, kcfg: (50_000_000, [8, 1, 6_250_000]),
+    )
+
+    class FakeWorker:
+        def __init__(self):
+            self._vllm_config = NS()
+            self._kv_cache_config = NS()
+            self._num_groups = 1
+            self._load_handler = None
+            self._store_handler = None
+            self._pending_jobs = {}
+            self._loading_req_jobs = {}
+            self._saving_req_jobs = {}
+            self._finished_req_ids = set()
+            self._finished_reqs_waiting_for_store = set()
+            self._worker_meta = NS(store_results=[], failed_loads=[])
+
+        def start_load_kv(self, metadata):
+            raise AssertionError("CPU fallback should not run when load timing is active")
+
+        def start_store_kv(self, metadata):
+            return None
+
+        def get_finished(self, finished_req_ids=None):
+            return set(), set()
+
+        def build_connector_worker_meta(self):
+            return self._worker_meta
+
+    adapter.C_TPUV6dObjectConnectorWorkerHook.hook(FakeWorker)
+    worker = FakeWorker()
+
+    # 10 objects * 50 MB / 10 GB/s = 0.05 s, plus 0.128 s base = 0.178 s.
+    # Also verify 0-object request finishes immediately without blocking.
+    meta = NS(
+        reqs_to_load={
+            "req-loaded": {0: (["k"] * 10, [1] * 10)},
+            "req-empty": {0: ([], [])},
+        },
+        store_job_ids={},
+        store_waits=set(),
+        num_groups=1,
+    )
+    worker.start_load_kv(meta)
+    assert worker.has_pending_push_work() is True
+
+    _, recvd0 = worker.get_finished()
+    assert recvd0 == {"req-empty"}
+    assert worker.has_pending_push_work() is True
+
+    now.value = 10.177
+    _, recvd1 = worker.get_finished()
+    assert recvd1 == set()
+    assert worker.has_pending_push_work() is True
+
+    now.value = 10.178
+    _, recvd2 = worker.get_finished()
+    assert recvd2 == {"req-loaded"}
+    assert worker.has_pending_push_work() is False
+
+
+def test_v6d_query_min_ms_paces_async_match_nonblocking(monkeypatch):
+    import asyncio
+
+    monkeypatch.setenv("HISIM_TPU_V6D_QUERY_MIN_MS", "20")
+    now = NS(value=50.0)
+    sleeps = []
+
+    async def fake_sleep(dt):
+        sleeps.append(dt)
+        now.value += dt
+
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: now.value)
+    monkeypatch.setattr(adapter.asyncio, "sleep", fake_sleep)
+
+    class FakeV6dSched:
+        def _compute_group_block_bytes(self, spec, group_id):
+            return (1024, [1, 1, 1024], None)
+
+        async def _async_match_impl(self, req_id):
+            now.value += 0.005  # simulated 5ms local query
+            return ("matched", req_id)
+
+    adapter.C_TPUV6dObjectLayoutHook.hook(FakeV6dSched)
+    sched = FakeV6dSched()
+    result = asyncio.run(sched._async_match_impl("r1"))
+    assert result == ("matched", "r1")
+    assert sleeps == pytest.approx([0.015])
+
+    # Disabled (0 ms) -> no sleep at all.
+    sleeps.clear()
+    monkeypatch.setenv("HISIM_TPU_V6D_QUERY_MIN_MS", "0")
+    result2 = asyncio.run(sched._async_match_impl("r2"))
+    assert result2 == ("matched", "r2")
+    assert sleeps == []
+
+
+def test_raiden_worker_auto_derives_bytes_per_token_from_group_specs(monkeypatch):
+    monkeypatch.setenv("HISIM_TPU_RAIDEN_HANDOFF_BASE_S", "0.70")
+    monkeypatch.setenv("HISIM_TPU_RAIDEN_HANDOFF_BANDWIDTH_GB", "10.0")
+    monkeypatch.setenv("HISIM_TPU_RAIDEN_HANDOFF_LANES", "1")
+    monkeypatch.delenv("HISIM_TPU_RAIDEN_BYTES_PER_TOKEN", raising=False)
+
+    now = NS(value=200.0)
+    monkeypatch.setattr(adapter.time, "monotonic", lambda: now.value)
+    # 4 groups * 37,748,736 B / 3072 tok = 49,152 B/token/node.
+    monkeypatch.setattr(
+        adapter,
+        "_tpu_node_object_layout",
+        lambda vcfg, kcfg: (37_748_736, [8, 1, 4_718_592]),
+    )
+
+    class FakeRaidenWorker:
+        def __init__(self):
+            self.is_producer = True
+            self._sim_raiden_vllm_config = NS(cache_config=NS(block_size=16))
+            self._sim_raiden_kv_cache_config = NS(
+                kv_cache_groups=[
+                    NS(kv_cache_spec=NS(block_size=3072)) for _ in range(4)
+                ]
+            )
+
+        def start_load_kv(self, metadata):
+            return None
+
+        def start_store_kv(self, metadata):
+            return None
+
+        def get_finished(self, finished_req_ids=None):
+            return set(), set()
+
+        def has_pending_push_work(self):
+            return False
+
+        def process_send_load(
+            self, metadata, wait_for_completion=False, report_completion=True
+        ):
+            return None
+
+    adapter.C_TPURaidenConnectorWorkerHook.hook(FakeRaidenWorker)
+    worker = FakeRaidenWorker()
+    # 100,000 tokens * 49,152 B/tok = 4.9152 GB / 10 GB/s = 0.49152 s + 0.70 s = 1.19152 s.
+    meta = NS(reqs_to_send={"req-100k": NS(num_tokens=100_000)})
+    worker.process_send_load(meta)
+    assert worker._sim_raiden_auto_bpt == pytest.approx(49_152.0)
+
+    now.value = 201.191
+    sent0, _ = worker.get_finished()
+    assert sent0 == set()
+
+    now.value = 201.192
+    sent1, _ = worker.get_finished()
+    assert sent1 == {"req-100k"}
+
+
+def test_tair_and_p2p_base_plus_bandwidth_sleep(monkeypatch):
+    from sglang_simulator.simulation.vllm.v6d import tair_kvcm, v6d_capacity
+
+    tair_sleeps = []
+    monkeypatch.setattr(tair_kvcm.time, "sleep", lambda dt: tair_sleeps.append(dt))
+    monkeypatch.setenv("HISIM_TAIR_KVCM_READ_BASE_S", "0.05")
+    monkeypatch.setenv("HISIM_TAIR_KVCM_READ_BANDWIDTH_GB", "2.0")
+    tair_kvcm._sleep_for_bytes(
+        [100_000_000],
+        "HISIM_TAIR_KVCM_READ_BANDWIDTH_GB",
+        "HISIM_TAIR_KVCM_READ_BASE_S",
+    )
+    assert tair_sleeps == pytest.approx([0.10])
+
+    p2p_sleeps = []
+    monkeypatch.setattr(v6d_capacity.time, "sleep", lambda dt: p2p_sleeps.append(dt))
+    monkeypatch.setenv("HISIM_V6D_P2P_BASE_S", "0.02")
+    monkeypatch.setenv("HISIM_V6D_P2P_BANDWIDTH_GB", "5.0")
+    v6d_capacity._sim_load_data_noop([NS(size=250_000_000)])
+    assert p2p_sleeps == pytest.approx([0.07])

@@ -12,7 +12,9 @@ from collections import deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass
+import asyncio
 from functools import wraps
+import inspect
 import math
 import os
 import time
@@ -84,6 +86,16 @@ def _nonneg_env_float(name: str, default: float = 0.0) -> float:
 def _tpu_load_bytes_per_second() -> float:
     gb_s = _nonneg_env_float("HISIM_TPU_V6D_LOAD_BANDWIDTH_GB", 0.0)
     return gb_s * 1e9 if gb_s > 0 else 0.0
+
+
+def _tpu_load_timing() -> tuple[float, float]:
+    base_s = _nonneg_env_float("HISIM_TPU_V6D_LOAD_BASE_S", 0.0)
+    return base_s, _tpu_load_bytes_per_second()
+
+
+def _tpu_v6d_query_min_s() -> float:
+    ms = _nonneg_env_float("HISIM_TPU_V6D_QUERY_MIN_MS", 0.0)
+    return (ms / 1000.0) if ms > 0 else 0.0
 
 
 def _tpu_raiden_handoff_timing() -> tuple[float, float]:
@@ -319,6 +331,32 @@ class C_TPUV6dObjectLayoutHook(BaseHook):
 
         target._compute_group_block_bytes = compute
 
+        match_attr = (
+            "_async_match_impl"
+            if getattr(target, "_async_match_impl", None) is not None
+            else "_async_match"
+        )
+        orig_match = getattr(target, match_attr, None)
+        if (
+            orig_match is not None
+            and inspect.iscoroutinefunction(orig_match)
+            and not getattr(orig_match, "_sim_v6d_query_delay_hook", False)
+        ):
+            @wraps(orig_match)
+            async def paced_async_match(self, *args, **kwargs):
+                min_s = _tpu_v6d_query_min_s()
+                if min_s <= 0:
+                    return await orig_match(self, *args, **kwargs)
+                started = time.monotonic()
+                result = await orig_match(self, *args, **kwargs)
+                remaining = min_s - (time.monotonic() - started)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                return result
+
+            paced_async_match._sim_v6d_query_delay_hook = True
+            setattr(target, match_attr, paced_async_match)
+
 
 class C_MultiKVConnectorPromMetricsHook(BaseHook):
     """Preserve native metric values when CPU execution skips IPC serialization."""
@@ -435,6 +473,10 @@ class C_TPURaidenConnectorHook(BaseHook):
             self._sim_raiden_num_groups = len(groups)
             self._sim_raiden_pending_sends = {}
             self._sim_raiden_inflight = {}
+            worker = getattr(self, "connector_worker", None)
+            if worker is not None:
+                worker._sim_raiden_vllm_config = vllm_config
+                worker._sim_raiden_kv_cache_config = kv_cache_config
             if local:
                 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
                     MambaSpec,
@@ -793,23 +835,32 @@ class C_TPUV6dObjectConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
 
         def start_load(self, metadata):
             validate(self, metadata)
-            read_bps = _tpu_load_bytes_per_second()
-            if read_bps > 0:
+            base_s, read_bps = _tpu_load_timing()
+            if base_s > 0 or read_bps > 0:
                 cls._ensure_state(self)
-                if not hasattr(self, "_sim_tpu_node_layout"):
+                if read_bps > 0 and not hasattr(self, "_sim_tpu_node_layout"):
                     self._sim_tpu_node_layout = _tpu_node_object_layout(
-                        self._vllm_config, self._kv_cache_config
+                        getattr(self, "_vllm_config", None),
+                        getattr(self, "_kv_cache_config", None),
                     )
-                layout = self._sim_tpu_node_layout
-                if layout is not None:
-                    now = time.monotonic()
-                    lqueue = load_queue_for(self)
-                    for req_id, groups in (getattr(metadata, "reqs_to_load", {}) or {}).items():
-                        n_objs = sum(len(keys) for keys, _ids in groups.values())
-                        if n_objs > 0:
-                            lqueue.enqueue(req_id, n_objs * layout[0] / read_bps, now)
-                else:
-                    cpu_load(self, metadata)
+                layout = getattr(self, "_sim_tpu_node_layout", None)
+                now = time.monotonic()
+                lqueue = load_queue_for(self)
+                for req_id, groups in (getattr(metadata, "reqs_to_load", {}) or {}).items():
+                    n_objs = sum(len(keys) for keys, _ids in groups.values())
+                    if n_objs > 0:
+                        xfer_s = (
+                            (n_objs * layout[0] / read_bps)
+                            if (read_bps > 0 and layout is not None)
+                            else 0.0
+                        )
+                        duration = base_s + xfer_s
+                        if duration > 0:
+                            lqueue.enqueue(req_id, duration, now)
+                        else:
+                            self._sim_tpu_load_done.add(req_id)
+                    else:
+                        self._sim_tpu_load_done.add(req_id)
             else:
                 cpu_load(self, metadata)
             # 这是原生 scheduler 明确承诺 delay_free 的增量集合，可能只有
@@ -982,6 +1033,37 @@ class C_TPURaidenConnectorWorkerHook(_TPUConnectorWorkerCPUHook):
                     bytes_per_token = _nonneg_env_float(
                         "HISIM_TPU_RAIDEN_BYTES_PER_TOKEN", 0.0
                     )
+                    if bytes_per_token <= 0 and bw_bps > 0:
+                        if not hasattr(self, "_sim_raiden_auto_bpt"):
+                            auto_bpt = 0.0
+                            vcfg = (
+                                getattr(self, "_sim_raiden_vllm_config", None)
+                                or getattr(self, "vllm_config", None)
+                                or getattr(self, "_vllm_config", None)
+                            )
+                            kcfg = (
+                                getattr(self, "_sim_raiden_kv_cache_config", None)
+                                or getattr(self, "kv_cache_config", None)
+                                or getattr(self, "_kv_cache_config", None)
+                            )
+                            layout = _tpu_node_object_layout(vcfg, kcfg)
+                            if layout is not None and kcfg is not None:
+                                fallback_blk = getattr(
+                                    getattr(vcfg, "cache_config", None), "block_size", 0
+                                ) or 0
+                                for group in (getattr(kcfg, "kv_cache_groups", ()) or ()):
+                                    blk_toks = (
+                                        getattr(
+                                            getattr(group, "kv_cache_spec", None),
+                                            "block_size",
+                                            0,
+                                        )
+                                        or fallback_blk
+                                    )
+                                    if blk_toks > 0:
+                                        auto_bpt += layout[0] / float(blk_toks)
+                            self._sim_raiden_auto_bpt = auto_bpt
+                        bytes_per_token = self._sim_raiden_auto_bpt
                     for req_id, req_meta in (getattr(metadata, "reqs_to_send", {}) or {}).items():
                         tokens = max(0, int(getattr(req_meta, "num_tokens", 0) or 0))
                         xfer_s = (

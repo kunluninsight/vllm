@@ -85,5 +85,22 @@ class AggregationTests(unittest.TestCase):
                                        rtol=0,atol=1e-12)
 
 
+    def test_batch_size_reweighting_records_metadata_and_fits(self):
+        rows = []
+        for i in range(60):
+            bs = 1.0 if i < 45 else 3.0
+            row = dict(dataset='fixture', case='c8', stage=3, split='train',
+                       target_ms=40 + 15 * bs + i / 10,
+                       **{k: float(i + 1) for k in r.ALL_FEATURES})
+            row['batch_size'] = bs
+            rows.append(row)
+        weighted = r.fit_stage(rows, 3, n_estimators=10, batch_size_weight_power=1.0)
+        unweighted = r.fit_stage(rows, 3, n_estimators=10, batch_size_weight_power=0.0)
+        self.assertEqual(weighted['batch_size_weight_power'], 1.0)
+        self.assertEqual(weighted['training_parameters']['alpha'], 0.95)
+        self.assertEqual(weighted['training_parameters']['min_samples_leaf'], 6)
+        self.assertEqual(unweighted['batch_size_weight_power'], 0.0)
+
+
 if __name__ == '__main__':
     unittest.main()

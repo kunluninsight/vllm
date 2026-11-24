@@ -33,13 +33,31 @@ def _tair_bandwidth_bps(env_name: str) -> float:
     return gb_s * 1e9
 
 
-def _sleep_for_bytes(sizes, env_name: str) -> None:
+def _tair_base_s(env_name: str | None) -> float:
+    if not env_name:
+        return 0.0
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        val = float(raw)
+    except ValueError:
+        raise ValueError(f"{env_name} must be a non-negative finite number") from None
+    if not math.isfinite(val) or val < 0:
+        raise ValueError(f"{env_name} must be a non-negative finite number")
+    return val
+
+
+def _sleep_for_bytes(sizes, env_name: str, base_env: str | None = None) -> None:
     bps = _tair_bandwidth_bps(env_name)
-    if bps <= 0:
+    base_s = _tair_base_s(base_env)
+    if bps <= 0 and base_s <= 0:
         return
     total_bytes = sum(int(s) for s in sizes if s and s > 0)
     if total_bytes > 0:
-        time.sleep(total_bytes / bps)
+        delay = base_s + (total_bytes / bps if bps > 0 else 0.0)
+        if delay > 0:
+            time.sleep(delay)
 
 
 class _NoopTransferClient:
@@ -68,7 +86,7 @@ class C_TairKVCMTransferRuntimeHook(BaseHook):
                 raise ValueError("uris, pointers, and sizes length mismatch")
             from v6d.common.tair_kvcm.transfer import _record_transfer_result
 
-            _sleep_for_bytes(sizes, "HISIM_TAIR_KVCM_READ_BANDWIDTH_GB")
+            _sleep_for_bytes(sizes, "HISIM_TAIR_KVCM_READ_BANDWIDTH_GB", "HISIM_TAIR_KVCM_READ_BASE_S")
             _record_transfer_result("read", True)
             return True
 
@@ -79,7 +97,7 @@ class C_TairKVCMTransferRuntimeHook(BaseHook):
                 raise ValueError("uris, pointers, and sizes length mismatch")
             from v6d.common.tair_kvcm.transfer import _record_transfer_result
 
-            _sleep_for_bytes(sizes, "HISIM_TAIR_KVCM_WRITE_BANDWIDTH_GB")
+            _sleep_for_bytes(sizes, "HISIM_TAIR_KVCM_WRITE_BANDWIDTH_GB", "HISIM_TAIR_KVCM_WRITE_BASE_S")
             _record_transfer_result("write", True)
             return [True] * len(uris)
 

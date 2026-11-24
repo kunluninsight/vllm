@@ -140,13 +140,29 @@ def _infer_transfer_bytes(args, kwargs) -> int:
     return total
 
 
+def _p2p_base_s() -> float:
+    raw = os.environ.get("HISIM_V6D_P2P_BASE_S", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        val = float(raw)
+    except ValueError:
+        raise ValueError("HISIM_V6D_P2P_BASE_S must be non-negative and finite") from None
+    if not math.isfinite(val) or val < 0:
+        raise ValueError("HISIM_V6D_P2P_BASE_S must be non-negative and finite")
+    return val
+
+
 def _sim_load_data_noop(*args, **kwargs):
     """Skip the remote blob copy (eager strategies only; lazy never calls)."""
     bps = _p2p_bandwidth_bps()
-    if bps > 0:
+    base_s = _p2p_base_s()
+    if bps > 0 or base_s > 0:
         nbytes = _infer_transfer_bytes(args, kwargs)
         if nbytes > 0:
-            time.sleep(nbytes / bps)
+            delay = base_s + (nbytes / bps if bps > 0 else 0.0)
+            if delay > 0:
+                time.sleep(delay)
     logger.debug("[v6d-sim] skip remote blob data transfer (no data plane)")
     return None
 
