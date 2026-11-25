@@ -50,8 +50,33 @@ def init_hook():
     if module_hooks:
         hisim_hook.install_module_hooks(module_hooks)
 
-    # Patch loaded modules now; the finder handles future imports.
+    # Patch already-loaded classes and modules; the finder handles future imports.
     logger = logging.getLogger("hisim")
+    for hook in class_hooks:
+        mod_pattern = getattr(hook, "HOOK_MODULE_NAME", None)
+        cls_name = getattr(hook, "HOOK_CLASS_NAME", None)
+        if not mod_pattern or not cls_name:
+            continue
+        for name, module in tuple(sys.modules.items()):
+            if module is None:
+                continue
+            matches = (
+                bool(re.search(mod_pattern, name))
+                if getattr(hook, "REGEX", False)
+                else name == mod_pattern
+            )
+            if matches:
+                target_cls = getattr(module, cls_name, None)
+                if target_cls is not None:
+                    try:
+                        hook.hook(target_cls)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to hook loaded class [%s.%s]. Error: %s",
+                            name,
+                            cls_name,
+                            exc,
+                        )
     for hook in module_hooks:
         for name, module in tuple(sys.modules.items()):
             if module is None:

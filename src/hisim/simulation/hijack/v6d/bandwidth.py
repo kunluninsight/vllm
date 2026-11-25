@@ -7,12 +7,40 @@ layout and calibration data; local transfer modeling is disabled without it.
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 
 from hisim.env import Envs
 
 logger = logging.getLogger(__name__)
+
+
+class DecoupledTransferQueue:
+    """Multi-lane transfer queue that keeps per-request handshake parallel.
+
+    Fixed handshake/scheduling latency (``base_s``) runs concurrently per
+    request; only the payload transfer (``xfer_s``) contends for the shared
+    ``lanes`` link slots.
+    """
+
+    def __init__(self, lanes: int):
+        self.lanes = max(1, int(lanes))
+        self._lane_free: list[float] = [0.0] * self.lanes
+
+    def schedule(self, now: float, base_s: float, xfer_s: float) -> float:
+        ready_for_xfer = now + max(0.0, base_s)
+        xfer = max(0.0, xfer_s)
+        if xfer <= 0.0:
+            return ready_for_xfer
+        earliest = heapq.heappop(self._lane_free)
+        start = max(ready_for_xfer, earliest)
+        end = start + xfer
+        heapq.heappush(self._lane_free, end)
+        return end
+
+    def reset(self) -> None:
+        self._lane_free = [0.0] * self.lanes
 
 
 class SegmentModel:
@@ -135,6 +163,48 @@ class BandwidthModel:
             self._seg1_floor_ms, self._seg1_per_blk_ms
         )
         return self._cp_latency(nblocks, floor_ms, per_ms)
+
+    def load_components(
+        self, num_blocks: int, nbytes_override: int = 0
+    ) -> tuple[float, float]:
+        """Split external load into parallel ``base_s`` and shared-link ``xfer_s``."""
+        if num_blocks <= 0 and nbytes_override <= 0:
+            return 0.0, 0.0
+        nbytes = (
+            nbytes_override if nbytes_override > 0 else self.seg2_bytes(num_blocks)
+        )
+        env_base = Envs.v6d_load_base_s()
+        env_bps = Envs.v6d_load_bandwidth_bps()
+        if self.enabled and self.local_load is not None:
+            seg = self.local_load
+            floor_ms, per_ms = Envs.seg1_latency_parameters(
+                self._seg1_floor_ms, self._seg1_per_blk_ms
+            )
+            seg1_base = max(0.0, floor_ms) / 1000.0
+            seg1_xfer = max(0.0, per_ms) * max(0, num_blocks) / 1000.0
+            local_base = max(seg.floor_s, seg.t0_s)
+            local_total = seg.latency(nbytes)
+            local_xfer = max(0.0, local_total - local_base)
+            base_s = (env_base if env_base > 0.0 else local_base) + seg1_base
+            xfer_s = (
+                nbytes / env_bps if env_bps > 0.0 and nbytes > 0 else local_xfer
+            ) + seg1_xfer
+            return base_s, xfer_s
+        if env_base > 0.0 or env_bps > 0.0:
+            xfer_s = nbytes / env_bps if env_bps > 0.0 and nbytes > 0 else 0.0
+            return env_base, xfer_s
+        return 0.0, 0.0
+
+    def store_components(self, num_blocks: int) -> tuple[float, float]:
+        """Split D2H store into parallel control overhead and shared-link DMA."""
+        if not self.enabled or num_blocks <= 0:
+            return 0.0, 0.0
+        dma_s = self.latency_for(num_blocks, False)
+        poll_s = Envs.store_poll_ms(self._poll_granularity_ms) / 1000.0
+        rank_s = Envs.store_rank_sync_ms(self._rank_sync_ms) / 1000.0
+        base_s = rank_s + (poll_s if dma_s < poll_s else 0.0)
+        xfer_s = dma_s if dma_s >= poll_s else 0.0
+        return base_s, xfer_s
 
     # Load the profile once per process; reset permits reconfiguration.
 

@@ -233,18 +233,28 @@ def target_layout_config(vllm_config):
     """A shallow config view for layout-only native calls, never for RPC execution."""
     inputs = getattr(vllm_config, "_hisim_layout_inputs", {})
     tp = int(inputs.get("tp_size", 1))
+    pp = int(inputs.get("pp_size", 1))
     if tp < 1:
         raise ValueError("Target TP must be positive")
+    if pp < 1:
+        raise ValueError("Target PP must be positive")
     layout = copy.copy(vllm_config)
     # Native MTP copies the layout and expects only declared VllmConfig fields.
     if hasattr(layout, "_hisim_layout_inputs"):
         del layout._hisim_layout_inputs
     layout.parallel_config = copy.copy(vllm_config.parallel_config)
     layout.parallel_config.tensor_parallel_size = tp
+    layout.parallel_config.pipeline_parallel_size = pp
+    if hasattr(layout.parallel_config, "prefill_context_parallel_size"):
+        layout.parallel_config.prefill_context_parallel_size = max(
+            1, int(inputs.get("pcp_size", 1))
+        )
+    if hasattr(layout.parallel_config, "decode_context_parallel_size"):
+        layout.parallel_config.decode_context_parallel_size = max(
+            1, int(inputs.get("dcp_size", 1))
+        )
     # local_world_size is derived from this stored field in PAI-vLLM.
-    layout.parallel_config.world_size = (
-        tp * layout.parallel_config.pipeline_parallel_size
-    )
+    layout.parallel_config.world_size = tp * pp
     layout.cache_config = copy.deepcopy(vllm_config.cache_config)
     layout.quant_config = copy.deepcopy(vllm_config.quant_config)
     return layout

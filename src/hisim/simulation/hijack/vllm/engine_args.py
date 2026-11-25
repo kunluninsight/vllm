@@ -74,6 +74,8 @@ class C_VLLMEngineArgsHook(BaseHook):
                 self._hisim_layout_inputs = {
                     "tp_size": self.tensor_parallel_size,
                     "pp_size": self.pipeline_parallel_size,
+                    "pcp_size": getattr(self, "prefill_context_parallel_size", 1),
+                    "dcp_size": getattr(self, "decode_context_parallel_size", 1),
                     "enable_expert_parallel": getattr(
                         self, "enable_expert_parallel", False
                     ),

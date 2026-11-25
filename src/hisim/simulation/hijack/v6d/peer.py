@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import time
 
 from hisim.env import Envs
 from hisim.hook import BaseHook
@@ -49,8 +50,37 @@ def _fmt_keys(object_keys) -> str:
 # Transfer stubs leave native metadata, capacity, and eviction paths intact.
 
 
+def _infer_transfer_bytes(args, kwargs) -> int:
+    for key in ("sizes", "nbytes", "size", "length"):
+        val = kwargs.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+        if isinstance(val, (list, tuple)):
+            return sum(int(x) for x in val if isinstance(x, (int, float)) and x > 0)
+    total = 0
+    for arg in args:
+        if isinstance(arg, (list, tuple)):
+            for item in arg:
+                sz = getattr(item, "size", None) or getattr(item, "nbytes", None)
+                if isinstance(sz, (int, float)) and sz > 0:
+                    total += int(sz)
+        else:
+            sz = getattr(arg, "size", None) or getattr(arg, "nbytes", None)
+            if isinstance(sz, (int, float)) and sz > 0:
+                total += int(sz)
+    return total
+
+
 def _sim_load_data_noop(*args, **kwargs):
-    """Skip synchronous remote payload copying."""
+    """Skip synchronous remote payload copying, with optional P2P latency."""
+    bps = Envs.v6d_p2p_bandwidth_bps()
+    base_s = Envs.v6d_p2p_base_s()
+    if bps > 0.0 or base_s > 0.0:
+        nbytes = _infer_transfer_bytes(args, kwargs)
+        if nbytes > 0:
+            delay = base_s + (nbytes / bps if bps > 0.0 else 0.0)
+            if delay > 0.0:
+                time.sleep(delay)
     logger.debug("[v6d-sim] skip remote blob data transfer (no data plane)")
     return None
 

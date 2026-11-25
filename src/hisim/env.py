@@ -25,6 +25,26 @@ class Envs:
     SEG1_PER_BLK_MS = "HISIM_SEG1_PER_BLK_MS"
     DP_MAX_REQUESTS = "HISIM_DP_MAX_REQUESTS"
 
+    # Tair KVCM / MemPool / V6D P2P / KVT transfer modeling controls.
+    TAIR_KVCM_READ_BANDWIDTH_GB = "HISIM_TAIR_KVCM_READ_BANDWIDTH_GB"
+    TAIR_KVCM_READ_BASE_S = "HISIM_TAIR_KVCM_READ_BASE_S"
+    TAIR_KVCM_SSD_READ_BANDWIDTH_GB = "HISIM_TAIR_KVCM_SSD_READ_BANDWIDTH_GB"
+    TAIR_KVCM_SSD_READ_BASE_S = "HISIM_TAIR_KVCM_SSD_READ_BASE_S"
+    TAIR_KVCM_WRITE_BANDWIDTH_GB = "HISIM_TAIR_KVCM_WRITE_BANDWIDTH_GB"
+    TAIR_KVCM_WRITE_BASE_S = "HISIM_TAIR_KVCM_WRITE_BASE_S"
+    TAIR_MEMPOOL_META_URL = "HISIM_TAIR_MEMPOOL_META_URL"
+    V6D_P2P_BANDWIDTH_GB = "HISIM_V6D_P2P_BANDWIDTH_GB"
+    V6D_P2P_BASE_S = "HISIM_V6D_P2P_BASE_S"
+    V6D_LOAD_LANES = "HISIM_V6D_LOAD_LANES"
+    V6D_STORE_LANES = "HISIM_V6D_STORE_LANES"
+    V6D_LOAD_BASE_S = "HISIM_V6D_LOAD_BASE_S"
+    V6D_LOAD_BANDWIDTH_GB = "HISIM_V6D_LOAD_BANDWIDTH_GB"
+    V6D_QUERY_MIN_MS = "HISIM_V6D_QUERY_MIN_MS"
+    KVT_HANDOFF_BASE_S = "HISIM_KVT_HANDOFF_BASE_S"
+    KVT_HANDOFF_BANDWIDTH_GB = "HISIM_KVT_HANDOFF_BANDWIDTH_GB"
+    KVT_HANDOFF_LANES = "HISIM_KVT_HANDOFF_LANES"
+    KVT_HANDOFF_BYTES_PER_TOKEN = "HISIM_KVT_HANDOFF_BYTES_PER_TOKEN"
+
     # Existing integration-owned names retain their upstream spelling.
     V6D_HITSOURCE_LOG = "V6D_HITSOURCE_LOG"
     V6D_KEYSOURCE_LOG = "V6D_KEYSOURCE_LOG"
@@ -170,3 +190,106 @@ class Envs:
         from vllm import envs
 
         return envs.VLLM_V6D_ASYNC_REGISTER
+
+    @staticmethod
+    def _non_negative_float(name: str, default: float = 0.0) -> float:
+        import math
+
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            val = float(raw)
+        except ValueError:
+            raise ValueError(
+                f"{name} must be a non-negative finite number"
+            ) from None
+        if not math.isfinite(val) or val < 0:
+            raise ValueError(f"{name} must be a non-negative finite number")
+        return val
+
+    @staticmethod
+    def _non_negative_int(name: str, default: int = 0) -> int:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            val = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be a non-negative integer") from None
+        if val < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        return val
+
+    @classmethod
+    def tair_kvcm_read_bandwidth_bps(cls) -> float:
+        return cls._non_negative_float(cls.TAIR_KVCM_READ_BANDWIDTH_GB) * 1e9
+
+    @classmethod
+    def tair_kvcm_read_base_s(cls) -> float:
+        return cls._non_negative_float(cls.TAIR_KVCM_READ_BASE_S)
+
+    @classmethod
+    def tair_kvcm_ssd_read_bandwidth_bps(cls) -> float:
+        return cls._non_negative_float(cls.TAIR_KVCM_SSD_READ_BANDWIDTH_GB) * 1e9
+
+    @classmethod
+    def tair_kvcm_ssd_read_base_s(cls) -> float:
+        return cls._non_negative_float(cls.TAIR_KVCM_SSD_READ_BASE_S)
+
+    @classmethod
+    def tair_kvcm_write_bandwidth_bps(cls) -> float:
+        return cls._non_negative_float(cls.TAIR_KVCM_WRITE_BANDWIDTH_GB) * 1e9
+
+    @classmethod
+    def tair_kvcm_write_base_s(cls) -> float:
+        return cls._non_negative_float(cls.TAIR_KVCM_WRITE_BASE_S)
+
+    @classmethod
+    def tair_mempool_meta_url(cls) -> str:
+        return os.getenv(cls.TAIR_MEMPOOL_META_URL, "").strip().rstrip("/")
+
+    @classmethod
+    def v6d_p2p_bandwidth_bps(cls) -> float:
+        return cls._non_negative_float(cls.V6D_P2P_BANDWIDTH_GB) * 1e9
+
+    @classmethod
+    def v6d_p2p_base_s(cls) -> float:
+        return cls._non_negative_float(cls.V6D_P2P_BASE_S)
+
+    @classmethod
+    def v6d_load_lanes(cls) -> int:
+        return cls._non_negative_int(cls.V6D_LOAD_LANES, 0)
+
+    @classmethod
+    def v6d_store_lanes(cls) -> int:
+        return cls._non_negative_int(cls.V6D_STORE_LANES, 0)
+
+    @classmethod
+    def v6d_load_base_s(cls) -> float:
+        return cls._non_negative_float(cls.V6D_LOAD_BASE_S)
+
+    @classmethod
+    def v6d_load_bandwidth_bps(cls) -> float:
+        return cls._non_negative_float(cls.V6D_LOAD_BANDWIDTH_GB) * 1e9
+
+    @classmethod
+    def v6d_query_min_s(cls) -> float:
+        return cls._non_negative_float(cls.V6D_QUERY_MIN_MS) / 1000.0
+
+    @classmethod
+    def kvt_handoff_base_s(cls) -> float:
+        return cls._non_negative_float(cls.KVT_HANDOFF_BASE_S)
+
+    @classmethod
+    def kvt_handoff_bandwidth_bps(cls) -> float:
+        return cls._non_negative_float(cls.KVT_HANDOFF_BANDWIDTH_GB) * 1e9
+
+    @classmethod
+    def kvt_handoff_lanes(cls) -> int:
+        lanes = cls._non_negative_int(cls.KVT_HANDOFF_LANES, 8)
+        return max(1, lanes)
+
+    @classmethod
+    def kvt_handoff_bytes_per_token(cls) -> int:
+        return cls._non_negative_int(cls.KVT_HANDOFF_BYTES_PER_TOKEN, 0)

@@ -17,7 +17,7 @@ from hisim.env import Envs
 from hisim.simulation.manager import ConfigManager, StateManager
 from hisim.hook import BaseHook
 from hisim.simulation.hijack.vllm.cpu_stubs import DummyEvent
-from hisim.simulation.hijack.v6d.bandwidth import BandwidthModel
+from hisim.simulation.hijack.v6d.bandwidth import BandwidthModel, DecoupledTransferQueue
 from hisim.simulation.hijack.vllm.v6d.manager import pop_captured_load_plan
 from hisim.utils import get_logger
 
@@ -69,10 +69,18 @@ class SimulatedKVController:
         self._stores = []
         self._loads = {}
         self._ple = {}
+        self._kvt_handoffs = []
         self._ple_model = _ple_admission_model(getattr(hybrid, "_cfg", None))
         self._store_tails = {}
         self._aborted_stores = {}
         self._preparing = []
+        load_lanes = Envs.v6d_load_lanes()
+        store_lanes = Envs.v6d_store_lanes()
+        self._load_queue = DecoupledTransferQueue(load_lanes) if load_lanes > 0 else None
+        self._store_queue = (
+            DecoupledTransferQueue(store_lanes) if store_lanes > 0 else None
+        )
+        self._kvt_handoff_queue = DecoupledTransferQueue(Envs.kvt_handoff_lanes())
         self._lock = threading.RLock()
         # Serialize native abort cleanup with transfer ownership of block pins.
         original_release = self.cache._release_protected_blocks
@@ -218,12 +226,50 @@ class SimulatedKVController:
                 pending.append(future)
         self._preparing = pending
 
-    def queue_load(self, request, num_tokens, groups):
+    def queue_load(self, request, num_tokens, groups, lookup_elapsed_s: float = 0.0):
         nblocks = sum(len(keys) for keys, _ids in groups.values())
         bw = BandwidthModel.get()
-        deadline = self.now() + bw.latency_for(nblocks, True) + bw.seg1_latency(nblocks)
+        now = self.now()
+        base_s, xfer_s = bw.load_components(nblocks)
+        query_min_s = Envs.v6d_query_min_s()
+        query_pad_s = max(0.0, query_min_s - max(0.0, lookup_elapsed_s))
+        total_base_s = base_s + query_pad_s
         with self._lock:
+            if self._load_queue is not None:
+                deadline = self._load_queue.schedule(now, total_base_s, xfer_s)
+            else:
+                deadline = now + total_base_s + xfer_s
             self._loads.setdefault(request.request_id, (deadline, num_tokens))
+
+    def _kvt_bytes_per_token(self) -> int:
+        explicit = Envs.kvt_handoff_bytes_per_token()
+        if explicit > 0:
+            return explicit
+        bw = BandwidthModel.get()
+        cfg = getattr(self.hybrid, "_cfg", None)
+        block_size = getattr(getattr(cfg, "cache_config", None), "block_size", 0) or 0
+        if bw.enabled and block_size > 0:
+            return bw.seg2_bytes(1) // block_size
+        return 0
+
+    def _schedule_kvt_handoff(self, now: float, req, blocks: list) -> bool:
+        """Hold KVT P->D handoff using parallel base_s + shared-lane xfer_s."""
+        base_s = Envs.kvt_handoff_base_s()
+        bps = Envs.kvt_handoff_bandwidth_bps()
+        if base_s <= 0.0 and bps <= 0.0:
+            return False
+        num_tokens = getattr(req, "num_prompt_tokens", 0) or 0
+        bytes_per_tok = self._kvt_bytes_per_token()
+        xfer_s = (
+            (num_tokens * bytes_per_tok) / bps
+            if (bps > 0.0 and num_tokens > 0 and bytes_per_tok > 0)
+            else 0.0
+        )
+        deadline = self._kvt_handoff_queue.schedule(now, base_s, xfer_s)
+        if deadline <= now:
+            return False
+        self._kvt_handoffs.append((deadline, req, blocks))
+        return True
 
     def queue_ple(self, request, run) -> bool:
         """Defer ``run`` (native mark_loaded) by the remote PLE admission time.
@@ -288,21 +334,48 @@ class SimulatedKVController:
         staged, self._staged = self._staged, []
         for store in staged:
             rid = store.request.request_id
-            store.ready_at = max(now, self._store_tails.get(rid, now))
-            store.ready_at += bw.store_completion_latency(store.num_blocks)
+            start_at = max(now, self._store_tails.get(rid, now))
+            if self._store_queue is not None:
+                base_s, xfer_s = bw.store_components(store.num_blocks)
+                store.ready_at = self._store_queue.schedule(start_at, base_s, xfer_s)
+            else:
+                store.ready_at = start_at + bw.store_completion_latency(
+                    store.num_blocks
+                )
             self._store_tails[rid] = store.ready_at
             self._stores.append(store)
         due = [store for store in self._stores if store.ready_at <= now]
         self._stores = [store for store in self._stores if store.ready_at > now]
         for store in due:
-            if store.blocks:
-                with self._lock:
-                    self.cache._block_pool.free_blocks(store.blocks)
             rid = store.request.request_id
             if self._store_tails.get(rid) == store.ready_at:
                 self._store_tails.pop(rid, None)
             if store.last and rid not in self._aborted_stores:
+                if self._schedule_kvt_handoff(now, store.request, store.blocks):
+                    continue
+                if store.blocks:
+                    with self._lock:
+                        self.cache._block_pool.free_blocks(store.blocks)
                 self._store_done(store.request)
+            elif store.blocks:
+                with self._lock:
+                    self.cache._block_pool.free_blocks(store.blocks)
+        kvt_due = [
+            item
+            for item in self._kvt_handoffs
+            if item[0] <= now or item[1].request_id in self._aborted_stores
+        ]
+        self._kvt_handoffs = [
+            item
+            for item in self._kvt_handoffs
+            if item[0] > now and item[1].request_id not in self._aborted_stores
+        ]
+        for _deadline, req, blocks in kvt_due:
+            if blocks:
+                with self._lock:
+                    self.cache._block_pool.free_blocks(blocks)
+            if req.request_id not in self._aborted_stores:
+                self._store_done(req)
         aborted = [rid for rid in self._aborted_stores if rid not in self._store_tails]
         for rid in aborted:
             self._store_done(self._aborted_stores.pop(rid), failed=True)
@@ -327,7 +400,7 @@ class SimulatedKVController:
                 del self._ple[rid]
         for _rid, run in ples:
             self._run_control(run())
-        return len(due) + len(loads) + len(aborted) + len(ples)
+        return len(due) + len(kvt_due) + len(loads) + len(aborted) + len(ples)
 
     def next_wakeup(self):
         if self._staged or any(
@@ -338,6 +411,7 @@ class SimulatedKVController:
             deadlines = [deadline for deadline, _n in self._loads.values()]
             deadlines.extend(deadline for deadline, _run in self._ple.values())
         deadlines.extend(store.ready_at for store in self._stores)
+        deadlines.extend(deadline for deadline, _req, _blocks in self._kvt_handoffs)
         return min(deadlines, default=None)
 
     def has_pending(self):
@@ -366,10 +440,19 @@ class SimulatedKVController:
             for store in self._staged + self._stores:
                 if store.blocks:
                     self.cache._block_pool.free_blocks(store.blocks)
+            for _deadline, _req, blocks in self._kvt_handoffs:
+                if blocks:
+                    self.cache._block_pool.free_blocks(blocks)
             self._staged.clear()
             self._stores.clear()
+            self._kvt_handoffs.clear()
             self._store_tails.clear()
             self._aborted_stores.clear()
+            if self._load_queue is not None:
+                self._load_queue.reset()
+            if self._store_queue is not None:
+                self._store_queue.reset()
+            self._kvt_handoff_queue.reset()
         if dropped_loads:
             logger.warning(
                 "[V6D Hijack] controller reset dropped %d pending load(s)",
@@ -648,7 +731,9 @@ class C_V6dObjectBackendHook(BaseHook):
             rid = request.request_id
             # Drop a snapshot left by an earlier (e.g. preempted) round.
             pop_captured_load_plan(scheduler, rid)
+            t0 = time.perf_counter()
             result = await original_prepare(self, request, blocks, num_external_tokens)
+            lookup_elapsed_s = time.perf_counter() - t0
             captured = pop_captured_load_plan(scheduler, rid)
             if result is not None or num_external_tokens <= 0:
                 return result
@@ -672,7 +757,12 @@ class C_V6dObjectBackendHook(BaseHook):
                 gid: (list(keys), list(block_ids))
                 for gid, (keys, block_ids) in groups.items()
             }
-            self._sim_controller.queue_load(request, num_external_tokens, groups)
+            self._sim_controller.queue_load(
+                request,
+                num_external_tokens,
+                groups,
+                lookup_elapsed_s=lookup_elapsed_s,
+            )
             return result
 
         if original_prepare is not None:

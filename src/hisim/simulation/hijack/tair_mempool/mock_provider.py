@@ -298,7 +298,12 @@ class Provider(object):
                 self.dram_resident[ga][1] = time.monotonic()
             self.stats["sim_" + operation + "_objects"] += 1
             self.stats["sim_" + operation + "_bytes"] += size
-            return {"ga": ga, "success": True, "reason": ""}
+            return {
+                "ga": ga,
+                "success": True,
+                "reason": "",
+                "resident_media_type": record[0],
+            }
 
     def copy_to(self, req, dst):
         """Provider-side CopyGA checks (meta_restful_server.cpp); returns (http_status, error).
