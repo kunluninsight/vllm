@@ -22,7 +22,7 @@
 - `docs/` holds only user-facing documentation: usage guides and simulation feature docs.
 - Put all process documents (e.g. bug investigations, feature design discussions, workflow analyses) under `tmp/`, by default in `tmp/docs/` or in a more relevant `tmp/` subdirectory, and never commit them.
 
-## Environment
-- `tmp/env.local.md` (if it exists) contains deployment-specific configuration that overrides all defaults.
-  - Read it only on the first turn of a session or when the user explicitly asks; do not re-read it on later turns, and treat its content as unchanged for the rest of the session.
-  - Never modify it unless the user explicitly asks to update it, even if its content appears outdated.
+## Agent
+- Do not commit `AGENTS.md` by default: developers may put local, environment-specific settings in it.
+  - Run `git update-index --assume-unchanged AGENTS.md` by default to avoid committing local changes by accident.
+  - Only when the developer explicitly asks to commit `AGENTS.md` changes, run `git update-index --no-assume-unchanged AGENTS.md` first, then commit.

@@ -20,4 +20,6 @@ def get_class_hooks() -> list[type[BaseHook]]:
 
 
 def get_module_hooks() -> list[type[BaseHook]]:
-    return []
+    from .network import M_V6dPeerAddressHook
+
+    return [M_V6dPeerAddressHook]

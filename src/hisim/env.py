@@ -28,7 +28,6 @@ class Envs:
     # Existing integration-owned names retain their upstream spelling.
     V6D_HITSOURCE_LOG = "V6D_HITSOURCE_LOG"
     V6D_KEYSOURCE_LOG = "V6D_KEYSOURCE_LOG"
-    V6D_SIM_STUB_META_PROBE = "V6D_SIM_STUB_META_PROBE"
 
     _TRUTHY = ("1", "true", "yes", "on")
     _DEFAULT_OUTPUT_DIR = "/tmp/hisim/output/"
@@ -164,14 +163,6 @@ class Envs:
     @classmethod
     def v6d_keysource_enabled(cls) -> bool:
         return os.getenv(cls.V6D_KEYSOURCE_LOG, "1") not in ("0", "false", "False")
-
-    @classmethod
-    def v6d_stub_meta_probe_enabled(cls) -> bool:
-        return os.getenv(cls.V6D_SIM_STUB_META_PROBE, "1") not in (
-            "0",
-            "false",
-            "False",
-        )
 
     @classmethod
     def vllm_async_registration_enabled(cls) -> bool:

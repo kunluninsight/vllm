@@ -80,6 +80,10 @@ class C_VLLMPlatformHook(BaseHook):
                 pass
 
             @classmethod
+            def device_count(cls) -> int:
+                return 1  # One simulated executor on this node.
+
+            @classmethod
             def get_device_name(cls, device_id: int = 0) -> str:
                 return "NVIDIA A100-SXM4-80GB"
 

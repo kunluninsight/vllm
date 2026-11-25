@@ -473,6 +473,8 @@ class C_VLLMExecutorHook(BaseHook):
                 "sample_tokens_latency": step.sample_tokens_latency,
                 "logprobs_latency": step.logprobs_latency,
                 "full_step_latency": full_step_latency,
+                "prediction_cpu_latency": step.prediction_cpu_latency,
+                "blocking_wait_latency": step.blocking_wait_latency,
                 "total_tokens": sum(num_scheduled_tokens.values()),
                 "l2_load_latency": 0.0,
                 "l2_backup_latency": 0.0,
@@ -492,7 +494,7 @@ class C_VLLMExecutorHook(BaseHook):
 
             # Non-async scheduling delays the mock output's future.
             # The native bypass loop can still process input and connector work.
-            return cls._defer(result, abs(full_step_latency), scheduler_output)
+            return cls._defer(result, step.blocking_wait_latency, scheduler_output)
 
         def wrapped_execute_dummy_batch(self, *args, non_block=False, **kwargs):
             """Hold an idle DP rank's dummy step for the coordinated span."""
@@ -505,7 +507,7 @@ class C_VLLMExecutorHook(BaseHook):
                 return result
             model_output = result.result() if isinstance(result, Future) else result
             step = model_output.__dict__.pop("_sim_step")
-            deferred = cls._defer(result, abs(step.full_step_latency), None)
+            deferred = cls._defer(result, step.blocking_wait_latency, None)
             return deferred if non_block else deferred.result()
 
         target.execute_model = wrapped_execute_model

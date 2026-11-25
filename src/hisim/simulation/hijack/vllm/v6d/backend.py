@@ -23,6 +23,8 @@ from hisim.utils import get_logger
 
 logger = get_logger()
 
+_BLOCKING_DP_SWITCH_INTERVAL_S = 0.00025
+
 
 def _ple_admission_model(vllm_config):
     """Configured admission model, disabled when the served model has no PLE.
@@ -403,6 +405,18 @@ class C_HybridControlPlaneHook(BaseHook):
                 if getattr(backend, "_sim_sync_prepare", False)
                 else None
             )
+
+            if (
+                self._sim_controller is not None
+                and Envs.simulation_mode() == "BLOCKING"
+                and self._cfg.parallel_config.data_parallel_size > 1
+                and sys.getswitchinterval() > _BLOCKING_DP_SWITCH_INTERVAL_S
+            ):
+                # Give the v6d event-loop thread time to run while EngineCore is busy.
+                sys.setswitchinterval(_BLOCKING_DP_SWITCH_INTERVAL_S)
+                logger.info(
+                    "[V6D Hijack] EngineCore thread switch interval set to 0.25 ms"
+                )
 
         def prepare(self, req, blocks):
             coroutine = original_prepare(self, req, blocks)

@@ -17,7 +17,10 @@ from hisim.hook import BaseHook
 from hisim.simulation.manager import ConfigManager
 from hisim.simulation.types import SimulationMode
 from hisim.simulation.utils import profile_device_available_bytes
-from hisim.simulation.hijack.vllm.engine_core_pipeline import C_VLLMEngineCoreHook
+from hisim.simulation.hijack.vllm.engine_core_pipeline import (
+    C_VLLMEngineCoreHook,
+    _finalize_step_stats,
+)
 from hisim.simulation.hijack.vllm.model_runner import SimModelRunner
 from hisim.utils import get_logger
 
@@ -42,22 +45,17 @@ def _local_requests(scheduler_output) -> list[tuple[int, int, int]]:
     ]
 
 
-def _build_kv_cache_spec(vllm_config) -> dict:
-    """Discover native layer metadata without loading weights or payload buffers."""
-    from hisim.simulation.hijack.vllm.kv_layout import build_kv_cache_spec
-
-    return build_kv_cache_spec(vllm_config)
-
-
 class C_VLLMWorkerHook(BaseHook):
     """Replace GPU execution with CPU placeholders and native connector calls."""
 
-    HOOK_CLASS_NAME = "Worker"
-    HOOK_MODULE_NAME = r"vllm\.v1\.worker\.(gpu_worker|worker)"
+    HOOK_CLASS_NAME = r"^Worker$"
+    HOOK_MODULE_NAME = r"^vllm\.v1\.worker\.(gpu_worker|worker)$"
     REGEX = True
 
     @classmethod
     def hook(cls, target):
+        negotiate_layouts = hasattr(target, "get_supported_kv_cache_layouts")
+
         from vllm.v1.outputs import (
             AsyncModelRunnerOutput as _AsyncModelRunnerOutput,
             ModelRunnerOutput as _ModelRunnerOutput,
@@ -66,12 +64,17 @@ class C_VLLMWorkerHook(BaseHook):
         class _SimAsyncOutput(_AsyncModelRunnerOutput):
             """Defer a simulated GPU span to vLLM's async-output thread."""
 
-            def __init__(self, output, latency: float):
+            def __init__(self, output, latency: float, scheduler_output):
                 self._output = output
                 self._latency = latency
+                self._scheduler_output = scheduler_output
+
+            def get_kv_connector_output(self):
+                return getattr(self._output, "kv_connector_output", None)
 
             def get_output(self):
                 time.sleep(self._latency)
+                _finalize_step_stats(self._scheduler_output, time.time())
                 return self._output
 
         # Field set varies across vLLM versions; probe once at install time.
@@ -95,6 +98,8 @@ class C_VLLMWorkerHook(BaseHook):
 
         def override_init_device(self):
             """Initialize Gloo, CPU workspace, and the CPU model runner."""
+            from hisim.simulation.hijack.vllm.kv_layout import build_kv_cache_metadata
+
             try:
                 from vllm.v1.worker.gpu_worker import (
                     init_worker_distributed_environment,
@@ -132,9 +137,10 @@ class C_VLLMWorkerHook(BaseHook):
             set_random_seed(self.vllm_config.model_config.seed)
 
             self.device = torch.device("cpu")
-            self.model_runner = SimModelRunner(
-                self.vllm_config, kv_spec=_build_kv_cache_spec(self.vllm_config)
+            kv_spec, self._hisim_kv_cache_layouts = build_kv_cache_metadata(
+                self.vllm_config, negotiate_layouts=negotiate_layouts
             )
+            self.model_runner = SimModelRunner(self.vllm_config, kv_spec=kv_spec)
 
             self.init_snapshot = None
             self.requested_memory = 0
@@ -176,6 +182,13 @@ class C_VLLMWorkerHook(BaseHook):
         def override_get_kv_cache_spec(self):
             """Return pre-built KV cache spec."""
             return self.model_runner.get_kv_cache_spec()
+
+        def override_get_supported_kv_cache_layouts(self):
+            return self._hisim_kv_cache_layouts
+
+        def override_zero_kv_cache_blocks(self, block_ids):
+            """Simulated KV blocks carry metadata only."""
+            return
 
         def override_initialize_from_config(self, kv_cache_config):
             """Init KV connector and allocate CPU KV cache tensors."""
@@ -246,7 +259,12 @@ class C_VLLMWorkerHook(BaseHook):
                 for kv_tensor in kv_cache_config.kv_cache_tensors:
                     minimal_size = min(kv_tensor.size, 4096)
                     tensor = torch.zeros(minimal_size, dtype=torch.int8, device="cpu")
-                    for layer_name in kv_tensor.shared_by:
+                    layers = (
+                        kv_tensor.layers
+                        if hasattr(kv_tensor, "layers")
+                        else kv_tensor.shared_by
+                    )
+                    for layer_name in layers:
                         kv_caches[layer_name] = tensor
                 logger.info(
                     "[vLLM Hijack] Allocated %d MINIMAL CPU KV cache tensors "
@@ -424,22 +442,26 @@ class C_VLLMWorkerHook(BaseHook):
                 getattr(scheduler_config, "async_scheduling", False)
             )
             # Async BLOCKING scheduling sleeps the span in the sample output.
-            self._last_sim_full_step_latency = (
-                abs(step.full_step_latency)
+            self._last_sim_blocking_wait_latency = (
+                step.blocking_wait_latency
                 if step is not None
                 and async_scheduling
                 and C_VLLMEngineCoreHook.SIM_MODE == SimulationMode.BLOCKING
                 else None
             )
-            return output
+            self._last_sim_scheduler_output = scheduler_output
+            # Async execute_model only launches; sample_tokens delivers the output.
+            return None if async_scheduling and req_ids else output
 
         def override_sample_tokens(self, grammar_output):
             """Defer BLOCKING GPU time when async scheduling is enabled."""
             output = self._last_model_output
-            latency = getattr(self, "_last_sim_full_step_latency", None)
-            self._last_sim_full_step_latency = None
+            latency = getattr(self, "_last_sim_blocking_wait_latency", None)
+            self._last_sim_blocking_wait_latency = None
+            scheduler_output = self._last_sim_scheduler_output
+            self._last_sim_scheduler_output = None
             if latency is not None:
-                return _SimAsyncOutput(output, latency)
+                return _SimAsyncOutput(output, latency, scheduler_output)
             return output
 
         def override_execute_dummy_batch(self, *args, **kwargs):
@@ -494,6 +516,12 @@ class C_VLLMWorkerHook(BaseHook):
         target.load_model = override_load_model
         target.determine_available_memory = override_determine_available_memory
         target.get_kv_cache_spec = override_get_kv_cache_spec
+        if negotiate_layouts:
+            target.get_supported_kv_cache_layouts = (
+                override_get_supported_kv_cache_layouts
+            )
+        if hasattr(target, "zero_kv_cache_blocks"):
+            target.zero_kv_cache_blocks = override_zero_kv_cache_blocks
         target.get_supported_tasks = override_get_supported_tasks
         target.initialize_from_config = override_initialize_from_config
         target.compile_or_warm_up_model = override_compile_or_warm_up_model

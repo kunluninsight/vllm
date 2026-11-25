@@ -6,6 +6,7 @@ predicting its span from the DP-wide batch.
 """
 
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Optional
 
 from hisim.simulation.hijack.vllm.dp import DPBatchCoordinator
@@ -30,10 +31,16 @@ class SimStep:
     requests_by_dp: list[list[tuple[int, int, int]]]
     dp_rank: int = 0
     dp_step_id: Optional[int] = None
+    prediction_cpu_latency: float = 0.0
 
     @property
     def full_step_latency(self) -> float:
         return self.forward_latency + self.sample_tokens_latency + self.logprobs_latency
+
+    @property
+    def blocking_wait_latency(self) -> float:
+        # Prediction already consumed wall time; DP coordination is separate.
+        return max(0.0, abs(self.full_step_latency) - self.prediction_cpu_latency)
 
     @property
     def requests(self) -> list[list[int]]:
@@ -100,7 +107,10 @@ class SimModelRunner:
         requests_by_dp, step_id = self._dp.coordinate(
             requests, num_context_tokens, is_dummy=is_dummy
         )
-        return self._predict(requests_by_dp, logprobs_tokens, step_id)
+        prediction_start = perf_counter()
+        step = self._predict(requests_by_dp, logprobs_tokens, step_id)
+        step.prediction_cpu_latency = perf_counter() - prediction_start
+        return step
 
     def _predict(
         self,
@@ -120,6 +130,22 @@ class SimModelRunner:
             raise RuntimeError("ModelRunner predictor is not loaded")
         predictor_config = ConfigManager._get_raw_config().get("predictor", {})
         scope = predictor_config.get("dp_batch_scope", "global")
+        if hasattr(predictor, "predict_dp_infer_time"):
+            if scope != "global":
+                raise ValueError("DP-aware ML requires dp_batch_scope=global")
+            forward = float(predictor.predict_dp_infer_time(requests_by_dp))
+            sample = float(predictor.predict_dp_sample_tokens_time(requests_by_dp))
+            if not any(requests_by_dp):
+                forward = float(predictor_config.get("dp_idle_step_ms", 0.0)) / 1e3
+            return SimStep(
+                forward_latency=forward,
+                sample_tokens_latency=sample,
+                logprobs_latency=logprobs_tokens
+                * getattr(predictor, "logprobs_cost_s_per_token", 0.0),
+                requests_by_dp=requests_by_dp,
+                dp_rank=self._dp.dp_rank,
+                dp_step_id=dp_step_id,
+            )
         if scope == "global":
             groups = [[req for reqs in requests_by_dp for req in reqs]]
         elif scope == "max_rank":

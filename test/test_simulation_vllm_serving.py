@@ -25,7 +25,7 @@ Envs.set_output_mode("BLOCKING")
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["VLLM_FORCE_DETOKENIZE"] = "1"
 
-MODEL_PATH = "Qwen/Qwen3-0.6B"
+MODEL_PATH = os.environ.get("HISIM_TEST_MODEL", "Qwen/Qwen3-0.6B")
 SERVER_PORT = 18100
 
 
@@ -70,6 +70,10 @@ class VLLMServingRunner:
         # Wait for server to be ready
         dur = 0
         while dur < 120:
+            if self.server_proc.poll() is not None:
+                raise RuntimeError(
+                    f"vLLM simulation server exited with code {self.server_proc.returncode}"
+                )
             try:
                 r = requests.get(f"{self.base_url}/health")
                 if r.status_code == 200:
@@ -78,6 +82,7 @@ class VLLMServingRunner:
                 pass
             time.sleep(1)
             dur += 1
+        self.shutdown()
         raise RuntimeError("Failed to start vLLM simulation server.")
 
     def completions(self, prompt: str, max_tokens: int = 10) -> dict:
@@ -143,18 +148,32 @@ def _load_jsonl(path: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def test_vllm_serving_blocking_dp2(tmp_path=None):
+def test_vllm_serving_blocking_dp2(
+    tmp_path=None, predictor_config=None, engine_overrides=None
+):
     """Internal-LB DP2: both ranks serve and agree on every coordinated batch."""
     output_dir = str(tmp_path or tempfile.mkdtemp(prefix="hisim_dp2_"))
-    saved = {k: os.environ.get(k) for k in ("HISIM_OUTPUT_DIR", "HISIM_RECORD_STATS")}
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "HISIM_OUTPUT_DIR",
+            "HISIM_RECORD_STATS",
+            "HISIM_CONFIG_PATH",
+            "HISIM_CONFIG_JSON",
+        )
+    }
     os.environ["HISIM_OUTPUT_DIR"] = output_dir
     os.environ["HISIM_RECORD_STATS"] = "1"
+    if predictor_config:
+        Envs.set_config_path(str(predictor_config))
+        os.environ.pop("HISIM_CONFIG_JSON", None)
     try:
         runner = VLLMServingRunner(
             model=MODEL_PATH,
             port=SERVER_PORT + 1,
             data_parallel_size=2,
             profiler_config=json.dumps({"profiler": "cuda"}),
+            **(engine_overrides or {}),
         )
     finally:
         for k, v in saved.items():
@@ -197,7 +216,22 @@ def test_vllm_serving_blocking_dp2(tmp_path=None):
                 # Only real local steps are recorded; peers may run dummies.
                 assert by_dp[rank], row
                 assert row["requests"] == [r for reqs_ in by_dp for r in reqs_]
+                assert row["prediction_cpu_latency"] >= 0, row
+                assert (
+                    abs(
+                        row["blocking_wait_latency"]
+                        - max(
+                            0,
+                            abs(row["full_step_latency"])
+                            - row["prediction_cpu_latency"],
+                        )
+                    )
+                    < 1e-9
+                ), row
                 by_step.setdefault(row["dp_step_id"], {})[rank] = row
+        assert any(
+            row["prediction_cpu_latency"] > 0 for rows in iters.values() for row in rows
+        )
         joint = [s for s in by_step.values() if len(s) == 2]
         assert joint, "no step had real batches on both DP ranks"
         for rows in joint:
@@ -209,6 +243,27 @@ def test_vllm_serving_blocking_dp2(tmp_path=None):
         for rows in solo_steps:
             ((rank, row),) = rows.items()
             assert row["requests_by_dp"][1 - rank] == [], row
+        if predictor_config:
+            from hisim.time_predictor.dp_ml import DPMLTimePredictor
+
+            with open(predictor_config) as stream:
+                config = json.load(stream)["predictor"]
+            predictor = DPMLTimePredictor(
+                None,
+                None,
+                None,
+                config["database_path"],
+                latency_scale=config.get("latency_scale", 1),
+            )
+            for rows in iters.values():
+                for row in rows:
+                    assert (
+                        abs(
+                            row["forward_latency"]
+                            - predictor.predict_dp_infer_time(row["requests_by_dp"])
+                        )
+                        < 1e-8
+                    ), row
         print(
             f"\n[PASS] test_vllm_serving_blocking_dp2 passed! requests/rank="
             f"{len(reqs[0])}/{len(reqs[1])}, iterations/rank="

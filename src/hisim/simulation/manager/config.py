@@ -154,6 +154,19 @@ class ConfigManager:
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
             )
+        elif predictor_config.get("name") == "ml_dp":
+            from hisim.time_predictor.dp_ml import DPMLTimePredictor
+
+            return DPMLTimePredictor(
+                model,
+                hw,
+                sched_config,
+                database_path=predictor_config.get("database_path"),
+                latency_scale=predictor_config.get("latency_scale", 1.0),
+                sample_tokens_base_ms=predictor_config.get(
+                    "sample_tokens_base_ms", 0.0
+                ),
+            )
         elif predictor_config.get("name") == "ml":
             from hisim.time_predictor.ml import MLTimePredictor
 
@@ -191,5 +204,5 @@ class ConfigManager:
         else:
             raise ValueError(
                 f"Unknown predictor name: {predictor_config.get('name')}. "
-                "Supported: linear, aiconfigurator, ml"
+                "Supported: linear, aiconfigurator, ml, ml_dp"
             )

@@ -19,6 +19,7 @@ from hisim.utils import get_logger
 
 logger = get_logger()
 _LAYOUT_LOCK = threading.RLock()
+_ALIGNED_CACHE_FIELDS = ("block_size", "mamba_block_size", "mamba_page_size_padded")
 
 
 class _ForceMetaFunctions(TorchFunctionMode):
@@ -31,6 +32,9 @@ class _ForceMetaFunctions(TorchFunctionMode):
 
 class _ForceMetaDevice(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func.name() == "_C::get_cuda_view_from_cpu_tensor" and args[0].is_meta:
+            # PLE creates a UVA alias during layout discovery, where no storage exists.
+            return args[0].detach()
         kwargs = dict(kwargs or {})
         if "device" in kwargs:
             kwargs["device"] = torch.device("meta")
@@ -232,6 +236,9 @@ def target_layout_config(vllm_config):
     if tp < 1:
         raise ValueError("Target TP must be positive")
     layout = copy.copy(vllm_config)
+    # Native MTP copies the layout and expects only declared VllmConfig fields.
+    if hasattr(layout, "_hisim_layout_inputs"):
+        del layout._hisim_layout_inputs
     layout.parallel_config = copy.copy(vllm_config.parallel_config)
     layout.parallel_config.tensor_parallel_size = tp
     # local_world_size is derived from this stored field in PAI-vLLM.
@@ -267,13 +274,13 @@ def align_target_cache(vllm_config):
             f"physical_block_size={requested} is incompatible with native target layout; "
             f"minimum/aligned size is {layout.cache_config.block_size}"
         )
-    for field in ("block_size", "mamba_block_size", "mamba_page_size_padded"):
+    for field in _ALIGNED_CACHE_FIELDS:
         setattr(vllm_config.cache_config, field, getattr(layout.cache_config, field))
     return layout
 
 
-def build_kv_cache_spec(vllm_config):
-    """Construct main and draft models on meta; collect their native layer specs."""
+def build_kv_cache_metadata(vllm_config, *, negotiate_layouts=False):
+    """Get native layer specs and supported layouts from the meta model."""
     import vllm.distributed.parallel_state as ps
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.model_loader.utils import initialize_model
@@ -292,7 +299,7 @@ def build_kv_cache_spec(vllm_config):
         )
         if getattr(ps, "_EP", None) is None:
             stack.enter_context(patch.object(ps, "_EP", tp_group, create=True))
-        stack.enter_context(_cuda_metadata_platform())
+        platform = stack.enter_context(_cuda_metadata_platform())
         stack.enter_context(set_current_vllm_config(layout))
         stack.enter_context(set_default_torch_dtype(layout.model_config.dtype))
         stack.enter_context(torch.device("meta"))
@@ -320,7 +327,43 @@ def build_kv_cache_spec(vllm_config):
                 draft = initialize_model(
                     layout, model_config=speculative.draft_model_config
                 )
+            # Recent runtimes postpone hybrid alignment until layers are available.
+            update_block_size = getattr(
+                type(platform), "update_block_size_for_backend", None
+            )
+            if negotiate_layouts and update_block_size is not None:
+                update_block_size(layout)
+                configured = ConfigManager._get_raw_config().get("scheduler", {})
+                expected = configured.get("physical_block_size")
+                if expected is not None and layout.cache_config.block_size != expected:
+                    raise ValueError(
+                        f"physical_block_size={expected} does not match native "
+                        f"aligned block size {layout.cache_config.block_size}"
+                    )
+                for field in _ALIGNED_CACHE_FIELDS:
+                    setattr(
+                        vllm_config.cache_config,
+                        field,
+                        getattr(layout.cache_config, field),
+                    )
             specs = get_kv_cache_spec(layout)
+            layouts = []
+            if negotiate_layouts:
+                from vllm.distributed.kv_transfer.kv_connector.utils import (
+                    get_current_attn_backends,
+                )
+                from vllm.v1.attention.backends.utils import (
+                    get_supported_kv_cache_layouts,
+                )
+
+                backends = (
+                    []
+                    if layout.is_mm_encoder_only
+                    else get_current_attn_backends(layout)
+                )
+                layouts = [
+                    item.name for item in get_supported_kv_cache_layouts(backends)
+                ]
             # The active v1 runner also preserves backend layout in attention specs.
             from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -340,12 +383,14 @@ def build_kv_cache_spec(vllm_config):
         raise RuntimeError("Native meta model produced no KV cache specs")
     logger.info(
         "[VLLM Hijack] Built KV cache spec via meta-device model walk: %d layers "
-        "(target tp=%d, block_size=%d)",
+        "(target tp=%d, block_size=%d, mamba_page_size_padded=%s, layouts=%s)",
         len(specs),
         layout.parallel_config.tensor_parallel_size,
         vllm_config.cache_config.block_size,
+        vllm_config.cache_config.mamba_page_size_padded,
+        layouts,
     )
-    return specs
+    return specs, layouts
 
 
 def layout_backend_view(backend):

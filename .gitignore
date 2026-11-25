@@ -7,3 +7,5 @@ src/hisim/_version.py
 
 tmp/
 logs/
+
+.codex/

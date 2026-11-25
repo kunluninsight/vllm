@@ -2,8 +2,8 @@
 
 Use non-reserved bulkstore memory and TCP-only SRPC with soft-fail startup.
 Tiered reads retain native lookup/eviction and task-local hit/key logging.
-Remote metadata is fabricated by default, assuming a uniform learned object
-size and trusting tracker entries; V6D_SIM_STUB_META_PROBE=0 restores probing.
+Remote metadata probes remain native to preserve per-object sizes and reject
+stale tracker entries.
 """
 
 from __future__ import annotations
@@ -40,10 +40,6 @@ def _keysource_enabled() -> bool:
     return Envs.v6d_keysource_enabled()
 
 
-def _stub_meta_probe_enabled() -> bool:
-    return Envs.v6d_stub_meta_probe_enabled()
-
-
 def _fmt_keys(object_keys) -> str:
     """Join nonempty object keys for lineage logging."""
     keys = [k for k in (object_keys or ()) if k]
@@ -61,62 +57,6 @@ def _sim_load_data_noop(*args, **kwargs):
 
 def _sim_async_load_data_noop(*args, **kwargs):
     return []
-
-
-# The fabricated-meta path assumes uniform sizes; zero means not yet learned.
-_learned_page_size = 0
-
-
-def _learn_page_size_from_peer(peer) -> None:
-    """Cache the first positive vineyard object size for fabricated metadata."""
-    global _learned_page_size
-    if _learned_page_size > 0:
-        return
-    info = getattr(peer, "_object_info", None)
-    if not info:
-        return
-    for oi in info.values():
-        if getattr(oi, "tier", None) == "vineyard":
-            size = getattr(oi, "size", 0) or 0
-            if size > 0:
-                _learned_page_size = size
-                return
-
-
-def _sim_get_metas_by_names(names, endpoint, trace_id=""):
-    """Fabricate metadata without confirming remote existence or actual size."""
-    size = _learned_page_size
-    if size <= 0:
-        # No learned size: reject the probe rather than fabricate an arbitrary size.
-        raise KeyError(
-            f"[v6d-sim] remote meta probe {endpoint}: page size unknown "
-            f"(no local store yet), {len(names)} keys treated as unfetchable"
-        )
-    from v6d.lite.common.type import ObjectID, ObjectMeta
-
-    blob_meta = {
-        "id": ObjectID.invalid_object_id().to_string(),
-        "length": size,
-        "nbytes": size,
-        "transient": False,
-        "instance_id": 0,
-        "typename": "vineyard::Blob",
-    }
-    return [
-        ObjectMeta.from_dict(
-            {
-                "size": size,
-                # Include object/blob fields required by native metadata sealing.
-                "typename": "vineyard::Object",
-                "instance_id": 0,
-                "transient": False,
-                "user_name": "",
-                "buffer_num": 1,
-                "buffer_0": dict(blob_meta),
-            }
-        )
-        for _ in names
-    ]
 
 
 class C_VineyardPeerHook(BaseHook):
@@ -173,9 +113,6 @@ class C_TieredVineyardPeerHook(BaseHook):
         original_acquire_tiered_read = target._acquire_tiered_read
 
         async def wrapped_acquire_tiered_read(self, *args, **kwargs):
-            if _stub_meta_probe_enabled():
-                # The process-wide metadata stub has no peer argument.
-                _learn_page_size_from_peer(self)
             if not _hitsource_enabled():
                 return await original_acquire_tiered_read(self, *args, **kwargs)
             object_keys = args[0] if args else kwargs.get("object_keys") or ()
@@ -256,21 +193,17 @@ class C_TieredVineyardPeerHook(BaseHook):
 
         target._evict_batch_from_vineyard = wrapped_evict_batch
 
-        # Payload stubs apply process-wide; metadata probing is configurable.
+        # Keep native metadata probes: mixed KV groups have different sizes,
+        # and tracker entries can outlive the remote objects they describe.
         import v6d.common.transfer as transfer
 
         transfer.load_data = _sim_load_data_noop
         transfer.async_load_data = _sim_async_load_data_noop
-        _stub_meta = _stub_meta_probe_enabled()
-        if _stub_meta:
-            transfer.get_metas_by_names = _sim_get_metas_by_names
-
         logger.info(
             "[v6d-sim] C_TieredVineyardPeerHook installed: real "
-            "_acquire_tiered_read + [V6D HitSource] stats + %s SRPC meta "
+            "_acquire_tiered_read + [V6D HitSource] stats + real SRPC meta "
             "probe (payload copies stubbed); key lineage (keys= suffix + "
             "CreateSource/EvictSource) %s",
-            "stubbed" if _stub_meta else "real",
             "on" if _keysource_enabled() else "off",
         )
 

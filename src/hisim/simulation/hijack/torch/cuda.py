@@ -94,18 +94,26 @@ class _TorchView:
 class M_TorchNodeDeviceCountHook(BaseHook):
     """Report `platform.num_device_per_node` as the local GPU count.
 
-    DashLLM's vLLM backend treats a TP size above the local GPU count as
-    multi-node TP, where non-zero ranks start a headless executor; with no
-    GPUs, every multi-node deployment (e.g. DP across nodes) would take it.
-    Rebinding the consumer module's `torch` simulates only device_count.
+    Consumers treat a TP size above the local GPU count as multi-node TP; with
+    no GPUs, every multi-node deployment (e.g. DP across nodes) would take it:
+    - DashLLM's vLLM backend starts a headless executor on non-zero ranks.
+    - The hybrid connector's workers send scheduler RPCs to MASTER_ADDRESS
+      instead of their own EngineCore.
+    Rebinding only the consumer modules' lookups simulates the count.
     """
 
-    HOOK_MODULE_NAME = r"^dashllm\.core\.backend\._backend_vllm$"
+    HOOK_MODULE_NAME = (
+        r"^(dashllm\.core\.backend\._backend_vllm"
+        r"|vllm\.v1\.hybrid_connector\.engine_proxy)$"
+    )
     REGEX = True
 
     @classmethod
     def hook(cls, target):
         # Simulation masks devices; is_available() can still report the driver.
-        if torch.cuda.device_count() > 0 or getattr(target, "torch", None) is not torch:
+        if torch.cuda.device_count() > 0:
             return
-        target.torch = _TorchView()
+        if target.__name__.startswith("dashllm."):
+            target.torch = _TorchView()
+        else:
+            target.cuda_device_count_stateless = _node_devices

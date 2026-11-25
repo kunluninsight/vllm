@@ -2,6 +2,7 @@
 
 Run in the serving image with an existing local model (no downloads):
     python test/test_dashllm_single_node.py --model /path/to/model
+    python test/test_dashllm_single_node.py --model /path/to/model --target-dp 2
 
 The Python entrypoint is the serving worker used by `dashllm_cmd serving`.
 A private Redis, ports, sockets, and logs isolate this run from other services.
@@ -29,7 +30,8 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 Ports = namedtuple(
-    "Ports", "grpc control worker_control redis v6d v6d_rpc sched_rpc vl_v6d vl_v6d_rpc"
+    "Ports",
+    "grpc control worker_control redis v6d v6d_rpc sched_rpc vl_v6d vl_v6d_rpc dp_master dp_rpc",
 )
 MAX_MODEL_LEN = 16384
 
@@ -62,7 +64,19 @@ def list_v6d_objects(base_url):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument(
+        "--http-benchmark",
+        action="store_true",
+        help="Validate token-trace replay through the HTTP router and native vLLM benchmark",
+    )
     parser.add_argument("--target-tp", type=int)
+    parser.add_argument(
+        "--target-dp",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="With DP2, verify the v6d EngineCore interval on both ranks and send a request",
+    )
     parser.add_argument("--kv-cache-dtype")
     parser.add_argument("--mamba-cache-dtype")
     parser.add_argument("--block-align-size", type=int)
@@ -165,6 +179,7 @@ def create_workspace(root):
     work = Path(tempfile.mkdtemp(prefix="dashllm-smoke-", dir=root / "tmp"))
     (work / "v6d").mkdir()
     (work / "logs").mkdir()
+    (work / "no-staging").mkdir()
     write_platform_config(work)
     write_sitecustomize(work)
     return work
@@ -297,7 +312,7 @@ def build_environment(root, work, model, ports):
     return env
 
 
-def worker_command(work, ports):
+def worker_command(work, ports, engine_count):
     return [
         sys.executable,
         "-m",
@@ -311,7 +326,7 @@ def worker_command(work, ports):
         "--control-port",
         str(ports.control),
         "--gpus",
-        "1",
+        str(engine_count),
         "--object-store",
         str(work / "objects"),
         "--log-dir",
@@ -319,7 +334,7 @@ def worker_command(work, ports):
     ]
 
 
-def start_services(processes, work, ports, env, log):
+def start_services(processes, work, ports, env, log, engine_count):
     processes.append(
         subprocess.Popen(
             [
@@ -342,7 +357,7 @@ def start_services(processes, work, ports, env, log):
     )
     processes.append(
         subprocess.Popen(
-            worker_command(work, ports),
+            worker_command(work, ports, engine_count),
             env=env,
             stdout=log,
             stderr=log,
@@ -534,6 +549,98 @@ def wait_for_stored_objects(v6d_url, before, timeout=30):
         time.sleep(0.5)
 
 
+def run_http_benchmark(root, work, model, ports, processes, log):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        http_port = sock.getsockname()[1]
+    env = os.environ.copy()
+    env.update(HISIM_ENABLE="0", SIM_COLLECTOR_ENABLE="0", PYTHONPATH=str(root / "src"))
+    router = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "hisim.benchmark.router",
+            "--port",
+            str(http_port),
+            "--dashllm-address",
+            f"127.0.0.1:{ports.grpc}",
+        ],
+        env=env,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+    )
+    processes.append(router)
+    wait_until_healthy([router], http_port, 30, work / "service.log")
+    trace = work / "http-trace.jsonl"
+    lengths = [37, 89, 151]
+    trace.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "input_ids": [100 + i] * length,
+                    "input_length": length,
+                    "output_length": 1,
+                    "timestamp": 1000 + i * 0.2,
+                }
+            )
+            for i, length in enumerate(lengths)
+        )
+    )
+    for scale in (0.5, 2):
+        destination = work / f"http-benchmark-{scale}.json"
+        manifest = work / f"http-trace-{scale}.json"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "hisim.benchmark.serve",
+                "bench",
+                "serve",
+                "--backend",
+                "openai",
+                "--model",
+                str(model),
+                "--base-url",
+                f"http://127.0.0.1:{http_port}",
+                "--dataset-name",
+                "hisim",
+                "--dataset-path",
+                str(trace),
+                "--num-prompts",
+                "3",
+                "--timestamp-scale",
+                str(scale),
+                "--ignore-eos",
+                "--save-result",
+                "--save-detailed",
+                "--result-dir",
+                str(work),
+                "--result-filename",
+                destination.name,
+                "--trace-manifest",
+                str(manifest),
+            ],
+            env=env,
+            stdout=log,
+            stderr=log,
+            check=True,
+            timeout=120,
+        )
+        result = json.loads(destination.read_text())
+        schedule = json.loads(manifest.read_text())
+        assert result["completed"] == 3 and result["failed"] == 0, result
+        assert result["input_lens"] == lengths, result
+        assert result["total_output_tokens"] == 3, result
+        assert result["mean_ttft_ms"] > 0, result
+        assert abs(schedule["arrival_span_seconds"] - 0.4 * scale) < 1e-9, schedule
+        assert schedule["max_concurrency"] is None, schedule
+    print(
+        "HTTP benchmark: original token lengths, scaled timestamps, native TTFT and output counts verified",
+        flush=True,
+    )
+
+
 def main():
     args = parse_args()
 
@@ -567,6 +674,14 @@ def main():
         )
     if args.num_layers is not None:
         engine["hf_overrides"] = layer_overrides(args.model, args.num_layers)
+    if args.target_dp > 1:
+        engine.update(
+            data_parallel_size=args.target_dp, data_parallel_rpc_port=ports.dp_rpc
+        )
+        env.update(
+            DS_LLM_MULTI_ENGINE_NUM=str(args.target_dp),
+            VLLM_DP_MASTER_PORT=str(ports.dp_master),
+        )
     env["DS_LLM_ENGINE_CONFIG"] = json.dumps(engine)
     simulator = json.loads((work / "config.json").read_text())
     min_elapsed = 0.0
@@ -592,7 +707,7 @@ def main():
     log_path = work / "service.log"
     with log_path.open("w") as log:
         try:
-            start_services(processes, work, ports, env, log)
+            start_services(processes, work, ports, env, log, args.target_dp)
             wait_until_healthy(processes, ports.worker_control, args.timeout, log_path)
             # Worker health can precede the serving port bind.
             deadline = time.monotonic() + 30
@@ -633,15 +748,32 @@ def main():
                 f"KV layout: block_size={block_size}, spec_sizes={spec_sizes}",
                 flush=True,
             )
-            before = snapshot_objects(v6d_url, work / "v6d-before.json")
-            print(
-                f"v6d: {v6d_url}, block_size={block_size} tokens, objects_before={before['total']}",
-                flush=True,
-            )
             client = LLMClient(
                 f"127.0.0.1:{ports.grpc}",
                 capability={"type": "generate"},
                 config=DashClientConfig(request_timeout_ms=60000),
+            )
+            marker = "EngineCore thread switch interval set to 0.25 ms"
+            expected = args.target_dp if args.target_dp > 1 else 0
+            count = log_path.read_text(errors="replace").count(marker)
+            assert count == expected, (count, expected, log_path)
+            if args.target_dp > 1:
+                generate_once(
+                    client,
+                    [100] * (2 * block_size),
+                    log_path,
+                    f"smoke-{uuid.uuid4().hex}",
+                )
+                if args.http_benchmark:
+                    run_http_benchmark(root, work, args.model, ports, processes, log)
+                print(
+                    "PASS: DP2 DashLLM/vLLM/v6d EngineCore switch interval and inference"
+                )
+                return
+            before = snapshot_objects(v6d_url, work / "v6d-before.json")
+            print(
+                f"v6d: {v6d_url}, block_size={block_size} tokens, objects_before={before['total']}",
+                flush=True,
             )
             short_prompt = [100] * max(1, min(64, block_size - 1))
             rows = run_requests(
@@ -697,6 +829,8 @@ def main():
                     "Remote PLE: every request waited for simulated admission",
                     flush=True,
                 )
+            if args.http_benchmark:
+                run_http_benchmark(root, work, args.model, ports, processes, log)
             print(
                 "PASS: single-node DashLLM/vLLM/v6d, BLOCKING + linear, "
                 "native KV stores and L2 loads after L1 reset",

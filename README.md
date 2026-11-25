@@ -114,9 +114,101 @@ training rows; `max_rank` predicts each rank's batch and keeps the slowest.
 `predictor.dp_idle_step_ms` (default `0`) is the latency of steps where every
 rank runs a dummy batch.
 
+In `BLOCKING`, predictor CPU execution consumes the modeled time budget:
+the remaining sleep is the modeled span minus prediction CPU time, clamped
+at zero. DP coordination is outside this timing window and is not deducted.
+This also applies to dummy ranks and async worker output. Recorded modeled
+latencies stay unchanged; `prediction_cpu_latency` and `blocking_wait_latency`
+expose the consumed CPU time and remaining wait. With `HISIM_RECORD_STATS=1`,
+export statistics through the engine's profiling API before stopping workers.
+`OFFLINE` virtual time uses the full modeled span.
+
+Use `ml_dp` with a DP-aware trained bundle to retain per-rank batch composition:
+
+```json
+"predictor": {
+  "name": "ml_dp",
+  "database_path": "/path/to/dp_ml.joblib",
+  "dp_batch_scope": "global",
+  "sample_tokens_base_ms": 0.18
+}
+```
+
+The `dp_v1` schema combines the global 18 features, seven load summaries, and
+18 features per rank (61 features for DP2). Ranks are ordered by load so swapping
+rank identities preserves the prediction. The bundle records `dp_size`,
+`features`, `feature_schema`, and `label_kind`; incompatible bundles or rank
+counts fail explicitly. `ml_dp` requires `dp_batch_scope=global`; it receives
+the rank-separated batch directly, without concatenating it first.
+
+The current label kind is `max_active_worker_execute_model_cuda_events_s`:
+the maximum measured CUDA-event span among active workers. Idle-rank dummy
+timing is not inferred from missing rows. Sampling is a separate calibrated
+constant, and all-idle steps use `dp_idle_step_ms`. Calibrate for the target
+hardware and TP/DP/EP configuration. Training data should cover small batches,
+one active rank and imbalanced rank loads. Keep all TP copies of one step in
+the same split, and reserve independent requests for end-to-end validation.
+An artifact trained only on prefill does not validate decode-only prediction.
+
 See [predictor selection and options](src/hisim/simulation/manager/config.py).
 Restart serving processes after editing the JSON; configuration is cached in
 each process.
+
+### HTTP benchmarks with token traces
+
+Use the serving image's vLLM benchmark through a streaming HTTP router. Install
+the `benchmark` extra for `aiohttp`; keep the image's PAI-vLLM and DashServing.
+Run the client and router with `HISIM_ENABLE=0` and `SIM_COLLECTOR_ENABLE=0`;
+enable simulation only in the target serving processes.
+
+```bash
+python -m hisim.benchmark.router \
+  --dashllm-address 127.0.0.1:8001 --port 18080
+
+# In another terminal:
+python -m hisim.benchmark.serve bench serve \
+  --backend openai --model /path/to/local/model \
+  --base-url http://127.0.0.1:18080 --endpoint /v1/completions \
+  --dataset-name hisim --dataset-path /path/to/trace.jsonl \
+  --num-prompts 2000 --timestamp-unit s --timestamp-scale 1 \
+  --ignore-eos --save-result --save-detailed \
+  --result-dir /tmp/bench-results --result-filename real.json \
+  --trace-manifest /tmp/bench-results/real-trace.json
+```
+
+Each JSONL row contains `input_ids` (a nonempty integer array), `output_length`,
+and `created_time` or `timestamp`. Optional `input_length` must match the array;
+optional `request_id` is forwarded in the HTTP header. The loader selects the
+first `num-prompts` nonempty rows, then sorts them by timestamp. It sends the
+original IDs without decoding, tokenizing, or applying a chat template. Output
+length is selected per request.
+
+The adapter invokes vLLM's `bench serve` CLI and replaces only dataset loading
+and arrival scheduling. HTTP requests, SSE parsing, TTFT and result statistics
+remain native vLLM implementations. It requires a compatible vLLM exposing
+`SampleRequest`, `get_samples`, and `get_request`; validate the wrapper when
+upgrading the serving image.
+
+Arrivals follow `(timestamp - first_timestamp) * timestamp_scale` using a
+monotonic clock. `0.5` is twice as fast; `2` is twice as slow. Supported timestamp
+units are `s`, `ms`, `us`, and `ns`; epoch seconds use `s`. No concurrency cap is
+set by default. `--max-concurrency` is optional and can delay actual sends; do
+not combine trace arrivals with `--request-rate` or ramp-up. The trace manifest
+records the selected data hash, arrival span and sender lag so two runs can be
+compared. Native readiness probes and optional warmups precede the trace clock
+and can populate prefix caches; align cache state when comparing services.
+Native result metadata identifies `arrival=trace` and includes the scale and
+trace hash. The native `request_rate=inf` field is unused in this replay mode;
+timestamps determine the actual arrival rate.
+
+The router accepts `POST /v1/completions` with an integer-array `prompt`,
+`stream=true`, `n=1` and a positive `max_tokens`. It uses DashLLM's async client
+without a thread-pool concurrency limit. It emits a token-bearing SSE only
+after upstream returns tokens, then a separate usage event and `[DONE]`.
+`GET /health` reports active, completed, failed and peak-active requests;
+`GET /v1/models` reports the configured model label. `--tokenizer` optionally
+decodes response text; input token IDs are always passed unchanged. Server
+capacity limits and queues still apply independently of the client settings.
 
 ### Remote PLE admission
 Qwen4-style models served with `VLLM_PLE_OFFLOAD_BACKEND=remote_v6d` fetch PLE
@@ -168,8 +260,16 @@ before bootstrap. Some DashServing launchers overwrite `CUDA_VISIBLE_DEVICES`;
 HiSim's startup default does not override an existing value. Framework controls
 remain distinct from simulator settings.
 
+On ECI CPU nodes, HiSim uses the platform-injected `ALIYUN_ECI_ETH1_IP` when
+v6d resolves its own hostname for tracker/P2P advertisements. Without this
+variable (e.g. on Dash GPU nodes), resolution remains native. An invalid,
+loopback, unspecified, multicast or link-local IPv4 raises a configuration error. This hook is scoped
+to v6d peer modules: it does not edit `/etc/hosts`, change global DNS, probe
+Redis, or rewrite KVCM subscriber reporter identities. No extra network
+configuration is required in HiSim.
+
 ## Environment settings
-Simulator settings are defined in [src/hisim/env.py](src/hisim/env.py).
+Core simulator settings are defined in [src/hisim/env.py](src/hisim/env.py).
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
